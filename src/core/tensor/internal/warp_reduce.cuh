@@ -11,6 +11,21 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
+// Warp-size abstraction. On HIP the compat header (force-included) defines
+// lfs::kWarpSize (64 on CDNA __GFX9__, else 32) and LFS_FULL_WARP_MASK (64-bit,
+// required by ROCm's __shfl_*_sync). On CUDA the warp is always 32 lanes and the
+// mask is the 32-bit literal. The block reductions recombine per-warp partials
+// through shared memory keyed on warp_id, so folding the full native warp (64 on
+// gfx90a) is correct and unified across wave widths (PORTING_GUIDE: AutoDock
+// atomicAdd-combined reduction class).
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_WARP_REDUCE_SIZE (lfs::kWarpSize)
+#define LFS_WARP_REDUCE_MASK LFS_FULL_WARP_MASK
+#else
+#define LFS_WARP_REDUCE_SIZE 32
+#define LFS_WARP_REDUCE_MASK 0xffffffffu
+#endif
+
 namespace lfs::core {
     namespace warp_ops {
 
@@ -32,8 +47,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_sum(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                val += __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = LFS_WARP_REDUCE_SIZE / 2; offset > 0; offset /= 2) {
+                val += __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val, offset);
             }
             return val;
         }
@@ -44,8 +59,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_max(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = LFS_WARP_REDUCE_SIZE / 2; offset > 0; offset /= 2) {
+                T other = __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val, offset);
                 val = (val > other) ? val : other;
             }
             return val;
@@ -57,8 +72,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_min(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = LFS_WARP_REDUCE_SIZE / 2; offset > 0; offset /= 2) {
+                T other = __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val, offset);
                 val = (val < other) ? val : other;
             }
             return val;
@@ -70,8 +85,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_prod(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                val *= __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = LFS_WARP_REDUCE_SIZE / 2; offset > 0; offset /= 2) {
+                val *= __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val, offset);
             }
             return val;
         }
@@ -93,8 +108,8 @@ namespace lfs::core {
         __device__ T block_reduce_sum(T val) {
             static __shared__ T shared[32]; // One value per warp (max 32 warps per block)
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % LFS_WARP_REDUCE_SIZE;
+            int warp_id = threadIdx.x / LFS_WARP_REDUCE_SIZE;
 
             // Reduce within warp
             val = warp_reduce_sum(val);
@@ -107,7 +122,7 @@ namespace lfs::core {
 
             // First warp reduces across warps
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : T(0);
+                val = (threadIdx.x < (blockDim.x + LFS_WARP_REDUCE_SIZE - 1) / LFS_WARP_REDUCE_SIZE) ? shared[lane] : T(0);
                 val = warp_reduce_sum(val);
             }
 
@@ -121,8 +136,8 @@ namespace lfs::core {
         __device__ T block_reduce_max(T val) {
             static __shared__ T shared[32];
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % LFS_WARP_REDUCE_SIZE;
+            int warp_id = threadIdx.x / LFS_WARP_REDUCE_SIZE;
 
             val = warp_reduce_max(val);
 
@@ -132,7 +147,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : -std::numeric_limits<T>::infinity();
+                val = (threadIdx.x < (blockDim.x + LFS_WARP_REDUCE_SIZE - 1) / LFS_WARP_REDUCE_SIZE) ? shared[lane] : -std::numeric_limits<T>::infinity();
                 val = warp_reduce_max(val);
             }
 
@@ -146,8 +161,8 @@ namespace lfs::core {
         __device__ T block_reduce_min(T val) {
             static __shared__ T shared[32];
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % LFS_WARP_REDUCE_SIZE;
+            int warp_id = threadIdx.x / LFS_WARP_REDUCE_SIZE;
 
             val = warp_reduce_min(val);
 
@@ -157,7 +172,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : std::numeric_limits<T>::infinity();
+                val = (threadIdx.x < (blockDim.x + LFS_WARP_REDUCE_SIZE - 1) / LFS_WARP_REDUCE_SIZE) ? shared[lane] : std::numeric_limits<T>::infinity();
                 val = warp_reduce_min(val);
             }
 
@@ -171,8 +186,8 @@ namespace lfs::core {
         __device__ T block_reduce_prod(T val) {
             static __shared__ T shared[32];
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % LFS_WARP_REDUCE_SIZE;
+            int warp_id = threadIdx.x / LFS_WARP_REDUCE_SIZE;
 
             val = warp_reduce_prod(val);
 
@@ -182,7 +197,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : T(1);
+                val = (threadIdx.x < (blockDim.x + LFS_WARP_REDUCE_SIZE - 1) / LFS_WARP_REDUCE_SIZE) ? shared[lane] : T(1);
                 val = warp_reduce_prod(val);
             }
 

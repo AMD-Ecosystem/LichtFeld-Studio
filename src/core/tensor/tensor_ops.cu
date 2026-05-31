@@ -35,6 +35,14 @@
 #include <thrust/tuple.h>
 #include <unordered_map>
 
+// rocThrust puts the per-backend execution policy (par / par_nosync) in
+// thrust::hip, not thrust::cuda (the namespaces are not aliased on ROCm). Alias
+// thrust::cuda -> thrust::hip on HIP so the thrust::cuda::par* call sites resolve
+// unchanged. CUDA keeps the real thrust::cuda.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+namespace thrust { namespace cuda = hip; }
+#endif
+
 // CHECK_CUDA provided by core/cuda_debug.hpp
 
 namespace lfs::core::tensor_ops {
@@ -417,19 +425,20 @@ namespace lfs::core::tensor_ops {
 
         // OPTIMIZED PATH: Contiguous segments - use CUB's segmented reduce
         if (inner_size == 1) {
+            // hipCUB's DeviceSegmentedReduce::Reduce unifies the begin/end offset
+            // iterators into a single OffsetIteratorT (CUDA CUB allows two distinct
+            // template types). Use ONE lambda type for both so the transform
+            // iterators have the same closure type; end starts its counter at 1.
+            auto offset_fn = [reduce_size] __host__ __device__(int i) -> int {
+                return i * static_cast<int>(reduce_size);
+            };
             // begin_offsets: [0, N, 2N, 3N, ...]
             auto begin_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(0),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+                thrust::counting_iterator<int>(0), offset_fn);
 
             // end_offsets: [N, 2N, 3N, 4N, ...]
             auto end_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(1),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+                thrust::counting_iterator<int>(1), offset_fn);
 
             void* d_temp_storage = nullptr;
             size_t temp_storage_bytes = 0;

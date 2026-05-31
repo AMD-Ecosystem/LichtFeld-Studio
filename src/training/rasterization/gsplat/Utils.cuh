@@ -13,38 +13,69 @@ namespace gsplat_lfs {
     // Reduce
     ///////////////////////////////
 
+    // ROCm 7.2.1 cooperative groups provides no cg::reduce. The warp argument
+    // here is always a cg::thread_block_tile<32>; a butterfly __shfl_xor over the
+    // tile's 32 lanes is an all-reduce that is wave-size-agnostic (a 32-lane tile
+    // on a 64-lane CDNA wavefront keeps its member-masked shuffles in-tile, so it
+    // reduces per 32-lane group exactly like a 32-lane NVIDIA warp -- the
+    // completed MOAT gsplat port confirmed this). On CUDA we keep cg::reduce.
+    // (PORTING_GUIDE: gsplat fault 4.)
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+    template <class WarpT>
+    inline __device__ float warpReduceSum(float val, WarpT& warp) {
+#pragma unroll
+        for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+            val += warp.shfl_xor(val, offset);
+        }
+        return val;
+    }
+    template <class WarpT>
+    inline __device__ float warpReduceMax(float val, WarpT& warp) {
+#pragma unroll
+        for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+            val = fmaxf(val, warp.shfl_xor(val, offset));
+        }
+        return val;
+    }
+#define GSPLAT_WARP_SUM(val, warp) warpReduceSum((val), (warp))
+#define GSPLAT_WARP_MAX(val, warp) warpReduceMax((val), (warp))
+#else
+#define GSPLAT_WARP_SUM(val, warp) cg::reduce((warp), (val), cg::plus<float>())
+#define GSPLAT_WARP_MAX(val, warp) cg::reduce((warp), (val), cg::greater<float>())
+#endif
+
     template <uint32_t DIM, class WarpT>
     inline __device__ void warpSum(float* val, WarpT& warp) {
 #pragma unroll
         for (uint32_t i = 0; i < DIM; i++) {
-            val[i] = cg::reduce(warp, val[i], cg::plus<float>());
+            val[i] = GSPLAT_WARP_SUM(val[i], warp);
         }
     }
 
     template <class WarpT>
     inline __device__ void warpSum(float& val, WarpT& warp) {
-        val = cg::reduce(warp, val, cg::plus<float>());
+        val = GSPLAT_WARP_SUM(val, warp);
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec4& val, WarpT& warp) {
-        val.x = cg::reduce(warp, val.x, cg::plus<float>());
-        val.y = cg::reduce(warp, val.y, cg::plus<float>());
-        val.z = cg::reduce(warp, val.z, cg::plus<float>());
-        val.w = cg::reduce(warp, val.w, cg::plus<float>());
+        val.x = GSPLAT_WARP_SUM(val.x, warp);
+        val.y = GSPLAT_WARP_SUM(val.y, warp);
+        val.z = GSPLAT_WARP_SUM(val.z, warp);
+        val.w = GSPLAT_WARP_SUM(val.w, warp);
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec3& val, WarpT& warp) {
-        val.x = cg::reduce(warp, val.x, cg::plus<float>());
-        val.y = cg::reduce(warp, val.y, cg::plus<float>());
-        val.z = cg::reduce(warp, val.z, cg::plus<float>());
+        val.x = GSPLAT_WARP_SUM(val.x, warp);
+        val.y = GSPLAT_WARP_SUM(val.y, warp);
+        val.z = GSPLAT_WARP_SUM(val.z, warp);
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec2& val, WarpT& warp) {
-        val.x = cg::reduce(warp, val.x, cg::plus<float>());
-        val.y = cg::reduce(warp, val.y, cg::plus<float>());
+        val.x = GSPLAT_WARP_SUM(val.x, warp);
+        val.y = GSPLAT_WARP_SUM(val.y, warp);
     }
 
     template <class WarpT>
@@ -70,7 +101,7 @@ namespace gsplat_lfs {
 
     template <class WarpT>
     inline __device__ void warpMax(float& val, WarpT& warp) {
-        val = cg::reduce(warp, val, cg::greater<float>());
+        val = GSPLAT_WARP_MAX(val, warp);
     }
 
     ///////////////////////////////

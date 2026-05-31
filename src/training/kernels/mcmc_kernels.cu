@@ -4,6 +4,7 @@
 
 #include "core/tensor.hpp"
 #include "mcmc_kernels.hpp"
+#include <cmath>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -16,6 +17,11 @@
 #include <thrust/scatter.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
+
+// rocThrust execution policy lives in thrust::hip, not thrust::cuda; alias on HIP.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+namespace thrust { namespace cuda = hip; }
+#endif
 
 namespace lfs::training::mcmc {
 
@@ -35,7 +41,9 @@ namespace lfs::training::mcmc {
             float binom = 1.0f;
             for (int k = 0; k <= n; k++) {
                 const float sign = (k % 2 == 0) ? 1.0f : -1.0f;
-                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * rsqrtf(static_cast<float>(k + 1));
+                // Host helper (no __device__): rsqrtf is a device builtin not
+                // available on the HIP host pass; use 1/sqrt explicitly.
+                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * (1.0f / std::sqrt(static_cast<float>(k + 1)));
                 if (k < n)
                     binom *= static_cast<float>(n - k) / static_cast<float>(k + 1);
             }
@@ -628,7 +636,18 @@ namespace lfs::training::mcmc {
         // This is O(n) per thread, total O(n*n_samples)
         // BUT: We can optimize using warp primitives
 
+        // Native warp width: 64 on CDNA (gfx90a), else 32. One index per warp,
+        // lane-strided gather + warp reduction; the result is written by lane 0,
+        // so a full 64-lane fold is correct and unified across wave widths. The
+        // compat header (force-included on HIP) supplies lfs::kWarpSize and the
+        // 64-bit shuffle mask; CUDA keeps 32 / 0xffffffff.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        const int WARP_SIZE = lfs::kWarpSize;
+        const unsigned long long warp_mask = LFS_FULL_WARP_MASK;
+#else
         const int WARP_SIZE = 32;
+        const unsigned warp_mask = 0xffffffffu;
+#endif
         int lane_id = threadIdx.x % WARP_SIZE;
 
         // Each warp cooperatively counts for one index
@@ -640,7 +659,7 @@ namespace lfs::training::mcmc {
 
         // Warp-level reduction to sum counts
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            count += __shfl_down_sync(0xffffffff, count, offset);
+            count += __shfl_down_sync(warp_mask, count, offset);
         }
 
         // First lane writes the result

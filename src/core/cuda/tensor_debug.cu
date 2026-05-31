@@ -11,12 +11,23 @@ namespace lfs::core::debug {
 
     namespace {
         constexpr int BLOCK_SIZE = 256;
+        // Native warp width: 64 on CDNA (gfx90a, __GFX9__), else 32. The block
+        // reduction recombines per-warp partials through shared memory, so a full
+        // 64-lane fold is correct and unified across wave widths. The compat
+        // header (force-included on HIP) defines lfs::kWarpSize / the 64-bit
+        // shuffle mask; CUDA keeps 32 / 0xffffffff.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        constexpr int WARP_SIZE = lfs::kWarpSize;
+#define LFS_DEBUG_WARP_MASK LFS_FULL_WARP_MASK
+#else
         constexpr int WARP_SIZE = 32;
+#define LFS_DEBUG_WARP_MASK 0xffffffffu
+#endif
 
         // Warp-level reduction for min
         __device__ float warp_reduce_min(float val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
+                val = fminf(val, __shfl_down_sync(LFS_DEBUG_WARP_MASK, val, offset));
             }
             return val;
         }
@@ -24,7 +35,7 @@ namespace lfs::core::debug {
         // Warp-level reduction for max
         __device__ float warp_reduce_max(float val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+                val = fmaxf(val, __shfl_down_sync(LFS_DEBUG_WARP_MASK, val, offset));
             }
             return val;
         }
@@ -32,7 +43,7 @@ namespace lfs::core::debug {
         // Warp-level reduction for sum
         __device__ float warp_reduce_sum(float val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val += __shfl_down_sync(0xffffffff, val, offset);
+                val += __shfl_down_sync(LFS_DEBUG_WARP_MASK, val, offset);
             }
             return val;
         }
@@ -40,7 +51,7 @@ namespace lfs::core::debug {
         // Warp-level reduction for count
         __device__ unsigned int warp_reduce_sum_uint(unsigned int val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val += __shfl_down_sync(0xffffffff, val, offset);
+                val += __shfl_down_sync(LFS_DEBUG_WARP_MASK, val, offset);
             }
             return val;
         }

@@ -26,6 +26,11 @@
 #include <thrust/transform.h>
 #include <thrust/tuple.h>
 
+// rocThrust execution policy lives in thrust::hip, not thrust::cuda; alias on HIP.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+namespace thrust { namespace cuda = hip; }
+#endif
+
 namespace lfs::core::tensor_ops {
 
     namespace {

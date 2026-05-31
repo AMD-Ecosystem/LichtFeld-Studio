@@ -389,8 +389,10 @@ namespace gsplat_lfs {
             return;
         }
 
+        // hipFuncSetAttribute takes the kernel as const void* (CUDA has a
+        // templated T* overload AND a const void* one; the cast is portable).
         auto err = cudaFuncSetAttribute(
-            rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>,
+            (const void*)rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shmem_size);
         if (err != cudaSuccess) {

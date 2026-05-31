@@ -113,7 +113,14 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline Packed128<ElementType> load128cs(const ElementType* address) {
+        // HIP provides __ldcs only for a few scalar types, not int4; the
+        // cache-streaming hint is a perf optimization, so fall back to a plain
+        // 128-bit load on ROCm (identical result, no L1-bypass hint).
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
+#else
         return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
+#endif
     }
 
     /**
@@ -140,7 +147,11 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline void store128cs(ElementType* target, Packed128<ElementType> value) {
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        *reinterpret_cast<int4*>(target) = value.get_bits();
+#else
         __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+#endif
     }
 
     /**
@@ -155,7 +166,11 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline void store128cg(ElementType* target, Packed128<ElementType> value) {
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        *reinterpret_cast<int4*>(target) = value.get_bits();
+#else
         __stcg(reinterpret_cast<int4*>(target), value.get_bits());
+#endif
     }
 
     // ============================================================================

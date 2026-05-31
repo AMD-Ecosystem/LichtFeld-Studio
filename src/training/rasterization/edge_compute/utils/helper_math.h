@@ -51,7 +51,10 @@ typedef unsigned short ushort;
 #define EXIT_WAIVED 2
 #endif
 
-#ifndef __CUDACC__
+// Host scalar-math fallbacks: needed on any HOST pass, skipped on the device
+// pass (builtins). Keyed on the device-compile macro so it is correct in both
+// passes of a .cu (HIP: __HIP_DEVICE_COMPILE__, CUDA: __CUDA_ARCH__).
+#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
 #include <math.h>
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -66,6 +69,14 @@ inline float fmaxf(float a, float b) {
     return a > b ? a : b;
 }
 
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+// HIP host already provides int min/max; bring std::min/std::max into the global
+// namespace via using-declarations (no redefinition) so the unqualified calls in
+// the vector helpers below resolve.
+#include <algorithm>
+using std::max;
+using std::min;
+#else
 inline int max(int a, int b) {
     return a > b ? a : b;
 }
@@ -73,6 +84,7 @@ inline int max(int a, int b) {
 inline int min(int a, int b) {
     return a < b ? a : b;
 }
+#endif
 
 inline float rsqrtf(float x) {
     return 1.0f / sqrtf(x);
@@ -214,6 +226,11 @@ inline __host__ __device__ uint4 make_uint4(uint3 a, uint w) {
 inline __host__ __device__ uint4 make_uint4(int4 a) {
     return make_uint4(uint(a.x), uint(a.y), uint(a.z), uint(a.w));
 }
+
+// HIP's HIP_vector_type provides the float2/3/4 arithmetic operators natively;
+// skip the hand-rolled ones on HIP (they collide as "ambiguous"). Keep the named
+// helpers below (min/max/dot/cross/length/normalize/clamp/lerp), absent in HIP.
+#if !defined(USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
 
 ////////////////////////////////////////////////////////////////////////////////
 // negate
@@ -851,6 +868,8 @@ inline __host__ __device__ void operator/=(float4& a, float b) {
 inline __host__ __device__ float4 operator/(float b, float4 a) {
     return make_float4(b / a.x, b / a.y, b / a.z, b / a.w);
 }
+
+#endif // !USE_HIP : end of operator overloads (HIP provides these natively)
 
 ////////////////////////////////////////////////////////////////////////////////
 // min

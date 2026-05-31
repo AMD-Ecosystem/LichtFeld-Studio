@@ -242,8 +242,18 @@ namespace gsplat_lfs {
         // each thread loads one gaussian at a time before rasterizing
         const uint32_t tr = block.thread_rank();
         cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+        // ROCm CG has no cg::reduce; butterfly __shfl_xor max over the 32-lane
+        // tile (wave-size-agnostic) on HIP, cg::reduce on CUDA. (gsplat fault 4.)
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        int32_t warp_bin_final = bin_final;
+#pragma unroll
+        for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+            warp_bin_final = max(warp_bin_final, warp.shfl_xor(warp_bin_final, offset));
+        }
+#else
         const int32_t warp_bin_final =
             cg::reduce(warp, bin_final, cg::greater<int>());
+#endif
         for (uint32_t b = 0; b < num_batches; ++b) {
             // resync all threads before writing next batch of shared mem
             block.sync();
@@ -502,8 +512,10 @@ namespace gsplat_lfs {
             return;
         }
 
+        // hipFuncSetAttribute takes the kernel as const void* (CUDA has a
+        // templated T* overload AND a const void* one; the cast is portable).
         auto err = cudaFuncSetAttribute(
-            rasterize_to_pixels_from_world_3dgs_bwd_kernel<CDIM, float>,
+            (const void*)rasterize_to_pixels_from_world_3dgs_bwd_kernel<CDIM, float>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shmem_size);
         if (err != cudaSuccess) {

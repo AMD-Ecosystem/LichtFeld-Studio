@@ -13,6 +13,15 @@
 #include <cstdint>
 namespace cg = cooperative_groups;
 
+// __ballot_sync requires a 64-bit mask on ROCm (static_assert sizeof(mask)==8);
+// the CUDA literal 0xffffffffu fails to compile. These ballots only test "is any
+// lane active" (== 0), which is wave-width-agnostic. CUDA keeps the 32-bit mask.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_BALLOT_MASK 0xffffffffffffffffULL
+#else
+#define LFS_BALLOT_MASK 0xffffffffu
+#endif
+
 namespace fast_lfs::rasterization::kernels::forward {
 
     __device__ __forceinline__ void report_forward_status(
@@ -103,7 +112,7 @@ namespace fast_lfs::rasterization::kernels::forward {
             active = false;
 
         // early exit if whole warp is inactive
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (__ballot_sync(LFS_BALLOT_MASK, active) == 0)
             return;
 
         // load opacity
@@ -124,7 +133,7 @@ namespace fast_lfs::rasterization::kernels::forward {
         const float q_norm_sq = qrr_raw + qxx_raw + qyy_raw + qzz_raw;
         if (q_norm_sq < 1e-8f)
             active = false;
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (__ballot_sync(LFS_BALLOT_MASK, active) == 0)
             return;
         const float q_norm_sq_safe = fmaxf(q_norm_sq, 1e-8f);
         const float qxx = 2.0f * qxx_raw / q_norm_sq_safe, qyy = 2.0f * qyy_raw / q_norm_sq_safe, qzz = 2.0f * qzz_raw / q_norm_sq_safe;
@@ -214,7 +223,7 @@ namespace fast_lfs::rasterization::kernels::forward {
             active = false;
 
         // early exit if whole warp is inactive
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (__ballot_sync(LFS_BALLOT_MASK, active) == 0)
             return;
 
         // compute exact number of tiles the primitive overlaps
@@ -268,7 +277,7 @@ namespace fast_lfs::rasterization::kernels::forward {
         const uint n_touched_tiles = active ? static_cast<uint>(primitive_n_touched_tiles[primitive_idx]) : 0;
         active = active && n_touched_tiles > 0;
 
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (__ballot_sync(LFS_BALLOT_MASK, active) == 0)
             return;
 
         const ushort4 screen_bounds = active ? primitive_screen_bounds[primitive_idx] : make_ushort4(0, 0, 0, 0);

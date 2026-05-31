@@ -12,6 +12,17 @@
 #include <stdexcept>
 #include <thread>
 
+// CUdeviceptr is an integer (unsigned long long) on CUDA but maps to HIP's
+// hipDeviceptr_t, which is a void*. Pointer arithmetic on the virtual base
+// (d_ptr + offset) is therefore integer-add on CUDA and illegal on HIP; compute
+// the offset address as a byte pointer on HIP. The driver map/unmap/setaccess
+// calls take the (void*) hipDeviceptr_t directly.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_DPTR_OFF(base, off) (reinterpret_cast<CUdeviceptr>(reinterpret_cast<char*>(base) + (off)))
+#else
+#define LFS_DPTR_OFF(base, off) ((base) + (off))
+#endif
+
 namespace lfs::core {
 
     // Default constructor implementation
@@ -397,8 +408,8 @@ namespace lfs::core {
             for (auto& chunk : arena.chunks) {
                 if (chunk.is_mapped) {
                     lfs::diagnostics::VramProfiler::instance().recordDeallocation(
-                        reinterpret_cast<void*>(arena.d_ptr + chunk.offset));
-                    cuMemUnmap(arena.d_ptr + chunk.offset, chunk.size);
+                        reinterpret_cast<void*>(LFS_DPTR_OFF(arena.d_ptr, chunk.offset)));
+                    cuMemUnmap(LFS_DPTR_OFF(arena.d_ptr, chunk.offset), chunk.size);
                     cuMemRelease(chunk.handle);
                     chunk.is_mapped = false;
                 }
@@ -806,28 +817,28 @@ namespace lfs::core {
                     size_t map_offset = arena.committed_size + total_allocated;
                     map_offset = (map_offset + arena.granularity - 1) & ~(arena.granularity - 1);
 
-                    result = cuMemMap(arena.d_ptr + map_offset, chunk_size, 0, chunk_handle, 0);
+                    result = cuMemMap(LFS_DPTR_OFF(arena.d_ptr, map_offset), chunk_size, 0, chunk_handle, 0);
                     if (result == CUDA_SUCCESS) {
                         CUmemAccessDesc access_desc = {};
                         access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
                         access_desc.location.id = arena.device;
                         access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-                        result = cuMemSetAccess(arena.d_ptr + map_offset, chunk_size, &access_desc, 1);
+                        result = cuMemSetAccess(LFS_DPTR_OFF(arena.d_ptr, map_offset), chunk_size, &access_desc, 1);
                         if (result == CUDA_SUCCESS) {
                             {
                                 std::lock_guard<std::mutex> lock(arena.chunks_mutex);
                                 arena.chunks.push_back({chunk_handle, map_offset, chunk_size, true});
                             }
                             lfs::diagnostics::VramProfiler::instance().recordAllocation(
-                                reinterpret_cast<void*>(arena.d_ptr + map_offset),
+                                reinterpret_cast<void*>(LFS_DPTR_OFF(arena.d_ptr, map_offset)),
                                 chunk_size,
                                 lfs::diagnostics::VramAllocationMethod::Direct,
                                 "rasterizer.arena.vmm_chunk");
                             total_allocated += chunk_size;
                             LOG_TRACE("VMM chunk %d: %zu MB", i, chunk_size >> 20);
                         } else {
-                            cuMemUnmap(arena.d_ptr + map_offset, chunk_size);
+                            cuMemUnmap(LFS_DPTR_OFF(arena.d_ptr, map_offset), chunk_size);
                             cuMemRelease(chunk_handle);
                         }
                     } else {
@@ -857,7 +868,7 @@ namespace lfs::core {
         size_t map_offset = arena.committed_size;
         map_offset = (map_offset + arena.granularity - 1) & ~(arena.granularity - 1);
 
-        result = cuMemMap(arena.d_ptr + map_offset, commit_size, 0, handle, 0);
+        result = cuMemMap(LFS_DPTR_OFF(arena.d_ptr, map_offset), commit_size, 0, handle, 0);
         if (result != CUDA_SUCCESS) {
             cuMemRelease(handle);
             return false;
@@ -868,9 +879,9 @@ namespace lfs::core {
         access_desc.location.id = arena.device;
         access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-        result = cuMemSetAccess(arena.d_ptr + map_offset, commit_size, &access_desc, 1);
+        result = cuMemSetAccess(LFS_DPTR_OFF(arena.d_ptr, map_offset), commit_size, &access_desc, 1);
         if (result != CUDA_SUCCESS) {
-            cuMemUnmap(arena.d_ptr + map_offset, commit_size);
+            cuMemUnmap(LFS_DPTR_OFF(arena.d_ptr, map_offset), commit_size);
             cuMemRelease(handle);
             return false;
         }
@@ -881,7 +892,7 @@ namespace lfs::core {
             arena.chunks.push_back({handle, map_offset, commit_size, true});
         }
         lfs::diagnostics::VramProfiler::instance().recordAllocation(
-            reinterpret_cast<void*>(arena.d_ptr + map_offset),
+            reinterpret_cast<void*>(LFS_DPTR_OFF(arena.d_ptr, map_offset)),
             commit_size,
             lfs::diagnostics::VramAllocationMethod::Direct,
             "rasterizer.arena.vmm");
@@ -926,10 +937,10 @@ namespace lfs::core {
                 // This chunk is completely unused, safe to free
                 if (chunk.is_mapped) {
                     // Unmap the physical memory from virtual address space
-                    CUresult result = cuMemUnmap(arena.d_ptr + chunk.offset, chunk.size);
+                    CUresult result = cuMemUnmap(LFS_DPTR_OFF(arena.d_ptr, chunk.offset), chunk.size);
                     if (result == CUDA_SUCCESS) {
                         lfs::diagnostics::VramProfiler::instance().recordDeallocation(
-                            reinterpret_cast<void*>(arena.d_ptr + chunk.offset));
+                            reinterpret_cast<void*>(LFS_DPTR_OFF(arena.d_ptr, chunk.offset)));
                         // Release the physical memory allocation
                         cuMemRelease(chunk.handle);
                         chunk.is_mapped = false;

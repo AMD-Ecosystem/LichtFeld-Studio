@@ -98,7 +98,7 @@ namespace lfs::core {
         // This reduces LOG_DEBUG overhead from ~1-5μs to <50ns when debug logging is disabled.
         template <typename... Args>
         void log_internal(LogLevel level, const std::source_location& loc,
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                           const char* fmt, Args&&... args) {
             // Fast path: skip formatting if the message would be dropped by all active sinks.
             if (!should_emit(level))

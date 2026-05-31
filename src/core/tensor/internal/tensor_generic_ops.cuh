@@ -9,6 +9,14 @@
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/transform.h>
 
+// rocThrust puts the per-backend execution policy (par / par_nosync) in
+// thrust::hip, not thrust::cuda (the namespaces are not aliased on ROCm). Alias
+// thrust::cuda -> thrust::hip on HIP so the thrust::cuda::par* call sites resolve
+// unchanged. CUDA keeps the real thrust::cuda.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+namespace thrust { namespace cuda = hip; }
+#endif
+
 // Include vectorized operations for float4 optimizations
 #include "tensor_vectorized_ops.cuh"
 
@@ -21,7 +29,8 @@ namespace lfs::core::tensor_ops {
     template <typename Func>
     inline void run_with_thrust_policy(cudaStream_t stream, Func&& func) {
         // Always use .on(stream) to avoid implicit sync after thrust operations
-        // When stream is nullptr/0, this uses the default stream without syncing
+        // When stream is nullptr/0, this uses the default stream without syncing.
+        // thrust::cuda is aliased to thrust::hip on ROCm above.
         func(thrust::cuda::par.on(stream));
     }
 

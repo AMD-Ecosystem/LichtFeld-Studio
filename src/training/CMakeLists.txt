@@ -70,6 +70,35 @@ if(MSVC)
     )
 endif()
 # Optimizer sources
+if(USE_HIP)
+    # MOAT compute tranche: build the kernel-facing training pieces (optimizer,
+    # schedulers, losses, the rasterization wrappers, MCMC, the GPU components)
+    # that the compute gtests exercise directly. The full training-loop
+    # orchestration (trainer/training_setup/checkpoint/metrics + the strategies
+    # and components that pull lfs_io's dataloader / exporter / pipelined image
+    # loader) is part of the DEFERRED io/GUI tranche and is excluded here so the
+    # compute build does not require FFmpeg/WebP/nvjpeg/USD/assimp.
+    set(TRAINING_NEW_SOURCES
+        optimizer/adam_optimizer.cpp
+        optimizer/scheduler.cpp
+        losses/regularization.cpp
+        losses/photometric_loss.cpp
+        strategies/strategy_utils.cpp
+        strategies/mcmc.cpp
+        rasterization/fast_rasterizer.cpp
+        rasterization/gsplat_rasterizer.cpp
+        rasterization/edge_rasterizer.cpp
+        components/bilateral_grid.cpp
+        components/ppisp.cpp
+        components/ppisp_controller.cu
+        components/ppisp_controller_pool.cu
+        components/ppisp_file.cpp
+        components/sparsity_optimizer.cpp
+    )
+    # control/command_api.cpp transitively includes trainer.hpp -> dataset.hpp ->
+    # io/pipelined_image_loader.hpp (the deferred io tranche); the compute gtests
+    # drive kernels/optimizer/rasterizers directly, not the runtime command API.
+else()
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
     optimizer/scheduler.cpp
@@ -95,6 +124,7 @@ set(TRAINING_NEW_SOURCES
     trainer.cpp
     training_setup.cpp
 )
+endif()
 
 # lfs_training - Training module with optimizer
 add_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
@@ -121,6 +151,20 @@ target_include_directories(lfs_training SYSTEM PUBLIC
 )
 
 # Link dependencies
+if(USE_HIP)
+    # Compute tranche: no lfs_io (dataloader/exporter -> FFmpeg/nvjpeg/USD) and no
+    # lfs_python_utils (nanobind); those belong to the deferred io/GUI tranche.
+    target_link_libraries(lfs_training
+        PUBLIC
+            lfs_core
+            lfs_diagnostics
+            lfs_event_bridge
+            lfs_training_kernels
+            fastlfs_backend
+            gsplat_backend_lfs
+            edge_compute_backend
+    )
+else()
 target_link_libraries(lfs_training
     PUBLIC
         lfs_core                # Depends on new core module (SplatData, Tensor)
@@ -134,6 +178,7 @@ target_link_libraries(lfs_training
     PRIVATE
         lfs_python_utils
 )
+endif()
 
 # Set C++ standard
 set_target_properties(lfs_training PROPERTIES

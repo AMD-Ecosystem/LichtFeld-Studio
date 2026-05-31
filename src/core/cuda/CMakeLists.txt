@@ -9,7 +9,6 @@
 
 set(LFS_CORE_CUDA_SOURCES
     memory_arena.cu
-    exportable_storage.cpp
     lanczos_resize/lanczos_resize.cu
     undistort/undistort.cu
     kernels/kmeans_new.cu
@@ -19,6 +18,15 @@ set(LFS_CORE_CUDA_SOURCES
     kernels/sh_layout.cu
     tensor_debug.cu
 )
+
+# exportable_storage.cpp implements CUDA-IPC export (cuMemExportToShareableHandle
+# + POSIX/Win handle-type-supported attribute queries) for cross-process memory
+# sharing. That feature is part of the DEFERRED io/sharing tranche (HIP has no
+# direct handle-type-supported device attribute), so it is excluded from the HIP
+# compute build. The compute kernels do not use IPC-exported storage.
+if(NOT USE_HIP)
+    list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage.cpp)
+endif()
 
 add_library(lfs_core_cuda STATIC ${LFS_CORE_CUDA_SOURCES})
 

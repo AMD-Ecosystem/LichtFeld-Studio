@@ -22,7 +22,7 @@ namespace lfs::core {
 // ============= Generic CUDA Operations =============
 // Include template implementation for inline instantiation
 // Only include in CUDA compilation units - C++ files will link to .cu implementations
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include "tensor_generic_ops.cuh"
 #include <cfloat>
 #define CUDA_INFINITY FLT_MAX
@@ -204,7 +204,7 @@ namespace lfs::core::tensor_ops {
 
 // Include template implementation for inline instantiation
 // Only include in CUDA compilation units - C++ files will link to .cu implementations
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include "tensor_broadcast_ops.cuh"
 #else
 // Forward declaration for C++ files - implementation in tensor_broadcast_ops.cu

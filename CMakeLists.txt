@@ -2,21 +2,38 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# windows/linux platform independent
-set(RAW_VCPKG_PATH $ENV{VCPKG_ROOT})
-file(TO_CMAKE_PATH "${RAW_VCPKG_PATH}" VCPKG_ROOT)
+cmake_minimum_required(VERSION 3.30)
 
-if ("${CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
-    message(STATUS "user didn't specify CMAKE_TOOLCHAIN_FILE manually, so let's use default -> ${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
-    set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+# MOAT: ROCm/HIP port of the GPU COMPUTE tranche only (tensor library, training
+# kernels, gsplat/fastgs/edge rasterizer backends + a focused GPU gtest binary).
+# The full desktop app (GUI/Vulkan-interop/Python/MCP/USD/nvImageCodec) is NVIDIA-
+# only and DEFERRED. When -DUSE_HIP=ON, route to a self-contained compute-only
+# build (cmake/HipCompute.cmake) and skip the entire NVIDIA path below, so the
+# CUDA build stays byte-for-byte unchanged (it never sees USE_HIP).
+# Plain cache BOOL (not option()) so a command-line -DUSE_HIP=ON survives the
+# automatic reconfigure that compiler detection triggers; option() can reset to
+# its default on the re-run and silently fall back to the NVIDIA path.
+if(NOT DEFINED USE_HIP)
+    set(USE_HIP OFF CACHE BOOL "Build the ROCm/HIP GPU-compute tranche (deferred GUI/USD/Python)")
 endif()
 
-cmake_minimum_required(VERSION 3.30)
+# windows/linux platform independent
+if(NOT USE_HIP)
+    set(RAW_VCPKG_PATH $ENV{VCPKG_ROOT})
+    file(TO_CMAKE_PATH "${RAW_VCPKG_PATH}" VCPKG_ROOT)
+
+    if ("${CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
+        message(STATUS "user didn't specify CMAKE_TOOLCHAIN_FILE manually, so let's use default -> ${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+        set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+    endif()
+endif()
 
 option(LFS_ENFORCE_LINUX_GUI_BACKENDS "Fail configure when Linux SDL3 would lack X11 and Wayland support" ON)
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxGuiSanity.cmake")
-lfs_linux_preflight_gui_backends()
+if(NOT USE_HIP)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxGuiSanity.cmake")
+    lfs_linux_preflight_gui_backends()
+endif()
 
 # Suppress CMake developer warnings
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS ON CACHE BOOL "" FORCE)
@@ -28,6 +45,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     message(STATUS "No build type specified, defaulting to Release")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
+if(USE_HIP)
+    # Compute-only ROCm build: enable HIP (not CUDA) at project() time so the HIP
+    # compiler is detected during CMakeDetermineSystem and no mid-configure
+    # reconfigure (which would not re-apply -DUSE_HIP) is triggered. Hand off
+    # entirely to the compute-only build and skip the NVIDIA path below.
+    project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES HIP CXX C)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HipCompute.cmake")
+    return()
 endif()
 
 project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CUDA CXX C)

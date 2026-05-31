@@ -1111,6 +1111,30 @@ namespace lfs::core {
     }
 
     // ============= Type Conversion =============
+    namespace {
+        // Per-element host conversion. A real template so `if constexpr` discards
+        // the non-matching branches (a macro in a non-template function does NOT,
+        // and HIP's __half -- with both operator=(float) and operator=(double) --
+        // makes a bare static_cast<__half>(int)/__half=uint8_t ambiguous in the
+        // dead branches). Routing __half through float is exact for these types.
+        template <typename FROM_TYPE, typename TO_TYPE>
+        inline TO_TYPE convert_one(const FROM_TYPE& v) {
+            if constexpr (std::is_same_v<FROM_TYPE, float> && std::is_same_v<TO_TYPE, uint8_t>) {
+                return static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(v), 0.0f, 255.0f)));
+            } else if constexpr (std::is_same_v<FROM_TYPE, int> && std::is_same_v<TO_TYPE, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int>(v), 0, 255));
+            } else if constexpr (std::is_same_v<FROM_TYPE, int64_t> && std::is_same_v<TO_TYPE, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int64_t>(v), static_cast<int64_t>(0), static_cast<int64_t>(255)));
+            } else if constexpr (std::is_same_v<TO_TYPE, __half>) {
+                return static_cast<__half>(static_cast<float>(v));
+            } else if constexpr (std::is_same_v<FROM_TYPE, __half>) {
+                return static_cast<TO_TYPE>(static_cast<float>(v));
+            } else {
+                return static_cast<TO_TYPE>(v);
+            }
+        }
+    } // namespace
+
     Tensor Tensor::to(DataType dtype) const {
         materialize_if_deferred();
         if (!is_valid()) {
@@ -1143,15 +1167,7 @@ namespace lfs::core {
         const FROM_TYPE* src = ptr<FROM_TYPE>();                                                                                             \
         TO_TYPE* dst = result.ptr<TO_TYPE>();                                                                                                \
         for (size_t i = 0; i < numel(); ++i) {                                                                                               \
-            if constexpr (std::is_same_v<FROM_TYPE, float> && std::is_same_v<TO_TYPE, uint8_t>) {                                            \
-                dst[i] = static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(src[i]), 0.0f, 255.0f)));                             \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int> && std::is_same_v<TO_TYPE, uint8_t>) {                                       \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(src[i]), 0, 255));                                                 \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int64_t> && std::is_same_v<TO_TYPE, uint8_t>) {                                   \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int64_t>(src[i]), static_cast<int64_t>(0), static_cast<int64_t>(255))); \
-            } else {                                                                                                                         \
-                dst[i] = static_cast<TO_TYPE>(src[i]);                                                                                       \
-            }                                                                                                                                \
+            dst[i] = convert_one<FROM_TYPE, TO_TYPE>(src[i]);                                                                                 \
         }                                                                                                                                    \
         return result;                                                                                                                       \
     }
