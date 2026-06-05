@@ -47,6 +47,9 @@ string(APPEND CMAKE_HIP_FLAGS " -Wno-non-pod-varargs -Wno-format-security")
 # .cu / -x hip). Many host .cpp in lfs_core/lfs_diagnostics include
 # <cuda_runtime.h> -> the compat header -> the HIP runtime, and need the symbols.
 add_compile_definitions(USE_HIP=1 __HIP_PLATFORM_AMD__=1)
+if(WIN32)
+    add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
+endif()
 
 # ---- Toolkit shim include dir (HIP build only) -------------------------------
 # Forwarding headers named <cuda.h>/<cuda_runtime.h>/<cooperative_groups*>/
@@ -120,9 +123,29 @@ endfunction()
 # ${CUDAToolkit_INCLUDE_DIRS} / ${LichtFeld-Studio_CUDA_ARCH}. Provide INTERFACE
 # stand-ins so those references resolve without editing every leaf: HIP's runtime
 # is implicit for HIP TUs, and hipRAND is linked for the RNG users.
-find_library(HIPRAND_LIB hiprand HINTS /opt/rocm/lib REQUIRED)
+find_library(HIPRAND_LIB hiprand HINTS "${ROCM_PATH}/lib" /opt/rocm/lib REQUIRED)
+# On Linux, the HIP runtime is linked implicitly for HIP TUs. On Windows, plain
+# C++ .cpp files that include <cuda_runtime.h> -> the compat header -> HIP runtime
+# must explicitly link amdhip64; satisfy that by making CUDA::cudart carry it.
+find_library(AMDHIP64_LIB amdhip64 HINTS "${ROCM_PATH}/lib" /opt/rocm/lib REQUIRED)
 if(NOT TARGET CUDA::cudart)
     add_library(CUDA::cudart INTERFACE IMPORTED)
+    set_target_properties(CUDA::cudart PROPERTIES INTERFACE_LINK_LIBRARIES "${AMDHIP64_LIB}")
+endif()
+# On Windows with --nostdlib in the HIP DLL link command, compiler-rt builtins
+# (float16 helpers: __extendhfsf2/__truncsfhf2/__truncdfhf2) are not pulled in
+# automatically. Link the builtins archive explicitly.
+if(WIN32)
+    find_library(CLANG_RT_BUILTINS clang_rt.builtins-x86_64
+        HINTS "${ROCM_PATH}/lib/llvm/lib/clang/23/lib/windows"
+              "${ROCM_PATH}/lib/llvm/lib/clang/22/lib/windows"
+              "${ROCM_PATH}/lib/llvm/lib/clang/21/lib/windows")
+    if(CLANG_RT_BUILTINS)
+        link_libraries("${CLANG_RT_BUILTINS}")
+        message(STATUS "[MOAT/HIP] Windows: linking clang_rt.builtins: ${CLANG_RT_BUILTINS}")
+    else()
+        message(WARNING "[MOAT/HIP] Windows: clang_rt.builtins-x86_64.lib not found -- float16 ops may fail to link")
+    endif()
 endif()
 if(NOT TARGET CUDA::curand)
     add_library(CUDA::curand INTERFACE IMPORTED)
@@ -188,26 +211,40 @@ find_package(TBB REQUIRED)
 # Construct the OpenImageIO target by hand: the apt -dev package's CMake config
 # references CLI tool binaries (iconvert/...) that the package omits, which trips
 # find_package. We only need the lib + headers for image_io.cpp.
-find_library(OIIO_LIB NAMES OpenImageIO HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
-find_path(OIIO_INC NAMES OpenImageIO/imageio.h HINTS /usr/include REQUIRED)
-if(NOT TARGET OpenImageIO::OpenImageIO)
-    add_library(OpenImageIO::OpenImageIO INTERFACE IMPORTED)
-    set_target_properties(OpenImageIO::OpenImageIO PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${OIIO_INC}"
-        INTERFACE_LINK_LIBRARIES "${OIIO_LIB}")
-endif()
-# OpenMesh: the leaf CMakeLists request OpenMeshCoreStatic on non-Windows; the apt
-# package ships only the shared OpenMeshCore. Build both target names by hand.
-find_library(OPENMESH_CORE_LIB NAMES OpenMeshCore HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
-find_path(OPENMESH_INC NAMES OpenMesh/Core/Mesh/ArrayKernel.hh HINTS /usr/include REQUIRED)
-foreach(_omt OpenMeshCore OpenMeshCoreStatic)
-    if(NOT TARGET ${_omt})
-        add_library(${_omt} INTERFACE IMPORTED)
-        set_target_properties(${_omt} PROPERTIES
-            INTERFACE_INCLUDE_DIRECTORIES "${OPENMESH_INC}"
-            INTERFACE_LINK_LIBRARIES "${OPENMESH_CORE_LIB}")
+# On Windows, image_io.cpp and mesh_data.cpp are replaced by stubs that do not
+# include OIIO/OpenMesh headers, so both libraries are skipped on that platform.
+if(NOT WIN32)
+    # OpenImageIO: on Linux use the apt-installed shared lib.
+    if(LFS_OIIO_LIB AND LFS_OIIO_INC)
+        set(OIIO_LIB "${LFS_OIIO_LIB}")
+        set(OIIO_INC "${LFS_OIIO_INC}")
+    else()
+        find_library(OIIO_LIB NAMES OpenImageIO HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
+        find_path(OIIO_INC NAMES OpenImageIO/imageio.h HINTS /usr/include REQUIRED)
     endif()
-endforeach()
+    if(NOT TARGET OpenImageIO::OpenImageIO)
+        add_library(OpenImageIO::OpenImageIO INTERFACE IMPORTED)
+        set_target_properties(OpenImageIO::OpenImageIO PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${OIIO_INC}"
+            INTERFACE_LINK_LIBRARIES "${OIIO_LIB}")
+    endif()
+    # OpenMesh: on Linux the apt package ships OpenMeshCore (shared).
+    if(LFS_OPENMESH_LIB AND LFS_OPENMESH_INC)
+        set(OPENMESH_CORE_LIB "${LFS_OPENMESH_LIB}")
+        set(OPENMESH_INC "${LFS_OPENMESH_INC}")
+    else()
+        find_library(OPENMESH_CORE_LIB NAMES OpenMeshCore HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
+        find_path(OPENMESH_INC NAMES OpenMesh/Core/Mesh/ArrayKernel.hh HINTS /usr/include REQUIRED)
+    endif()
+    foreach(_omt OpenMeshCore OpenMeshCoreStatic)
+        if(NOT TARGET ${_omt})
+            add_library(${_omt} INTERFACE IMPORTED)
+            set_target_properties(${_omt} PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${OPENMESH_INC}"
+                INTERFACE_LINK_LIBRARIES "${OPENMESH_CORE_LIB}")
+        endif()
+    endforeach()
+endif()
 # Taywee/args (header-only CLI parser, used only by argument_parser.cpp). No apt
 # package; the header is supplied via -DLFS_ARGS_INCLUDE_DIR (MOAT vendors it).
 if(NOT TARGET taywee::args)
