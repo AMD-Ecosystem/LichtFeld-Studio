@@ -52,7 +52,6 @@ set(CORE_SOURCES
         cuda_alloc_tracker.cpp
         image_loader.cpp
         cuda_version.cpp
-        image_io.cpp
         parameters.cpp
         property_registry.cpp
         reactive_store.cpp
@@ -64,8 +63,14 @@ set(CORE_SOURCES
         splat_exportable_storage.cpp
         tensor_debug.cpp
         training_snapshot.cpp
-        mesh_data.cpp
 )
+# On Windows image_io.cpp and mesh_data.cpp need OpenImageIO/OpenMesh headers
+# that are unavailable in the compute-tranche build; use stubs that throw.
+if(WIN32)
+    list(APPEND CORE_SOURCES image_io_win_stub.cpp mesh_data_win_stub.cpp)
+else()
+    list(APPEND CORE_SOURCES image_io.cpp mesh_data.cpp)
+endif()
 
 add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
 
@@ -101,8 +106,8 @@ target_link_libraries(lfs_core
         lfs_core_cuda
         lfs_tensor_kernels
         taywee::args
-        OpenImageIO::OpenImageIO
-        $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
+        $<$<NOT:$<PLATFORM_ID:Windows>>:OpenImageIO::OpenImageIO>
+        $<$<NOT:$<PLATFORM_ID:Windows>>:OpenMeshCoreStatic>
 )
 
 # OpenMP for tensor multi-threaded operations

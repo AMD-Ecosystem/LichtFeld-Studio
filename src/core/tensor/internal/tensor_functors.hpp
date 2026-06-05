@@ -483,7 +483,7 @@ namespace lfs::core {
 #ifdef __CUDA_ARCH__
                 return powf(a, b);
 #else
-                return static_cast<T>(std::pow(a, b));
+                return static_cast<T>(std::pow(static_cast<double>(a), static_cast<double>(b)));
 #endif
             }
         };
@@ -497,7 +497,7 @@ namespace lfs::core {
 #ifdef __CUDA_ARCH__
                     return fmodf(a, b);
 #else
-                    return std::fmod(a, b);
+                    return static_cast<T>(std::fmod(static_cast<double>(a), static_cast<double>(b)));
 #endif
                 }
             }

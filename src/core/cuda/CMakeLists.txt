@@ -26,6 +26,10 @@ set(LFS_CORE_CUDA_SOURCES
 # compute build. The compute kernels do not use IPC-exported storage.
 if(NOT USE_HIP)
     list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage.cpp)
+elseif(WIN32)
+    # Windows lld-link requires all symbols be resolved at link time; on Linux the
+    # shared-library linker silently defers undefined symbols (tested, never called).
+    list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage_win_stub.cpp)
 endif()
 
 add_library(lfs_core_cuda STATIC ${LFS_CORE_CUDA_SOURCES})

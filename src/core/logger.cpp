@@ -12,7 +12,7 @@
 #include <optional>
 #include <regex>
 #include <vector>
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
 #define FMT_UNICODE 0
 #endif
 #include <spdlog/sinks/base_sink.h>
@@ -135,7 +135,7 @@ namespace lfs::core {
         [[nodiscard]] std::string format_timestamp(const std::chrono::system_clock::time_point& timestamp) {
             const auto time_t_val = std::chrono::system_clock::to_time_t(timestamp);
             std::tm tm{};
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
             localtime_s(&tm, &time_t_val);
 #else
             localtime_r(&time_t_val, &tm);
@@ -206,7 +206,7 @@ namespace lfs::core {
 
                 const auto time_t_val = std::chrono::system_clock::to_time_t(msg.time);
                 std::tm tm{};
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
                 localtime_s(&tm, &time_t_val);
 #else
                 localtime_r(&time_t_val, &tm);
