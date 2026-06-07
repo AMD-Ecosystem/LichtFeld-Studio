@@ -71,6 +71,64 @@ set(LFS_HIP_TEST_FILES
     # CPU tensor regressions (no io dependency -- were silently dropped)
     test_cpu_dtype_conversions.cpp
     test_cpu_large_tensor_bugs.cpp
+    # nn ops kernels (max_pool2d, adaptive_avg_pool2d, conv1x1, linear, relu)
+    test_tensor_nn_ops.cpp
+    # tensor library coverage (compute-only: include only core/tensor + torch oracle)
+    test_add_new_gs_tensor_ops.cpp
+    test_background_image.cpp
+    test_bug_regressions.cpp
+    test_bugs_found.cpp
+    test_critical_fixes.cpp
+    test_cuda_device_state.cpp
+    test_dtype_operations_comprehensive.cpp
+    test_expanded_tensor_ops.cpp
+    test_expression_templates.cpp
+    test_extended_unary_ops_vs_torch.cpp
+    test_interleaved_slice_copy.cpp
+    test_isolation.cpp
+    test_logger.cpp
+    test_slice_mm_bug.cpp
+    test_stride_bugs.cpp
+    test_strided_fill.cpp
+    test_tensor_accessor.cpp
+    test_tensor_advanced.cpp
+    test_tensor_bitwise.cpp
+    test_tensor_bugs.cpp
+    test_tensor_cat_bug.cpp
+    test_tensor_cat_reduction_bug.cpp
+    test_tensor_compat.cpp
+    test_tensor_conversions_shape.cpp
+    test_tensor_cumsum_convenience.cpp
+    test_tensor_debug.cpp
+    test_tensor_index_select_bool.cpp
+    test_tensor_index_select_uint8.cpp
+    test_tensor_indexing_advanced.cpp
+    test_tensor_inplace_capacity.cpp
+    test_tensor_lazy_ir.cpp
+    test_tensor_lazy_stateful_ops.cpp
+    test_tensor_masked_select_rows.cpp
+    test_tensor_mcmc_memory_profile.cpp
+    test_tensor_memory.cpp
+    test_tensor_memory_planner.cpp
+    test_tensor_move.cpp
+    test_tensor_ops_comparison.cpp
+    test_tensor_reserve_inplace_cat.cpp
+    test_tensor_serialization.cpp
+    test_tensor_slice_assignment_reserve.cpp
+    test_tensor_slicing_safety.cpp
+    test_tensor_storage_version.cpp
+    test_tensor_stream.cpp
+    test_tensor_stress.cpp
+    test_tensor_struct_init.cpp
+    test_tensor_uint8_inversion.cpp
+    test_tensor_uint8_masking.cpp
+    test_tensor_views.cpp
+    test_tensor_zero_dimension.cpp
+    test_torch_conversion.cpp
+    test_allocator_policy.cpp
+    # diagnostics (vram profiler accounting -- lfs_diagnostics linked via lfs_core)
+    test_vram_profiler_metrics.cpp
+    test_vram_resize.cpp
 )
 
 set(LFS_HIP_TEST_SOURCES "${LFS_TESTS_DIR}/test_main.cpp")
