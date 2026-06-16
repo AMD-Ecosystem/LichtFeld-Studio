@@ -1,24 +1,24 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# MOAT ROCm/HIP compute-only build (lead platform linux-gfx90a). Builds the
+# ROCm/HIP compute-only build (linux-gfx90a). Builds the
 # libtorch-free GPU COMPUTE tranche -- tensor library, training kernels, and the
 # gsplat/fastgs/edge rasterizer backends -- plus a focused GPU gtest binary
 # (lfs_compute_tests). The full desktop app (GUI/Vulkan-interop/Python/MCP/USD/
 # nvImageCodec) is DEFERRED and never configured here. The top-level CMakeLists
 # returns immediately after including this file, so the NVIDIA path is untouched.
 #
-# Authored as part of the MOAT effort with the assistance of Claude (Anthropic).
+# Authored with the assistance of Claude (Anthropic).
 
 # ---- HIP language + target architecture --------------------------------------
 # HIP is enabled at project() time in the top-level CMakeLists (LANGUAGES HIP).
-# Never hardcode the lead arch as a literal: a literal would override
-# -DCMAKE_HIP_ARCHITECTURES and force every follower (gfx1100, gfx1151) to edit
-# this file. Default the lead arch only when the cache var is unset.
+# Never hardcode the default arch as a literal: a literal would override
+# -DCMAKE_HIP_ARCHITECTURES and force every other arch (gfx1100, gfx1151) to edit
+# this file. Default the arch only when the cache var is unset.
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
     set(CMAKE_HIP_ARCHITECTURES "gfx90a")
 endif()
-message(STATUS "[MOAT/HIP] Building GPU-compute tranche for HIP arch: ${CMAKE_HIP_ARCHITECTURES}")
+message(STATUS "[ROCm] Building GPU-compute tranche for HIP arch: ${CMAKE_HIP_ARCHITECTURES}")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -142,9 +142,9 @@ if(WIN32)
               "${ROCM_PATH}/lib/llvm/lib/clang/21/lib/windows")
     if(CLANG_RT_BUILTINS)
         link_libraries("${CLANG_RT_BUILTINS}")
-        message(STATUS "[MOAT/HIP] Windows: linking clang_rt.builtins: ${CLANG_RT_BUILTINS}")
+        message(STATUS "[ROCm] Windows: linking clang_rt.builtins: ${CLANG_RT_BUILTINS}")
     else()
-        message(WARNING "[MOAT/HIP] Windows: clang_rt.builtins-x86_64.lib not found -- float16 ops may fail to link")
+        message(WARNING "[ROCm] Windows: clang_rt.builtins-x86_64.lib not found -- float16 ops may fail to link")
     endif()
 endif()
 if(NOT TARGET CUDA::curand)
@@ -246,7 +246,7 @@ if(NOT WIN32)
     endforeach()
 endif()
 # Taywee/args (header-only CLI parser, used only by argument_parser.cpp). No apt
-# package; the header is supplied via -DLFS_ARGS_INCLUDE_DIR (MOAT vendors it).
+# package; the header is supplied via -DLFS_ARGS_INCLUDE_DIR (vendored here).
 if(NOT TARGET taywee::args)
     find_path(ARGS_INCLUDE_DIR args.hxx HINTS ${LFS_ARGS_INCLUDE_DIR} /usr/include /usr/local/include)
     if(NOT ARGS_INCLUDE_DIR)
@@ -270,4 +270,4 @@ if(BUILD_TESTS)
     add_subdirectory(cmake/hip_tests)
 endif()
 
-message(STATUS "[MOAT/HIP] Compute-only configuration complete.")
+message(STATUS "[ROCm] Compute-only configuration complete.")

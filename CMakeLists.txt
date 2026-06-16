@@ -4,7 +4,7 @@
 
 cmake_minimum_required(VERSION 3.30)
 
-# MOAT: ROCm/HIP port of the GPU COMPUTE tranche only (tensor library, training
+# ROCm/HIP port of the GPU compute tranche only (tensor library, training
 # kernels, gsplat/fastgs/edge rasterizer backends + a focused GPU gtest binary).
 # The full desktop app (GUI/Vulkan-interop/Python/MCP/USD/nvImageCodec) is NVIDIA-
 # only and DEFERRED. When -DUSE_HIP=ON, route to a self-contained compute-only

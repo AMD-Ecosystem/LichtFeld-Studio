@@ -18,7 +18,7 @@ namespace gsplat_lfs {
     // tile's 32 lanes is an all-reduce that is wave-size-agnostic (a 32-lane tile
     // on a 64-lane CDNA wavefront keeps its member-masked shuffles in-tile, so it
     // reduces per 32-lane group exactly like a 32-lane NVIDIA warp -- the
-    // completed MOAT gsplat port confirmed this). On CUDA we keep cg::reduce.
+    // a prior gsplat port confirmed this). On CUDA we keep cg::reduce.
     // (PORTING_GUIDE: gsplat fault 4.)
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
     template <class WarpT>

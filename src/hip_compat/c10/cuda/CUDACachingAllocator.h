@@ -1,4 +1,4 @@
-/* MOAT shim: on Windows ROCm, the TheRock PyTorch build ships a non-hipified
+/* Compatibility shim: on Windows ROCm, the TheRock PyTorch build ships a non-hipified
  * c10/cuda/CUDACachingAllocator.h whose extern symbols live only in the CUDA
  * c10 build. The HIP equivalents are in c10/hip/HIPCachingAllocator.h.
  * On Linux ROCm, torch is already hipified and c10::cuda::CUDACachingAllocator

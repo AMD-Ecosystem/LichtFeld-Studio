@@ -1,6 +1,6 @@
 /* Windows stub for image_io.cpp -- OpenImageIO not required for compute tests.
  * The compute test tranche does not call image I/O functions.
- * MOAT ROCm/HIP port: stub added for Windows build. */
+ * ROCm/HIP port: stub added for Windows build. */
 #if defined(_WIN32)
 
 #include "core/image_io.hpp"
