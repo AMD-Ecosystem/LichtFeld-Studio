@@ -9,7 +9,7 @@ cmake_minimum_required(VERSION 3.30)
 # The full desktop app (GUI/Vulkan-interop/Python/MCP/USD/nvImageCodec) is NVIDIA-
 # only and DEFERRED. When -DUSE_HIP=ON, route to a self-contained compute-only
 # build (cmake/HipCompute.cmake) and skip the entire NVIDIA path below, so the
-# CUDA build stays byte-for-byte unchanged (it never sees USE_HIP).
+# CUDA build stays unchanged (it never sees USE_HIP).
 # Plain cache BOOL (not option()) so a command-line -DUSE_HIP=ON survives the
 # automatic reconfigure that compiler detection triggers; option() can reset to
 # its default on the re-run and silently fall back to the NVIDIA path.

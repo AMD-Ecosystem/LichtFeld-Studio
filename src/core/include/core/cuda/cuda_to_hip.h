@@ -6,8 +6,7 @@
  * rasterizer backends). This is the ONLY file in the compute tree that knows
  * about HIP: it is force-included on every HIP translation unit (see the
  * top-level CMakeLists `USE_HIP` block, CMAKE_HIP_FLAGS -include ...). On a
- * CUDA build this header is never reached and the NVIDIA path is byte-for-byte
- * unchanged.
+ * CUDA build this header is never reached and the NVIDIA path is unchanged.
  *
  * Authored with the assistance of Claude (Anthropic).
  */
@@ -230,6 +229,6 @@ namespace lfs {
 #define nvtxRangePushA(msg) ((void)0)
 #define nvtxRangePop()     ((void)0)
 
-#else /* CUDA build: real toolkit headers, byte-for-byte unchanged. */
+#else /* CUDA build: real toolkit headers, unchanged. */
 #include <cuda_runtime.h>
 #endif
