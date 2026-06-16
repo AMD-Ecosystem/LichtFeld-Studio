@@ -71,7 +71,7 @@ if(MSVC)
 endif()
 # Optimizer sources
 if(USE_HIP)
-    # MOAT compute tranche: build the kernel-facing training pieces (optimizer,
+    # Compute tranche: build the kernel-facing training pieces (optimizer,
     # schedulers, losses, the rasterization wrappers, MCMC, the GPU components)
     # that the compute gtests exercise directly. The full training-loop
     # orchestration (trainer/training_setup/checkpoint/metrics + the strategies

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# MOAT focused GPU gtest binary for the ROCm compute tranche. Links only the
+# Focused GPU gtest binary for the ROCm compute tranche. Links only the
 # compute libraries + GTest + the ROCm libtorch parity oracle and the subset of
 # tests/test_*.cpp that exercise the tensor library, training kernels, losses,
 # MCMC and the gsplat/fastgs/edge rasterizers. The monolithic upstream
@@ -13,7 +13,7 @@ find_package(GTest CONFIG REQUIRED)
 # Torch_DIR is supplied on the command line (the project's external/libtorch is a
 # CUDA build; point at the installed ROCm python torch instead).
 find_package(Torch REQUIRED)
-message(STATUS "[MOAT/HIP] Tests: libtorch ${Torch_VERSION} (ROCm parity oracle)")
+message(STATUS "[ROCm] Tests: libtorch ${Torch_VERSION} (ROCm parity oracle)")
 
 set(LFS_TESTS_DIR "${CMAKE_SOURCE_DIR}/tests")
 
@@ -136,7 +136,7 @@ foreach(_t IN LISTS LFS_HIP_TEST_FILES)
     if(EXISTS "${LFS_TESTS_DIR}/${_t}")
         list(APPEND LFS_HIP_TEST_SOURCES "${LFS_TESTS_DIR}/${_t}")
     else()
-        message(WARNING "[MOAT/HIP] test file not found, skipping: ${_t}")
+        message(WARNING "[ROCm] test file not found, skipping: ${_t}")
     endif()
 endforeach()
 
@@ -191,4 +191,4 @@ gtest_discover_tests(lfs_compute_tests
     DISCOVERY_MODE PRE_TEST
 )
 
-message(STATUS "[MOAT/HIP] lfs_compute_tests configured (compute gtest set + ROCm torch oracle)")
+message(STATUS "[ROCm] lfs_compute_tests configured (compute gtest set + ROCm torch oracle)")

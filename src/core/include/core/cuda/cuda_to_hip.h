@@ -9,7 +9,7 @@
  * CUDA build this header is never reached and the NVIDIA path is byte-for-byte
  * unchanged.
  *
- * Authored as part of the MOAT effort with the assistance of Claude (Anthropic).
+ * Authored with the assistance of Claude (Anthropic).
  */
 #pragma once
 

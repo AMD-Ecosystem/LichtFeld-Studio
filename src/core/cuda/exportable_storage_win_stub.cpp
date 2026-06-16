@@ -1,6 +1,6 @@
 /* Windows stub for exportable_storage.cpp -- CUDA VMM IPC not supported in
  * the compute-tranche HIP build. The compute tests do not call these functions.
- * MOAT ROCm/HIP port: stub added for Windows build. */
+ * ROCm/HIP port: stub added for Windows build. */
 #if defined(_WIN32) && defined(USE_HIP)
 
 #include "core/exportable_storage.hpp"

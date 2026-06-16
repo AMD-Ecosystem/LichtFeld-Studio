@@ -1,6 +1,6 @@
 /* Windows stub for mesh_data.cpp -- OpenMesh not required for compute tests.
  * The compute test tranche does not call compute_normals().
- * MOAT ROCm/HIP port: stub added for Windows build. */
+ * ROCm/HIP port: stub added for Windows build. */
 #if defined(_WIN32)
 
 #include "core/mesh_data.hpp"
