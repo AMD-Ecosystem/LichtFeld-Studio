@@ -11,13 +11,10 @@
 # Authored with the assistance of Claude (Anthropic).
 
 # ---- HIP language + target architecture --------------------------------------
-# HIP is enabled at project() time in the top-level CMakeLists (LANGUAGES HIP).
-# Never hardcode the default arch as a literal: a literal would override
-# -DCMAKE_HIP_ARCHITECTURES and force every other arch (gfx1100, gfx1151) to edit
-# this file. Default the arch only when the cache var is unset.
-if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
-    set(CMAKE_HIP_ARCHITECTURES "gfx90a")
-endif()
+# project(... LANGUAGES HIP CXX C) in the top-level CMakeLists already resolved
+# CMAKE_HIP_ARCHITECTURES: it honors an explicit -DCMAKE_HIP_ARCHITECTURES,
+# otherwise auto-detects the host GPU(s) and errors on a no-GPU host, so no arch
+# default is pinned here.
 message(STATUS "[ROCm] Building GPU-compute tranche for HIP arch: ${CMAKE_HIP_ARCHITECTURES}")
 
 set(CMAKE_CXX_STANDARD 23)
