@@ -46,6 +46,15 @@ string(APPEND CMAKE_HIP_FLAGS " -Wno-non-pod-varargs -Wno-format-security")
 add_compile_definitions(USE_HIP=1 __HIP_PLATFORM_AMD__=1)
 if(WIN32)
     add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
+    # clang-cl's HIP compile rule passes /Fo<OBJECT> (MSVC-style) as the output
+    # flag. For a HIP translation unit the driver runs a host pass and a device
+    # pass from the same invocation; on Windows this makes the driver treat the
+    # single input as if it were compiling multiple source files, which clang-cl
+    # rejects ("cannot specify /Fo<OBJECT> when compiling multiple source
+    # files"). Using the GCC-style -o <OBJECT> instead avoids the ambiguity.
+    # See ROCm/TheRock#5615.
+    string(REPLACE "/Fo<OBJECT>" "-o <OBJECT>"
+        CMAKE_HIP_COMPILE_OBJECT "${CMAKE_HIP_COMPILE_OBJECT}")
 endif()
 
 # ---- Toolkit shim include dir (HIP build only) -------------------------------

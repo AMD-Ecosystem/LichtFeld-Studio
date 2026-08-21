@@ -1,21 +1,18 @@
-/* Compatibility shim: on Windows ROCm, the TheRock PyTorch build ships a non-hipified
- * c10/cuda/CUDACachingAllocator.h whose extern symbols live only in the CUDA
- * c10 build. The HIP equivalents are in c10/hip/HIPCachingAllocator.h.
+/* Compatibility shim: on Windows ROCm, TheRock's PyTorch build ships a
+ * non-hipified c10/cuda/CUDACachingAllocator.h whose headers pull in the real
+ * <cuda_runtime_api.h> toolkit chain, so it cannot be included directly here.
+ * The HIP build instead needs the hipified counterpart, c10/hip/HIPCachingAllocator.h
+ * (an auto-generated-by-hipify file); on a current TheRock build that header
+ * already opens `namespace c10::cuda::CUDACachingAllocator` itself with the
+ * hipified content, so simply including it is enough -- no separate namespace
+ * alias is declared (declaring one here would redefine that namespace).
  * On Linux ROCm, torch is already hipified and c10::cuda::CUDACachingAllocator
- * exists. Apply the redirect and namespace alias ONLY on Windows. */
+ * exists; include the real header unchanged. */
 #pragma once
 
 #if defined(_WIN32)
-// Windows: redirect to HIP header and create the cuda namespace alias.
+// Windows: the hipified header defines c10::cuda::CUDACachingAllocator itself.
 #include <c10/hip/HIPCachingAllocator.h>
-
-namespace c10 {
-namespace cuda {
-// Expose the HIP caching allocator under the CUDA namespace alias so existing
-// call-sites that use c10::cuda::CUDACachingAllocator:: work on ROCm without edits.
-namespace CUDACachingAllocator = c10::hip::HIPCachingAllocator;
-} // namespace cuda
-} // namespace c10
 #else
 // Linux: ROCm torch is already hipified; include the real header unchanged.
 #include_next <c10/cuda/CUDACachingAllocator.h>
