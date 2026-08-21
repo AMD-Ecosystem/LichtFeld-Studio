@@ -178,7 +178,7 @@ target_link_libraries(lfs_compute_tests PRIVATE
     edge_compute_backend
     GTest::gtest
     ${TORCH_LIBRARIES}
-    OpenImageIO::OpenImageIO
+    $<$<NOT:$<PLATFORM_ID:Windows>>:OpenImageIO::OpenImageIO>
     CUDA::cudart
     CUDA::curand
     spdlog::spdlog
