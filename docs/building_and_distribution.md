@@ -111,7 +111,7 @@ HIP_VISIBLE_DEVICES=0 ./build-hip/cmake/hip_tests/lfs_compute_tests
 
 `CMAKE_HIP_ARCHITECTURES` is optional: CMake detects the architecture of the installed GPU when it is not given. Set it to build for another target, for example `gfx1100` on RDNA 3 or `gfx90a` on CDNA 2. No source change is needed to switch architectures.
 
-The commands above are the Linux recipe. `CMAKE_HIP_COMPILER` does not have to be set on a standard ROCm install: HIP is enabled at `project()` time and CMake finds the HIP compiler under `ROCM_PATH`. Pass it explicitly when the HIP toolchain lives somewhere CMake does not search.
+The commands above are the Linux recipe. `CMAKE_HIP_COMPILER` does not have to be set when ROCm's `bin` directory is on `PATH`: CMake asks `hipconfig` where the ROCm Clang lives, and HIP is enabled at `project()` time so no reconfigure is needed. Otherwise name the compiler yourself with `-DCMAKE_HIP_COMPILER` or the `HIPCXX` environment variable; setting `ROCM_PATH` alone does not steer that search.
 
 `lfs_compute_tests` is a plain GoogleTest binary and is not registered with CTest on this path, so run it directly. It executes its tests sequentially in a single process; run one instance at a time.
 
