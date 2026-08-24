@@ -85,22 +85,23 @@ dist/
 
 Dependencies are supplied directly rather than through vcpkg:
 
-- ROCm 7.x (tested with 7.2), with `clang++` and `clang` from `$ROCM_PATH/llvm/bin`. `ROCM_PATH` defaults to `/opt/rocm`.
+- ROCm 7.x (tested with 7.2), with `clang++` and `clang` from the ROCm LLVM directory. The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`; set it if ROCm is installed elsewhere.
 - GLM 1.0.1 or newer, passed as `-DLFS_GLM_INCLUDE_DIR`. Older GLM has no HIP path and its math will not compile in device code.
 - Taywee/args, passed as `-DLFS_ARGS_INCLUDE_DIR`.
 - spdlog, nlohmann-json, TBB, OpenImageIO and OpenMesh from the distribution packages.
-- With `-DBUILD_TESTS=ON`, GoogleTest and a ROCm build of LibTorch, which the tensor tests use as a comparison oracle. Point `Torch_DIR` at it; the `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
+- With `-DBUILD_TESTS=ON`, GoogleTest and a ROCm build of LibTorch, which the tensor tests use as a comparison oracle. Both are found by config package, so point `GTest_DIR` and `Torch_DIR` at them or list their install prefixes in `CMAKE_PREFIX_PATH`. The `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
 
 ```bash
 cmake -B build-hip -G Ninja \
   -DUSE_HIP=ON \
   -DCMAKE_HIP_ARCHITECTURES=gfx90a \
-  -DCMAKE_CXX_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
-  -DCMAKE_C_COMPILER="$ROCM_PATH/llvm/bin/clang" \
+  -DCMAKE_CXX_COMPILER="${ROCM_PATH:-/opt/rocm}/llvm/bin/clang++" \
+  -DCMAKE_C_COMPILER="${ROCM_PATH:-/opt/rocm}/llvm/bin/clang" \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTS=ON \
   -DLFS_GLM_INCLUDE_DIR=/path/to/glm \
   -DLFS_ARGS_INCLUDE_DIR=/path/to/args \
+  -DGTest_DIR=/path/to/gtest/lib/cmake/GTest \
   -DTorch_DIR=/path/to/rocm/libtorch/share/cmake/Torch
 cmake --build build-hip -j 16
 
@@ -110,9 +111,9 @@ HIP_VISIBLE_DEVICES=0 ./build-hip/cmake/hip_tests/lfs_compute_tests
 
 `CMAKE_HIP_ARCHITECTURES` is optional: CMake detects the architecture of the installed GPU when it is not given. Set it to build for another target, for example `gfx1100` on RDNA 3 or `gfx90a` on CDNA 2. No source change is needed to switch architectures.
 
-Do not pass `-DCMAKE_HIP_COMPILER`. It provokes a second configure pass that does not re-apply `USE_HIP`, and the build then falls back to the CUDA path. HIP is enabled at `project()` time instead.
+The commands above are the Linux recipe. `CMAKE_HIP_COMPILER` does not have to be set on a standard ROCm install: HIP is enabled at `project()` time and CMake finds the HIP compiler under `ROCM_PATH`. Pass it explicitly when the HIP toolchain lives somewhere CMake does not search.
 
-`lfs_compute_tests` is a plain GoogleTest binary and is not registered with CTest on this path; run it directly, and run it serially, since concurrent processes on one GPU produce spurious failures.
+`lfs_compute_tests` is a plain GoogleTest binary and is not registered with CTest on this path, so run it directly. It executes its tests sequentially in a single process; run one instance at a time.
 
 ## CMake Options
 
