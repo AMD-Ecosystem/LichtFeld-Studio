@@ -7,6 +7,8 @@
 - vcpkg (`VCPKG_ROOT` environment variable set)
 - GCC 14+ (Linux) or Visual Studio 2022 v17.10+ (Windows)
 
+On AMD GPUs, ROCm takes the place of the CUDA Toolkit and vcpkg is not used. See [AMD GPUs (ROCm/HIP)](#amd-gpus-rocmhip).
+
 ## Linux Prerequisites
 
 On Linux, LichtFeld Studio requires SDL3 to be built with at least one windowing backend (`x11` or `wayland`).
@@ -77,6 +79,41 @@ dist/
 └── LICENSE                 # GPL-3.0
 ```
 
+## AMD GPUs (ROCm/HIP)
+
+`-DUSE_HIP=ON` configures a HIP build for AMD GPUs. It covers the GPU compute libraries only: the tensor library, the training kernels (Adam, schedulers, losses, SSIM, MCMC, densification, bilateral grid, ppisp) and the fastgs, gsplat and edge rasterizer backends, plus a focused GPU test binary named `lfs_compute_tests`. The desktop application (Vulkan viewer, Python plugins, MCP server, USD export, nvImageCodec) is not built on this path and still requires CUDA. The CUDA build is unaffected: with `USE_HIP` set, the top-level `CMakeLists.txt` hands the configure to `cmake/HipCompute.cmake` and returns before any NVIDIA logic runs.
+
+Dependencies are supplied directly rather than through vcpkg:
+
+- ROCm 7.x (tested with 7.2), with `clang++` and `clang` from `$ROCM_PATH/llvm/bin`. `ROCM_PATH` defaults to `/opt/rocm`.
+- GLM 1.0.1 or newer, passed as `-DLFS_GLM_INCLUDE_DIR`. Older GLM has no HIP path and its math will not compile in device code.
+- Taywee/args, passed as `-DLFS_ARGS_INCLUDE_DIR`.
+- spdlog, nlohmann-json, TBB, OpenImageIO and OpenMesh from the distribution packages.
+- With `-DBUILD_TESTS=ON`, GoogleTest and a ROCm build of LibTorch, which the tensor tests use as a comparison oracle. Point `Torch_DIR` at it; the `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
+
+```bash
+cmake -B build-hip -G Ninja \
+  -DUSE_HIP=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx90a \
+  -DCMAKE_CXX_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
+  -DCMAKE_C_COMPILER="$ROCM_PATH/llvm/bin/clang" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON \
+  -DLFS_GLM_INCLUDE_DIR=/path/to/glm \
+  -DLFS_ARGS_INCLUDE_DIR=/path/to/args \
+  -DTorch_DIR=/path/to/rocm/libtorch/share/cmake/Torch
+cmake --build build-hip -j 16
+
+# Compute tests, on a single GPU
+HIP_VISIBLE_DEVICES=0 ./build-hip/cmake/hip_tests/lfs_compute_tests
+```
+
+`CMAKE_HIP_ARCHITECTURES` is optional: CMake detects the architecture of the installed GPU when it is not given. Set it to build for another target, for example `gfx1100` on RDNA 3 or `gfx90a` on CDNA 2. No source change is needed to switch architectures.
+
+Do not pass `-DCMAKE_HIP_COMPILER`. It provokes a second configure pass that does not re-apply `USE_HIP`, and the build then falls back to the CUDA path. HIP is enabled at `project()` time instead.
+
+`lfs_compute_tests` is a plain GoogleTest binary and is not registered with CTest on this path; run it directly, and run it serially, since concurrent processes on one GPU produce spurious failures.
+
 ## CMake Options
 
 | Option | Default | Description |
@@ -86,6 +123,7 @@ dist/
 | `BUILD_CUDA_MIN_SM` | 75 | Minimum GPU (75=Turing, 80=Ampere, 89=Ada) |
 | `BUILD_TESTS` | OFF | Build test suite |
 | `LFS_ENFORCE_LINUX_GUI_BACKENDS` | ON | Linux only. Fail configure if SDL3 would be built without both X11 and Wayland |
+| `USE_HIP` | OFF | Build the GPU compute libraries with HIP for AMD GPUs. See [AMD GPUs (ROCm/HIP)](#amd-gpus-rocmhip) |
 
 ## Troubleshooting
 
