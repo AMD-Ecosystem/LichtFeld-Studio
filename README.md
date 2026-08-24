@@ -87,6 +87,7 @@ Current project notes:
 - LichtFeld Studio targets NVIDIA GPUs
 - Source builds use modern C++23 and CUDA 12.8+ toolchains
 - Use a recent NVIDIA driver for current Windows builds
+- AMD GPUs are supported for the GPU compute libraries and their tests through a ROCm/HIP build; see [Building and Distribution](docs/building_and_distribution.md#amd-gpus-rocmhip)
 
 ## Docs
 
