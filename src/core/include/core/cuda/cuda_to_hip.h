@@ -126,6 +126,10 @@
 #define cudaEventRecordWithFlags                    hipEventRecordWithFlags
 #define cudaEventWaitDefault                        hipEventWaitDefault
 #define cudaEventWaitExternal                       hipEventWaitExternal
+#define cudaGraphRetainUserObject                   hipGraphRetainUserObject
+#define cudaGraphUserObjectMove                     hipGraphUserObjectMove
+#define cudaGraph_t                                 hipGraph_t
+#define cudaHostFn_t                                hipHostFn_t
 #define cudaIpcEventHandle_t                        hipIpcEventHandle_t
 #define cudaIpcGetEventHandle                       hipIpcGetEventHandle
 #define cudaIpcOpenEventHandle                      hipIpcOpenEventHandle
@@ -136,9 +140,14 @@
 #define cudaStreamCaptureStatusInvalidated          hipStreamCaptureStatusInvalidated
 #define cudaStreamCaptureStatusNone                 hipStreamCaptureStatusNone
 #define cudaStreamGetCaptureInfo                    hipStreamGetCaptureInfo
+#define cudaStreamGetCaptureInfo_v2                 hipStreamGetCaptureInfo_v2
 #define cudaStreamGetPriority                       hipStreamGetPriority
 #define cudaStreamIsCapturing                       hipStreamIsCapturing
 #define cudaThreadExchangeStreamCaptureMode         hipThreadExchangeStreamCaptureMode
+#define cudaUserObjectCreate                        hipUserObjectCreate
+#define cudaUserObjectNoDestructorSync              hipUserObjectNoDestructorSync
+#define cudaUserObjectRelease                       hipUserObjectRelease
+#define cudaUserObject_t                            hipUserObject_t
 
 /* ---- CUDA Driver API (VMM) -> HIP ----
  * memory_arena.cu uses the low-level virtual-memory-management driver API
