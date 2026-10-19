@@ -46,15 +46,20 @@ string(APPEND CMAKE_HIP_FLAGS " -Wno-non-pod-varargs -Wno-format-security")
 add_compile_definitions(USE_HIP=1 __HIP_PLATFORM_AMD__=1)
 if(WIN32)
     add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
-    # clang-cl's HIP compile rule passes /Fo<OBJECT> (MSVC-style) as the output
-    # flag. For a HIP translation unit the driver runs a host pass and a device
-    # pass from the same invocation; on Windows this makes the driver treat the
-    # single input as if it were compiling multiple source files, which clang-cl
-    # rejects ("cannot specify /Fo<OBJECT> when compiling multiple source
-    # files"). Using the GCC-style -o <OBJECT> instead avoids the ambiguity.
-    # See ROCm/TheRock#5615.
-    string(REPLACE "/Fo<OBJECT>" "-o <OBJECT>"
-        CMAKE_HIP_COMPILE_OBJECT "${CMAKE_HIP_COMPILE_OBJECT}")
+    # GNU-style rules for clang++, as in LibTorch's LoadHIP.cmake.
+    set(CMAKE_HIP_COMPILE_OBJECT
+        "<CMAKE_HIP_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -o <OBJECT> -x hip -c <SOURCE>")
+    set(CMAKE_INCLUDE_SYSTEM_FLAG_HIP "-isystem ")
+    set(CMAKE_HIP_DEPFILE_FORMAT gcc)
+    set(CMAKE_DEPFILE_FLAGS_HIP "-MD -MT <DEP_TARGET> -MF <DEP_FILE>")
+    # Without -fgpu-rdc HIP objects are plain COFF, so link them like C++.
+    set(CMAKE_HIP_LINK_EXECUTABLE "${CMAKE_CXX_LINK_EXECUTABLE}")
+    set(CMAKE_HIP_CREATE_SHARED_LIBRARY "${CMAKE_CXX_CREATE_SHARED_LIBRARY}")
+    set(CMAKE_HIP_CREATE_SHARED_MODULE "${CMAKE_CXX_CREATE_SHARED_MODULE}")
+    set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreaded -fms-runtime-lib=static)
+    set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL -fms-runtime-lib=dll)
+    set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDebug -fms-runtime-lib=static_dbg)
+    set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDebugDLL -fms-runtime-lib=dll_dbg)
 endif()
 
 # ---- Toolkit shim include dir (HIP build only) -------------------------------

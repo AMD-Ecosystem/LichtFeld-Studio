@@ -52,7 +52,14 @@ if(USE_HIP)
     # compiler is detected during CMakeDetermineSystem and no mid-configure
     # reconfigure (which would not re-apply -DUSE_HIP) is triggered. Hand off
     # entirely to the compute-only build and skip the NVIDIA path below.
-    project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES HIP CXX C)
+    if(WIN32)
+        # clang++ for HIP next to clang-cl is only accepted when HIP is enabled last.
+        project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CXX C)
+        set(CMAKE_HIP_COMPILER_FORCED TRUE)
+        enable_language(HIP)
+    else()
+        project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES HIP CXX C)
+    endif()
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HipCompute.cmake")
     return()
 endif()
