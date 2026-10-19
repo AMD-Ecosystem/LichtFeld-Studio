@@ -166,6 +166,8 @@ target_compile_definitions(lfs_compute_tests PRIVATE
     # own header documents this define as the escape hatch for the unported AMD
     # configure-file. USE_ROCM routes the c10/cuda compat includes to c10/hip.
     C10_CUDA_NO_CMAKE_CONFIGURE_FILE
+    # Set by the skipped configure-file; keeps dllimport on c10_hip data exports.
+    $<$<PLATFORM_ID:Windows>:C10_CUDA_BUILD_SHARED_LIBS>
     USE_ROCM=1
 )
 
@@ -183,6 +185,19 @@ target_link_libraries(lfs_compute_tests PRIVATE
     CUDA::curand
     spdlog::spdlog
 )
+
+if(WIN32)
+    # find_package(Torch) restores clang++ HIP link rules in this directory.
+    set_target_properties(lfs_compute_tests PROPERTIES LINKER_LANGUAGE CXX)
+    # Keep the torch_hip.dll import, or torch::cuda::is_available() is false.
+    target_link_options(lfs_compute_tests PRIVATE "/INCLUDE:?warp_size@cuda@at@@YAHXZ")
+    # The driver's amdhip64 in System32 wins over PATH and cannot run SDK code objects.
+    file(GLOB _lfs_amdhip_dll "${ROCM_PATH}/bin/amdhip64_*.dll")
+    if(_lfs_amdhip_dll)
+        add_custom_command(TARGET lfs_compute_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_lfs_amdhip_dll} $<TARGET_FILE_DIR:lfs_compute_tests>)
+    endif()
+endif()
 
 include(GoogleTest)
 gtest_discover_tests(lfs_compute_tests
