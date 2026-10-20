@@ -60,6 +60,11 @@ if(WIN32)
     set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL -fms-runtime-lib=dll)
     set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDebug -fms-runtime-lib=static_dbg)
     set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDebugDLL -fms-runtime-lib=dll_dbg)
+    # The MSVC debug-information options (-Zi, -Z7) are clang-cl only; the GNU
+    # per-config flags below already carry -g.
+    set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_Embedded "")
+    set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_ProgramDatabase "")
+    unset(CMAKE_HIP_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_EditAndContinue)
     # With C/CXX on clang-cl, CMake 4.3+ seeds the HIP flags with MSVC-style
     # defaults (/DWIN32 /O2 ...) that clang++ rejects; use GNU-style ones.
     string(REGEX REPLACE "(^| )/[A-Za-z][A-Za-z0-9_:=.]*" "" CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS}")
