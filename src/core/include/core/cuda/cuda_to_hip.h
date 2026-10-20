@@ -79,8 +79,10 @@
 #define cudaGetErrorName                            hipGetErrorName
 #define cudaGetErrorString                          hipGetErrorString
 #define cudaGetLastError                            hipGetLastError
+#define cudaGraphDestroy                            hipGraphDestroy
 #define cudaHostAlloc                               hipHostMalloc
 #define cudaHostAllocDefault                        hipHostMallocDefault
+#define cudaLaunchKernel                            hipLaunchKernel
 #define cudaLaunchHostFunc                          hipLaunchHostFunc
 #define cudaMalloc                                  hipMalloc
 #define cudaMallocAsync                             hipMallocAsync
@@ -163,10 +165,12 @@
 #define cudaIpcOpenEventHandle                      hipIpcOpenEventHandle
 #define cudaStreamBeginCapture                      hipStreamBeginCapture
 #define cudaStreamCaptureMode                       hipStreamCaptureMode
+#define cudaStreamCaptureModeGlobal                 hipStreamCaptureModeGlobal
 #define cudaStreamCaptureStatus                     hipStreamCaptureStatus
 #define cudaStreamCaptureStatusActive               hipStreamCaptureStatusActive
 #define cudaStreamCaptureStatusInvalidated          hipStreamCaptureStatusInvalidated
 #define cudaStreamCaptureStatusNone                 hipStreamCaptureStatusNone
+#define cudaStreamEndCapture                        hipStreamEndCapture
 #define cudaStreamGetCaptureInfo                    hipStreamGetCaptureInfo
 #define cudaStreamGetCaptureInfo_v2                 hipStreamGetCaptureInfo_v2
 #define cudaStreamGetPriority                       hipStreamGetPriority
@@ -229,6 +233,11 @@
  * passes kernel arguments the same way without it. */
 #define __grid_constant__
 #define __trap() __builtin_trap()
+/* __nanosleep is only a back-off hint in spin loops; s_sleep 1 is the shortest
+ * hardware sleep (about 64 clocks). */
+#if defined(__HIPCC__)
+__device__ inline void __nanosleep(unsigned int) { __builtin_amdgcn_s_sleep(1); }
+#endif
 
 /* fp16/bf16: HIP provides __half/__half2 (hip_fp16.h) as drop-ins. The CUDA
  * bfloat16 scalar __nv_bfloat16 maps to HIP's __hip_bfloat16. */

@@ -101,6 +101,7 @@ if(USE_HIP)
         perf_bench.cpp
         losses/regularization.cpp
         losses/photometric_loss.cpp
+        losses/mask_loss.cpp
         strategies/strategy_utils.cpp
         strategies/mcmc.cpp
         strategies/mrnf.cpp
