@@ -19,11 +19,12 @@
 // pixel sub-tile, or one source lane's rows). A CUDA warp is one such group. A
 // 64-lane wavefront holds two, so on ROCm a ballot returns this group's half of
 // the wave mask, shuffles address a lane inside the group, and sums fold only
-// the group (offsets below 32). Each CUDA expansion is the original expression.
+// the group (offsets below 32). The two groups can diverge, so the mask names
+// only this group. Each CUDA expansion is the original expression.
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
-#define LFS_GROUP32_MASK LFS_FULL_WARP_MASK
-#define LFS_GROUP32_BALLOT(pred)     static_cast<unsigned>(__ballot_sync(LFS_FULL_WARP_MASK, (pred)) >> (__lane_id() & 32u))
-#define LFS_GROUP32_SHFL(var, src) __shfl_sync(LFS_FULL_WARP_MASK, (var), (src), 32)
+#define LFS_GROUP32_MASK LFS_GROUP32_LANE_MASK
+#define LFS_GROUP32_BALLOT(pred)     static_cast<unsigned>(__ballot_sync(LFS_GROUP32_LANE_MASK, (pred)) >> (__lane_id() & 32u))
+#define LFS_GROUP32_SHFL(var, src) __shfl_sync(LFS_GROUP32_LANE_MASK, (var), (src), 32)
 #define LFS_GROUP32_SUM(val) ::fast_lfs::rasterization::kernels::group32_reduce_sum(val)
 #define LFS_GROUP32_MAX(val) ::fast_lfs::rasterization::kernels::group32_reduce_max(val)
 #else

@@ -23,9 +23,12 @@
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
 #define LFS_WARP_REDUCE_SIZE (lfs::kWarpSize)
 #define LFS_WARP_REDUCE_MASK LFS_FULL_WARP_MASK
+// For folds over 32-lane groups that finish in threads 0-31 only.
+#define LFS_WARP_REDUCE_GROUP32_MASK LFS_GROUP32_LANE_MASK
 #else
 #define LFS_WARP_REDUCE_SIZE 32
 #define LFS_WARP_REDUCE_MASK 0xffffffffu
+#define LFS_WARP_REDUCE_GROUP32_MASK 0xffffffffu
 #endif
 
 namespace lfs::core {

@@ -17,9 +17,12 @@
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
 #define LFS_WARP_REDUCE_SIZE (lfs::kWarpSize)
 #define LFS_WARP_REDUCE_MASK LFS_FULL_WARP_MASK
+// block_reduce_min4/min2 fold 32-lane groups and finish in threads 0-31 only.
+#define LFS_WARP_REDUCE_GROUP32_MASK LFS_GROUP32_LANE_MASK
 #else
 #define LFS_WARP_REDUCE_SIZE 32
 #define LFS_WARP_REDUCE_MASK 0xffffffffu
+#define LFS_WARP_REDUCE_GROUP32_MASK 0xffffffffu
 #endif
 
 namespace lfs::core {
@@ -193,10 +196,10 @@ namespace lfs::core {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 const float4 o = make_float4(
-                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
-                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset),
-                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.z, offset),
-                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.w, offset));
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.z, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.w, offset));
                 val.x = fminf(val.x, o.x);
                 val.y = fminf(val.y, o.y);
                 val.z = fminf(val.z, o.z);
@@ -222,10 +225,10 @@ namespace lfs::core {
 #pragma unroll
                 for (int offset = 16; offset > 0; offset /= 2) {
                     const float4 o = make_float4(
-                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
-                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset),
-                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.z, offset),
-                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.w, offset));
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.z, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.w, offset));
                     val.x = fminf(val.x, o.x);
                     val.y = fminf(val.y, o.y);
                     val.z = fminf(val.z, o.z);
@@ -246,8 +249,8 @@ namespace lfs::core {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 const float2 o = make_float2(
-                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
-                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset));
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset));
                 val.x = fminf(val.x, o.x);
                 val.y = fminf(val.y, o.y);
             }
@@ -268,8 +271,8 @@ namespace lfs::core {
 #pragma unroll
                 for (int offset = 16; offset > 0; offset /= 2) {
                     const float2 o = make_float2(
-                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
-                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset));
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset));
                     val.x = fminf(val.x, o.x);
                     val.y = fminf(val.y, o.y);
                 }

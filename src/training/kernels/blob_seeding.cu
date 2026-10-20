@@ -10,9 +10,10 @@
 #include <nvtx3/nvToolsExt.h>
 // ROCm requires a 64-bit lane mask for __shfl_*_sync. The shuffle-down sums
 // below are read only at lane 0 of each 32-lane group, whose reduction tree
-// stays inside that group on a 64-lane wavefront too.
+// stays inside that group on a 64-lane wavefront too, so the mask names the
+// caller's group.
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
-#define LFS_LANE_MASK LFS_FULL_WARP_MASK
+#define LFS_LANE_MASK LFS_GROUP32_LANE_MASK
 #else
 #define LFS_LANE_MASK 0xffffffffu
 #endif

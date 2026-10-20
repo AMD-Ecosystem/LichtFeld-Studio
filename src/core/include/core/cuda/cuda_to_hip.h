@@ -280,6 +280,14 @@ namespace lfs {
  * literal 0xffffffff fails to COMPILE on HIP. */
 #define LFS_FULL_WARP_MASK 0xffffffffffffffffULL
 
+/* Lane mask of the caller's 32-lane group, for code written for 32-lane CUDA
+ * warps: the whole wave on wave32, the caller's half on wave64. HIP checks a
+ * *_sync mask against the lanes that reach the call (__hip_check_mask, which
+ * traps unless NDEBUG), so where the two halves of a 64-lane wave take
+ * different paths only the group mask is valid. The shuffle itself does not
+ * depend on the mask; a ballot returns only the mask's bits. */
+#define LFS_GROUP32_LANE_MASK (0xffffffffull << (__lane_id() & 32u))
+
 /* ---- GLM in device code ----
  * The build uses GLM 1.0.1 (vendored), which has a NATIVE GLM_COMPILER_HIP path
  * (glm/detail/setup.hpp keys on __HIPCC__) and emits __device__ __host__ on its

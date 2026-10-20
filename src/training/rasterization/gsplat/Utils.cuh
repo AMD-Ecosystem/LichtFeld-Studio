@@ -41,11 +41,12 @@ namespace gsplat_lfs {
 #define GSPLAT_WARP_SUM(val, warp) warpReduceSum((val), (warp))
 // Raw lane intrinsics over a 32-lane tile: a 64-lane wavefront holds two
 // tiles, so a ballot returns this tile's half of the wave mask and a shuffle
-// addresses a lane inside the tile.
-#define GSPLAT_TILE32_MASK LFS_FULL_WARP_MASK
+// addresses a lane inside the tile. The two tiles can diverge, so the mask
+// names only this tile.
+#define GSPLAT_TILE32_MASK LFS_GROUP32_LANE_MASK
 #define GSPLAT_TILE32_BALLOT(pred) \
-    static_cast<unsigned>(__ballot_sync(LFS_FULL_WARP_MASK, (pred)) >> (__lane_id() & 32u))
-#define GSPLAT_TILE32_SHFL(var, src) __shfl_sync(LFS_FULL_WARP_MASK, (var), (src), 32)
+    static_cast<unsigned>(__ballot_sync(LFS_GROUP32_LANE_MASK, (pred)) >> (__lane_id() & 32u))
+#define GSPLAT_TILE32_SHFL(var, src) __shfl_sync(LFS_GROUP32_LANE_MASK, (var), (src), 32)
 #define GSPLAT_WARP_MAX(val, warp) warpReduceMax((val), (warp))
 #else
 #define GSPLAT_WARP_SUM(val, warp) cg::reduce((warp), (val), cg::plus<float>())
