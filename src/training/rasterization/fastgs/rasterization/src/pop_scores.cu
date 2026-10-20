@@ -96,7 +96,7 @@ namespace fast_lfs::rasterization {
             uint max_last = ::max(last0, last1);
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2)
-                max_last = ::max(max_last, __shfl_xor_sync(0xffffffffu, max_last, offset));
+                max_last = ::max(max_last, __shfl_xor_sync(LFS_GROUP32_MASK, max_last, offset));
             __shared__ uint s_warp_last[kPopWarps];
             __shared__ int s_count;
             if (lane_id == 0u)
@@ -155,8 +155,8 @@ namespace fast_lfs::rasterization {
                             hit1 = kernels::splat_overlaps_subtile_ellipse(s_mean2d[j_test], conic, co.w,
                                                                            static_cast<float>(sub1_ix0), static_cast<float>(sub1_iy0), sub_w, sub_h);
                     }
-                    const unsigned mask0 = __ballot_sync(0xffffffffu, hit0);
-                    const unsigned mask1 = __ballot_sync(0xffffffffu, hit1);
+                    const unsigned mask0 = LFS_GROUP32_BALLOT(hit0);
+                    const unsigned mask1 = LFS_GROUP32_BALLOT(hit1);
                     unsigned live = mask0 | mask1;
                     while (live != 0u) {
                         const int k = __ffs(live) - 1;
@@ -186,12 +186,12 @@ namespace fast_lfs::rasterization {
                         };
                         float score = score_pixel(((mask0 >> k) & 1u) != 0u, inside0, last0, pixel0, T0, behind0);
                         score += score_pixel(((mask1 >> k) & 1u) != 0u, inside1, last1, pixel1, T1, behind1);
-                        const unsigned contributors = __ballot_sync(0xffffffffu, contributed);
+                        const unsigned contributors = LFS_GROUP32_BALLOT(contributed);
                         if (contributors == 0u)
                             continue;
                         score = __popc(contributors) == 1u
-                                    ? __shfl_sync(0xffffffffu, score, __ffs(contributors) - 1)
-                                    : lfs::core::warp_ops::warp_reduce_sum(score);
+                                    ? LFS_GROUP32_SHFL(score, __ffs(contributors) - 1)
+                                    : LFS_GROUP32_SUM(score);
                         if (lane_id == 0u)
                             atomicAdd(scores + s_prim_idx[j], static_cast<double>(score));
                     }

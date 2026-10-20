@@ -8,6 +8,15 @@
 #include <cassert>
 #include <cmath>
 #include <nvtx3/nvToolsExt.h>
+// ROCm requires a 64-bit lane mask for __shfl_*_sync. The shuffle-down sums
+// below are read only at lane 0 of each 32-lane group, whose reduction tree
+// stays inside that group on a 64-lane wavefront too.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_LANE_MASK LFS_FULL_WARP_MASK
+#else
+#define LFS_LANE_MASK 0xffffffffu
+#endif
+
 
 namespace lfs::training::kernels::blob_seeding {
     namespace {
@@ -168,8 +177,8 @@ namespace lfs::training::kernels::blob_seeding {
             constexpr uint32_t BRIGHT_BITS = 0x55555555u;
             unsigned int bright = __popc(bits & BRIGHT_BITS), dark = __popc(bits & (BRIGHT_BITS << 1));
             for (int offset = 16; offset > 0; offset /= 2) {
-                bright += __shfl_down_sync(0xffffffffu, bright, offset);
-                dark += __shfl_down_sync(0xffffffffu, dark, offset);
+                bright += __shfl_down_sync(LFS_LANE_MASK, bright, offset);
+                dark += __shfl_down_sync(LFS_LANE_MASK, dark, offset);
             }
             if ((threadIdx.x & 31) == 0) {
                 atomicAdd(&set_bits[0], bright);

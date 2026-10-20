@@ -193,10 +193,10 @@ namespace lfs::core {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 const float4 o = make_float4(
-                    __shfl_xor_sync(0xffffffff, val.x, offset),
-                    __shfl_xor_sync(0xffffffff, val.y, offset),
-                    __shfl_xor_sync(0xffffffff, val.z, offset),
-                    __shfl_xor_sync(0xffffffff, val.w, offset));
+                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.z, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.w, offset));
                 val.x = fminf(val.x, o.x);
                 val.y = fminf(val.y, o.y);
                 val.z = fminf(val.z, o.z);
@@ -222,10 +222,10 @@ namespace lfs::core {
 #pragma unroll
                 for (int offset = 16; offset > 0; offset /= 2) {
                     const float4 o = make_float4(
-                        __shfl_xor_sync(0xffffffff, val.x, offset),
-                        __shfl_xor_sync(0xffffffff, val.y, offset),
-                        __shfl_xor_sync(0xffffffff, val.z, offset),
-                        __shfl_xor_sync(0xffffffff, val.w, offset));
+                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.z, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.w, offset));
                     val.x = fminf(val.x, o.x);
                     val.y = fminf(val.y, o.y);
                     val.z = fminf(val.z, o.z);
@@ -246,8 +246,8 @@ namespace lfs::core {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 const float2 o = make_float2(
-                    __shfl_xor_sync(0xffffffff, val.x, offset),
-                    __shfl_xor_sync(0xffffffff, val.y, offset));
+                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset));
                 val.x = fminf(val.x, o.x);
                 val.y = fminf(val.y, o.y);
             }
@@ -268,8 +268,8 @@ namespace lfs::core {
 #pragma unroll
                 for (int offset = 16; offset > 0; offset /= 2) {
                     const float2 o = make_float2(
-                        __shfl_xor_sync(0xffffffff, val.x, offset),
-                        __shfl_xor_sync(0xffffffff, val.y, offset));
+                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.x, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val.y, offset));
                     val.x = fminf(val.x, o.x);
                     val.y = fminf(val.y, o.y);
                 }

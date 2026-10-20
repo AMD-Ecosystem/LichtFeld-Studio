@@ -15,7 +15,46 @@
 
 #include <cuda_fp16.h>
 
+// The blend, warp-cull and instance kernels work in groups of 32 lanes (an 8x4
+// pixel sub-tile, or one source lane's rows). A CUDA warp is one such group. A
+// 64-lane wavefront holds two, so on ROCm a ballot returns this group's half of
+// the wave mask, shuffles address a lane inside the group, and sums fold only
+// the group (offsets below 32). Each CUDA expansion is the original expression.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_GROUP32_MASK LFS_FULL_WARP_MASK
+#define LFS_GROUP32_BALLOT(pred)     static_cast<unsigned>(__ballot_sync(LFS_FULL_WARP_MASK, (pred)) >> (__lane_id() & 32u))
+#define LFS_GROUP32_SHFL(var, src) __shfl_sync(LFS_FULL_WARP_MASK, (var), (src), 32)
+#define LFS_GROUP32_SUM(val) ::fast_lfs::rasterization::kernels::group32_reduce_sum(val)
+#define LFS_GROUP32_MAX(val) ::fast_lfs::rasterization::kernels::group32_reduce_max(val)
+#else
+#define LFS_GROUP32_MASK 0xffffffffu
+#define LFS_GROUP32_BALLOT(pred) __ballot_sync(0xffffffffu, (pred))
+#define LFS_GROUP32_SHFL(var, src) __shfl_sync(0xffffffffu, (var), (src))
+#define LFS_GROUP32_SUM(val) ::lfs::core::warp_ops::warp_reduce_sum(val)
+#define LFS_GROUP32_MAX(val) ::lfs::core::warp_ops::warp_reduce_max(val)
+#endif
+
 namespace fast_lfs::rasterization::kernels {
+
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+    template <typename T>
+    __device__ __forceinline__ T group32_reduce_sum(T val) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            val += __shfl_xor_sync(LFS_GROUP32_MASK, val, offset);
+        }
+        return val;
+    }
+    template <typename T>
+    __device__ __forceinline__ T group32_reduce_max(T val) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            const T other = __shfl_xor_sync(LFS_GROUP32_MASK, val, offset);
+            val = (val > other) ? val : other;
+        }
+        return val;
+    }
+#endif
 
     // SH swizzle index: swizzled layout is [ceil(N/R), K_F4, R] of float4 where
     // R = config::sh_reorder_size and K_F4 = config::sh_rest_float4_per_primitive,
@@ -1378,7 +1417,7 @@ namespace fast_lfs::rasterization::kernels {
         uint inclusive = val;
 #pragma unroll
         for (int offset = 1; offset < 32; offset <<= 1) {
-            const uint n = __shfl_up_sync(0xffffffffu, inclusive, offset);
+            const uint n = __shfl_up_sync(LFS_GROUP32_MASK, inclusive, offset);
             if ((threadIdx.x & 31) >= static_cast<unsigned>(offset))
                 inclusive += n;
         }

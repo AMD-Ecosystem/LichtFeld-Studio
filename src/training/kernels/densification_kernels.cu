@@ -12,6 +12,15 @@
 #include <limits>
 
 #include "kernel_stream.hpp"
+// ROCm requires a 64-bit lane mask for __shfl_*_sync. The shuffle-down sums
+// below are read only at lane 0 of each 32-lane group, whose reduction tree
+// stays inside that group on a 64-lane wavefront too.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_LANE_MASK LFS_FULL_WARP_MASK
+#else
+#define LFS_LANE_MASK 0xffffffffu
+#endif
+
 
 namespace lfs::training::kernels {
 
@@ -538,7 +547,7 @@ namespace lfs::training::kernels {
             }
             if constexpr (kPass == 0 && kPositiveOnly) {
                 for (int offset = 16; offset > 0; offset >>= 1) {
-                    counted += __shfl_down_sync(0xffffffffu, counted, offset);
+                    counted += __shfl_down_sync(LFS_LANE_MASK, counted, offset);
                 }
                 if ((threadIdx.x & 31) == 0 && counted != 0u) {
                     atomicAdd(&state->total, counted);

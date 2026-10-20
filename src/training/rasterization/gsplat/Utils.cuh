@@ -39,9 +39,19 @@ namespace gsplat_lfs {
         return val;
     }
 #define GSPLAT_WARP_SUM(val, warp) warpReduceSum((val), (warp))
+// Raw lane intrinsics over a 32-lane tile: a 64-lane wavefront holds two
+// tiles, so a ballot returns this tile's half of the wave mask and a shuffle
+// addresses a lane inside the tile.
+#define GSPLAT_TILE32_MASK LFS_FULL_WARP_MASK
+#define GSPLAT_TILE32_BALLOT(pred) \
+    static_cast<unsigned>(__ballot_sync(LFS_FULL_WARP_MASK, (pred)) >> (__lane_id() & 32u))
+#define GSPLAT_TILE32_SHFL(var, src) __shfl_sync(LFS_FULL_WARP_MASK, (var), (src), 32)
 #define GSPLAT_WARP_MAX(val, warp) warpReduceMax((val), (warp))
 #else
 #define GSPLAT_WARP_SUM(val, warp) cg::reduce((warp), (val), cg::plus<float>())
+#define GSPLAT_TILE32_MASK 0xffffffffu
+#define GSPLAT_TILE32_BALLOT(pred) __ballot_sync(0xffffffffu, (pred))
+#define GSPLAT_TILE32_SHFL(var, src) __shfl_sync(0xffffffffu, (var), (src))
 #define GSPLAT_WARP_MAX(val, warp) cg::reduce((warp), (val), cg::greater<float>())
 #endif
 
@@ -257,8 +267,10 @@ namespace gsplat_lfs {
         if (smem <= max_set) {
             return;
         }
+        // hipFuncSetAttribute takes the kernel as const void* only; CUDA has the
+        // same overload next to its templated one, so the cast is portable.
         const auto err = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         lfs::core::ensure_cuda_success(
             err,
             "cudaFuncSetAttribute(dynamic shared memory)",

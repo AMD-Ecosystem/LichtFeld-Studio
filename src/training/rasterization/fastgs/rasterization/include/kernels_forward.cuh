@@ -140,7 +140,7 @@ namespace fast_lfs::rasterization::kernels::forward {
             !isfinite(raw_rotation.x) || !isfinite(raw_rotation.y) ||
             !isfinite(raw_rotation.z) || !isfinite(raw_rotation.w) || !isfinite(raw_opacity))
             active = false;
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (__ballot_sync(LFS_BALLOT_MASK, active) == 0)
             return;
         const float3 clamped_scale = make_float3(
             fminf(raw_scale.x, config::max_raw_scale),
@@ -366,26 +366,26 @@ namespace fast_lfs::rasterization::kernels::forward {
         FastGSForwardStatus* __restrict__ status) {
         const uint lane = threadIdx.x & 31u;
         for (int src = 0; src < 32; ++src) {
-            const bool src_active = __shfl_sync(0xffffffffu, static_cast<unsigned>(active), src) != 0u;
-            const uint src_n_scan = __shfl_sync(0xffffffffu, n_scan, src);
+            const bool src_active = LFS_GROUP32_SHFL(static_cast<unsigned>(active), src) != 0u;
+            const uint src_n_scan = LFS_GROUP32_SHFL(n_scan, src);
             if (!src_active || src_n_scan == 0u)
                 continue;
-            const uint src_scan0 = __shfl_sync(0xffffffffu, scan0, src);
-            const uint src_cross0 = __shfl_sync(0xffffffffu, cross0, src);
-            const uint src_cross1 = __shfl_sync(0xffffffffu, cross1, src);
-            const uint src_write_end = __shfl_sync(0xffffffffu, write_offset_end, src);
-            const uint src_write = __shfl_sync(0xffffffffu, current_write_offset, src);
-            const uint src_prim = __shfl_sync(0xffffffffu, primitive_idx, src);
-            const uint src_dkey = __shfl_sync(0xffffffffu, depth_key, src);
-            const bool src_along_x = __shfl_sync(0xffffffffu, static_cast<unsigned>(scan_along_x), src) != 0u;
+            const uint src_scan0 = LFS_GROUP32_SHFL(scan0, src);
+            const uint src_cross0 = LFS_GROUP32_SHFL(cross0, src);
+            const uint src_cross1 = LFS_GROUP32_SHFL(cross1, src);
+            const uint src_write_end = LFS_GROUP32_SHFL(write_offset_end, src);
+            const uint src_write = LFS_GROUP32_SHFL(current_write_offset, src);
+            const uint src_prim = LFS_GROUP32_SHFL(primitive_idx, src);
+            const uint src_dkey = LFS_GROUP32_SHFL(depth_key, src);
+            const bool src_along_x = LFS_GROUP32_SHFL(static_cast<unsigned>(scan_along_x), src) != 0u;
             const float2 src_mean = make_float2(
-                __shfl_sync(0xffffffffu, mean2d_shifted.x, src),
-                __shfl_sync(0xffffffffu, mean2d_shifted.y, src));
+                LFS_GROUP32_SHFL(mean2d_shifted.x, src),
+                LFS_GROUP32_SHFL(mean2d_shifted.y, src));
             const float3 src_conic = make_float3(
-                __shfl_sync(0xffffffffu, conic.x, src),
-                __shfl_sync(0xffffffffu, conic.y, src),
-                __shfl_sync(0xffffffffu, conic.z, src));
-            const float src_radius_sq = __shfl_sync(0xffffffffu, radius_sq, src);
+                LFS_GROUP32_SHFL(conic.x, src),
+                LFS_GROUP32_SHFL(conic.y, src),
+                LFS_GROUP32_SHFL(conic.z, src));
+            const float src_radius_sq = LFS_GROUP32_SHFL(radius_sq, src);
 
             uint emitted_unclamped = 0u;
             for (uint row0 = 0; row0 < src_n_scan; row0 += 32u) {
@@ -405,7 +405,7 @@ namespace fast_lfs::rasterization::kernels::forward {
                         span, scan_index, src_along_x, grid_width, src_dkey, src_prim,
                         write_at, src_write_end, instance_keys, instance_primitive_indices);
                 }
-                emitted_unclamped += lfs::core::warp_ops::warp_reduce_sum(cnt);
+                emitted_unclamped += LFS_GROUP32_SUM(cnt);
             }
 
             if (lane == static_cast<uint>(src)) {
@@ -747,8 +747,8 @@ namespace fast_lfs::rasterization::kernels::forward {
                                   (static_cast<uint>(bb.z) < sub1_iy1) &&
                                   (static_cast<uint>(bb.w) > sub1_iy0);
                 }
-                unsigned mask0 = __ballot_sync(0xffffffffu, intersects0);
-                unsigned mask1 = __ballot_sync(0xffffffffu, intersects1);
+                unsigned mask0 = LFS_GROUP32_BALLOT(intersects0);
+                unsigned mask1 = LFS_GROUP32_BALLOT(intersects1);
                 if (warp_cull_mode == 1) {
                     mask0 = mask1 = 0xffffffffu;
                 } else if (warp_cull_mode == 2) {

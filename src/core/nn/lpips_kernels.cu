@@ -3,6 +3,7 @@
 
 #include "core/assert.hpp"
 #include "core/cuda_error.hpp"
+#include "nn_device.cuh"
 #include "nn_kernels.hpp"
 
 #include <algorithm>
@@ -258,8 +259,8 @@ namespace lfs::core::nn::kernels {
                 if constexpr (kPool) {
                     float mx = fmaxf(x0, x1);
                     float my = fmaxf(y0, y1);
-                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
-                    my = fmaxf(my, __shfl_xor_sync(0xffffffffu, my, 1));
+                    mx = fmaxf(mx, __shfl_xor_sync(LFS_NN_WARP_MASK, mx, 1));
+                    my = fmaxf(my, __shfl_xor_sync(LFS_NN_WARP_MASK, my, 1));
                     if (pool_ok) {
                         const long long o = (static_cast<long long>(ni) * channels + c) * out_h * out_w +
                                             static_cast<long long>(r) * out_w + (col >> 1);
@@ -314,7 +315,7 @@ namespace lfs::core::nn::kernels {
             }
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                score += __shfl_xor_sync(0xffffffffu, score, offset);
+                score += __shfl_xor_sync(LFS_NN_WARP_MASK, score, offset);
             }
             if (lane == 0) {
                 block_score[warp] = score;

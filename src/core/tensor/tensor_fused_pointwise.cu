@@ -234,7 +234,7 @@ namespace lfs::core::tensor_ops {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 val = reduce_combine(
-                    val, __shfl_xor_sync(0xffffffff, val, offset), reduce_op_int);
+                    val, __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val, offset), reduce_op_int);
             }
             return val;
         }

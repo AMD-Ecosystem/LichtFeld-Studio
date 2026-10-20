@@ -18,7 +18,7 @@ namespace lfs::core::nn::kernels {
         __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                v += __shfl_xor_sync(0xffffffffu, v, offset);
+                v += __shfl_xor_sync(LFS_NN_WARP_MASK, v, offset);
             }
             return v;
         }

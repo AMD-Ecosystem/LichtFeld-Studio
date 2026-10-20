@@ -248,11 +248,11 @@ namespace gsplat_lfs {
 
     __device__ __forceinline__ float reduce_field(float v, const unsigned n_contrib, const int src_lane) {
         if (n_contrib == 1u) {
-            return __shfl_sync(0xffffffffu, v, src_lane);
+            return GSPLAT_TILE32_SHFL(v, src_lane);
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
-            v += __shfl_xor_sync(0xffffffffu, v, offset);
+            v += __shfl_xor_sync(GSPLAT_TILE32_MASK, v, offset);
         }
         return v;
     }
@@ -415,8 +415,18 @@ namespace gsplat_lfs {
 
         const uint32_t tr = block.thread_rank();
         cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+        // ROCm CG has no cg::reduce; butterfly __shfl_xor max over the 32-lane
+        // tile (wave-size-agnostic) on HIP, cg::reduce on CUDA.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        int32_t warp_bin_final = max(pix0.bin_final, pix1.bin_final);
+#pragma unroll
+        for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+            warp_bin_final = max(warp_bin_final, warp.shfl_xor(warp_bin_final, offset));
+        }
+#else
         const int32_t warp_bin_final =
             cg::reduce(warp, max(pix0.bin_final, pix1.bin_final), cg::greater<int>());
+#endif
 
         auto stage_splat = [&](const int32_t idx, const uint32_t slot) {
             if (idx >= range_start) {
@@ -482,7 +492,7 @@ namespace gsplat_lfs {
                     v_opacity_local, densification_weight_local, densification_error_weighted_local,
                     edge_weight_map, edge_score_local, hit0, hit1);
 
-                const unsigned valid_mask = __ballot_sync(0xffffffffu, hit0 || hit1);
+                const unsigned valid_mask = GSPLAT_TILE32_BALLOT(hit0 || hit1);
                 if (valid_mask == 0u) {
                     if constexpr (!kEdgeScoring) {
                         continue;
@@ -788,7 +798,7 @@ namespace gsplat_lfs {
                     }
                 }
 
-                const unsigned valid_mask = __ballot_sync(0xffffffffu, valid);
+                const unsigned valid_mask = GSPLAT_TILE32_BALLOT(valid);
                 if (valid_mask == 0u) {
                     if constexpr (!kEdgeScoring) {
                         continue;

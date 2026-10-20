@@ -20,7 +20,7 @@ namespace lfs::core::nn::kernels {
         __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                v += __shfl_xor_sync(0xffffffffu, v, offset);
+                v += __shfl_xor_sync(LFS_NN_WARP_MASK, v, offset);
             }
             return v;
         }
@@ -28,7 +28,7 @@ namespace lfs::core::nn::kernels {
         __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                const float other = __shfl_xor_sync(0xffffffffu, v, offset);
+                const float other = __shfl_xor_sync(LFS_NN_WARP_MASK, v, offset);
                 v = fmaxf(v, other);
             }
             return v;
@@ -683,8 +683,8 @@ namespace lfs::core::nn::kernels {
                     }
 #pragma unroll
                     for (int r = 0; r < 2; ++r) {
-                        row_max[r] = fmaxf(row_max[r], __shfl_xor_sync(0xffffffffu, row_max[r], 1));
-                        row_max[r] = fmaxf(row_max[r], __shfl_xor_sync(0xffffffffu, row_max[r], 2));
+                        row_max[r] = fmaxf(row_max[r], __shfl_xor_sync(LFS_NN_WARP_MASK, row_max[r], 1));
+                        row_max[r] = fmaxf(row_max[r], __shfl_xor_sync(LFS_NN_WARP_MASK, row_max[r], 2));
                     }
 
                     float alpha[2];
@@ -721,8 +721,8 @@ namespace lfs::core::nn::kernels {
                     }
 #pragma unroll
                     for (int r = 0; r < 2; ++r) {
-                        l_add[r] += __shfl_xor_sync(0xffffffffu, l_add[r], 1);
-                        l_add[r] += __shfl_xor_sync(0xffffffffu, l_add[r], 2);
+                        l_add[r] += __shfl_xor_sync(LFS_NN_WARP_MASK, l_add[r], 1);
+                        l_add[r] += __shfl_xor_sync(LFS_NN_WARP_MASK, l_add[r], 2);
                         l_i[tile][r] = l_i[tile][r] * alpha[r] + l_add[r];
                         m_i[tile][r] = m_new[r];
                     }

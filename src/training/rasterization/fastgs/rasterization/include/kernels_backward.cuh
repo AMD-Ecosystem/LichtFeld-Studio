@@ -822,7 +822,7 @@ namespace fast_lfs::rasterization::kernels::backward {
 #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             local_max_contrib = ::max(local_max_contrib,
-                                      __shfl_xor_sync(0xffffffffu, local_max_contrib, offset));
+                                      __shfl_xor_sync(LFS_GROUP32_MASK, local_max_contrib, offset));
         }
         constexpr int kBwdWarps = config::block_size_blend_backward / 32;
         __shared__ uint s_warp_max_contrib[kBwdWarps];
@@ -985,8 +985,8 @@ namespace fast_lfs::rasterization::kernels::backward {
                             s_mean2d[j_test], conic_t, co.w, sub1_x0, sub1_y0, sub_w, sub_h);
                     }
                 }
-                unsigned mask0 = __ballot_sync(0xffffffffu, hit0);
-                unsigned mask1 = __ballot_sync(0xffffffffu, hit1);
+                unsigned mask0 = LFS_GROUP32_BALLOT(hit0);
+                unsigned mask1 = LFS_GROUP32_BALLOT(hit1);
                 if constexpr (WARP_CULL_MODE == 1) {
                     mask0 = mask1 = 0xffffffffu;
                 } else if constexpr (WARP_CULL_MODE == 2) {
@@ -1128,15 +1128,15 @@ namespace fast_lfs::rasterization::kernels::backward {
                                      T1, grad_c1, grad_T1, grad_d1, grad_n1, behind1);
 
                     // Warp-reduce → one global atomic per splat per warp.
-                    const unsigned contrib_mask = __ballot_sync(0xffffffffu, has_contribution);
+                    const unsigned contrib_mask = LFS_GROUP32_BALLOT(has_contribution);
                     if (contrib_mask != 0u && primitive_idx < n_primitives) {
                         using lfs::core::warp_ops::warp_reduce_sum;
                         const unsigned n_contrib = __popc(contrib_mask);
                         const int src_lane = __ffs(contrib_mask) - 1;
                         auto reduce_field = [&](float v) -> float {
                             if (n_contrib == 1u)
-                                return __shfl_sync(0xffffffffu, v, src_lane);
-                            return warp_reduce_sum(v);
+                                return LFS_GROUP32_SHFL(v, src_lane);
+                            return LFS_GROUP32_SUM(v);
                         };
                         const float mean_x = reduce_field(accum.mean_x);
                         const float mean_y = reduce_field(accum.mean_y);
@@ -1167,8 +1167,8 @@ namespace fast_lfs::rasterization::kernels::backward {
                         if constexpr (IMPACT_SCORE) {
                             reduced_impact_sum = reduce_field(impact_sum);
                             reduced_impact_peak = n_contrib == 1u
-                                                      ? __shfl_sync(0xffffffffu, impact_peak, src_lane)
-                                                      : lfs::core::warp_ops::warp_reduce_max(impact_peak);
+                                                      ? LFS_GROUP32_SHFL(impact_peak, src_lane)
+                                                      : LFS_GROUP32_MAX(impact_peak);
                         }
                         if (lane_id == 0u) {
                             atomicAdd(&grad_mean2d[work_idx].x, clamp_grad(mean_x));

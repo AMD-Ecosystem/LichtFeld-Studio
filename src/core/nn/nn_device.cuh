@@ -6,6 +6,15 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+// ROCm requires a 64-bit lane mask for __shfl_*_sync. The warp reductions in
+// these kernels fold 32-lane groups (offsets below 32), which stay inside one
+// half of a 64-lane wavefront, so only the mask width differs.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_NN_WARP_MASK LFS_FULL_WARP_MASK
+#else
+#define LFS_NN_WARP_MASK 0xffffffffu
+#endif
+
 namespace lfs::core::nn::device {
 
     __device__ __forceinline__ float gelu_erf(const float x) {
