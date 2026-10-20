@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include "pty_process.hpp"
 
 #ifdef _WIN32
@@ -77,16 +79,13 @@ namespace lfs::vis::terminal {
         std::vector<TerminalRowSnapshot> visible_rows;
     };
 
-    class TerminalWidget {
+    class LFS_VIS_API TerminalWidget {
     public:
         explicit TerminalWidget(int cols = 80, int rows = 24);
         ~TerminalWidget();
 
         TerminalWidget(const TerminalWidget&) = delete;
         TerminalWidget& operator=(const TerminalWidget&) = delete;
-
-        // Spawn shell. Empty = default shell, "python3" for Python REPL
-        void spawn(const std::string& shell = "");
 
         // Create PTY pair without forking. Returns fds for the Python-side I/O.
         EmbeddedFds spawnEmbedded();
@@ -95,12 +94,9 @@ namespace lfs::vis::terminal {
         void update();
         void resize(int cols, int rows);
         [[nodiscard]] TerminalSnapshot snapshot() const;
-        [[nodiscard]] int cols() const { return cols_; }
-        [[nodiscard]] int rows() const { return rows_; }
 
         void setFocused(bool focused);
         void sendText(std::string_view text);
-        void sendCodepoint(uint32_t codepoint);
         void sendKey(TerminalKey key);
         void sendControl(char letter);
         void beginSelection(int row, int col);
@@ -110,7 +106,6 @@ namespace lfs::vis::terminal {
 
         // State
         [[nodiscard]] bool is_running() const { return pty_.is_running(); }
-        [[nodiscard]] bool has_output() const { return has_new_output_.load(); }
         [[nodiscard]] bool isFocused() const { return is_focused_.load(); }
         [[nodiscard]] bool needsRedraw() const { return rendered_generation_.load() != redraw_generation_.load(); }
         [[nodiscard]] uint64_t redrawGeneration() const { return redraw_generation_.load(); }
@@ -126,7 +121,7 @@ namespace lfs::vis::terminal {
         [[nodiscard]] std::string getAllText() const;
         void paste(const std::string& text);
 
-        // Clear screen (sends Ctrl+L to PTY, or resets vterm if no PTY)
+        // Clear screen and scrollback, preserving a visible primary prompt without writing to stdin.
         void clear();
 
         // Direct text output (for read-only output terminal without PTY)
@@ -139,9 +134,6 @@ namespace lfs::vis::terminal {
         // Read-only mode (disables keyboard input, for output-only terminals)
         void setReadOnly(bool readonly) { read_only_.store(readonly); }
         [[nodiscard]] bool isReadOnly() const { return read_only_.load(); }
-
-        // Send text to PTY (for executing code programmatically)
-        void sendToPty(const std::string& text);
 
         // Send interrupt signal (Ctrl+C) to stop running process
         void interrupt();
@@ -158,7 +150,7 @@ namespace lfs::vis::terminal {
         static int onMoveCursor(VTermPos pos, VTermPos oldpos, int visible, void* user);
         static int onBell(void* user);
         static int onResize(int rows, int cols, void* user);
-        static int onPushline(int cols, const VTermScreenCell* cells, void* user);
+        static int onPushline(int cols, const VTermScreenCell* cells, bool continuation, void* user);
         static int onPopline(int cols, VTermScreenCell* cells, void* user);
 
         [[nodiscard]] TerminalColor vtermColorToPackedColor(VTermColor color) const;
@@ -188,6 +180,7 @@ namespace lfs::vis::terminal {
         // Scrollback buffer
         struct ScrollbackLine {
             std::vector<VTermScreenCell> cells;
+            bool continuation = false;
         };
         std::deque<ScrollbackLine> scrollback_;
         int scroll_offset_ = 0;

@@ -59,6 +59,11 @@ namespace lfs::python {
     [[nodiscard]] std::optional<PyTensor> render_view(const PyTensor& rotation, const PyTensor& translation, int width,
                                                       int height, float fov_degrees = 60.0f,
                                                       const PyTensor* bg_color = nullptr);
+    [[nodiscard]] std::optional<PyTensor> render_view_u8(const PyTensor& rotation, const PyTensor& translation,
+                                                         int width, int height, float fov_degrees = 60.0f,
+                                                         const PyTensor* bg_color = nullptr,
+                                                         std::optional<bool> orthographic = std::nullopt,
+                                                         std::optional<float> ortho_scale = std::nullopt);
 
     [[nodiscard]] std::optional<PyTensor> compute_screen_positions(const PyTensor& rotation, const PyTensor& translation,
                                                                    int width, int height, float fov_degrees = 60.0f);
@@ -87,6 +92,7 @@ namespace lfs::python {
         [[nodiscard]] const std::string& property_group() const { return prop_.group_id(); }
         [[nodiscard]] nb::object get(const std::string& name) const { return prop_.getattr(name); }
         void set(const std::string& name, nb::object value);
+        void _set_without_session_dirty(const std::string& name, nb::object value);
         [[nodiscard]] nb::dict prop_info(const std::string& name) const {
             return prop_.prop_info(name);
         }
@@ -126,6 +132,7 @@ namespace lfs::python {
         PyRenderSettings& operator=(const PyRenderSettings&) = delete;
 
     private:
+        void set_impl(const std::string& name, nb::object value, bool mark_session_dirty);
         vis::RenderSettingsProxy settings_;
         PyProp<vis::RenderSettingsProxy> prop_;
     };

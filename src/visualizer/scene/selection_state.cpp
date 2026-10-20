@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "scene/selection_state.hpp"
+#include "core/services.hpp"
+#include "rendering/rendering_manager.hpp"
 #include "visualizer/app_store.hpp"
 #include <cassert>
 
@@ -59,7 +61,7 @@ namespace lfs::vis {
         return selected_nodes_.size();
     }
 
-    const std::vector<bool>& SelectionState::getNodeMask(const core::Scene& scene) const {
+    std::vector<bool> SelectionState::getNodeMask(const core::Scene& scene) const {
         std::shared_lock lock(mutex_);
         if (!node_mask_dirty_)
             return cached_node_mask_;
@@ -93,6 +95,11 @@ namespace lfs::vis {
     void SelectionState::bumpGeneration() {
         const uint32_t generation = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
         app_store().selection_generation.set(generation);
+        // Python can write the store generation independently. Its value can
+        // already equal this generation, so publishing it need not notify.
+        if (auto* rendering = services().renderingOrNull())
+            rendering->markDirty(DirtyFlag::SELECTION | DirtyFlag::OVERLAY,
+                                 FrameReason::Selection, "node_selection");
     }
 
 } // namespace lfs::vis

@@ -1,0 +1,834 @@
+# SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Contract tests for the LichtFeld portal account client."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import stat
+import threading
+import time
+import urllib.error
+import urllib.parse
+from collections import deque
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from lfs_plugins import portal_account
+from lfs_plugins import credential_storage
+from lfs_plugins.ui.store import RuntimeState
+
+
+@pytest.fixture(autouse=True)
+def account_contract_storage(monkeypatch):
+    # These contracts inspect test JSON files; OS encryption is tested separately.
+    monkeypatch.setattr(credential_storage, "default_backend", credential_storage.FileBackend)
+
+
+class FakeResponse:
+    def __init__(self, status: int, payload=None, headers=None):
+        self.status = status
+        self.headers = headers or {}
+        if payload is None:
+            self._raw = b""
+        elif isinstance(payload, bytes):
+            self._raw = payload
+        else:
+            self._raw = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def getcode(self):
+        return self.status
+
+    def read(self, size=-1):
+        return self._raw if size < 0 else self._raw[:size]
+
+
+class StubUrlopen:
+    def __init__(self, *responses):
+        self.responses = deque(responses)
+        self.requests = []
+
+    def __call__(self, request, *, timeout, **kwargs):
+        del timeout, kwargs
+        self.requests.append(request)
+        if not self.responses:
+            raise AssertionError(f"Unexpected request: {request.full_url}")
+        response = self.responses.popleft()
+        if callable(response):
+            response = response(request)
+        if isinstance(response, BaseException):
+            raise response
+        if isinstance(response, tuple):
+            return FakeResponse(*response)
+        return FakeResponse(200, response)
+
+
+def token_pair(access="access-new", refresh="refresh-new"):
+    return {
+        "access_token": access,
+        "expires_in": 3600,
+        "refresh_token": refresh,
+        "refresh_expires_in": 90 * 24 * 60 * 60,
+        "token_type": "Bearer",
+    }
+
+
+@pytest.mark.parametrize("worker", ["_flow_thread", "_sync_thread", "_sign_out_thread"])
+def test_busy_tracks_account_worker_lifetime(tmp_path, worker):
+    account = portal_account.PortalAccountService(credentials_path=tmp_path / "credentials.json")
+    assert account.busy is False
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait)
+    setattr(account, worker, thread)
+    assert account.busy is False
+    thread.start()
+    try:
+        assert account.busy is True
+    finally:
+        release.set()
+        account.wait_for_idle()
+    assert not thread.is_alive()
+    assert account.busy is False
+
+
+def test_saved_authorization_is_visible_while_connection_is_switched_off(tmp_path):
+    path = tmp_path / "credentials.json"
+    write_credentials(path, connection_enabled=False)
+
+    account = portal_account.PortalAccountService(credentials_path=path)
+
+    assert account.snapshot().signed_in is False
+    assert account.snapshot().authorized is True
+    from lfs_plugins.portal_connection_ui import connection_state
+    assert connection_state(account.snapshot()) == "switched_off"
+
+
+def test_action_waits_for_successful_connection_and_runs_once(tmp_path, monkeypatch):
+    account = make_service(tmp_path)
+    actions = []
+    scheduled = []
+    monkeypatch.setattr(account, "start_device_flow", lambda: True)
+    monkeypatch.setattr(account, "_run_connection_action", scheduled.append)
+
+    assert account.run_after_connection(lambda: actions.append("publish")) is True
+    assert actions == [] and len(account._connection_actions) == 1
+
+    account._snapshot = replace(account.snapshot(), signed_in=True)
+    account._run_pending_connection_actions()
+    account._run_pending_connection_actions()
+    assert len(scheduled) == 1
+    scheduled.pop()()
+    assert actions == ["publish"]
+
+
+def test_action_waits_for_profile_identity_after_device_approval(tmp_path, monkeypatch):
+    account = make_service(tmp_path)
+    actions = []
+    scheduled = []
+    monkeypatch.setattr(account, "start_device_flow", lambda: True)
+    monkeypatch.setattr(account, "_run_connection_action", scheduled.append)
+    account.run_after_connection(lambda: actions.append("publish"))
+
+    credentials = account._credentials_from_token_pair(token_pair())
+    account._apply_credentials_state(credentials)
+    assert scheduled == []
+
+    account._apply_credentials_state(replace(credentials, email="ada@example.com",
+                                             connected_since="2026-09-24T11:00:00Z"))
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert actions == ["publish"]
+
+
+def test_cancelled_connection_drops_pending_action(tmp_path, monkeypatch):
+    account = make_service(tmp_path)
+    actions = []
+    monkeypatch.setattr(account, "start_device_flow", lambda: True)
+
+    account.run_after_connection(lambda: actions.append("check"))
+    account._finish_device_flow("")
+
+    assert actions == []
+    assert account._connection_actions == []
+
+
+def test_gallery_request_rejects_different_session_before_network(tmp_path, monkeypatch):
+    path = tmp_path / "credentials.json"
+    write_credentials(path)
+    account = portal_account.PortalAccountService(credentials_path=path)
+    network = StubUrlopen()
+    monkeypatch.setattr(portal_account, "urlopen", network)
+    with pytest.raises(portal_account.PortalProtocolError, match="account changed"):
+        account.request_json_authenticated("POST", "/api/gallery/v1/splats/uploads", {},
+            expected_session=("different@example.com", "session"))
+    assert network.requests == []
+
+
+def test_gallery_delete_preserves_revision_body_on_explicit_retry_after_refresh(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from lfs_plugins.portal_gallery import PortalGalleryClient
+    path = tmp_path / 'credentials.json'
+    write_credentials(path)
+    account = portal_account.PortalAccountService(credentials_path=path)
+    old = account._current_credentials()
+    network = StubUrlopen((401, {'error': 'invalid_token'}), (204, None))
+    monkeypatch.setattr(portal_account, 'urlopen', network)
+    def refresh(*args, **kwargs):
+        account._set_current_credentials(replace(old, access_token='replacement-token'))
+        return 'ok'
+    monkeypatch.setattr(account, '_refresh_tokens', refresh)
+    client = PortalGalleryClient(account, expected_session=(old.email, old.connected_since), revision_domains=1)
+    with pytest.raises(portal_account.PortalHTTPError, match='access_refreshed'):
+        client.delete('7e812ba8-6cfb-4307-a0bc-da8e395bb721', {'contentRevision': 'content', 'metadataRevision': 'metadata'})
+    assert len(network.requests) == 1
+    client.delete('7e812ba8-6cfb-4307-a0bc-da8e395bb721', {'contentRevision': 'content', 'metadataRevision': 'metadata'})
+    assert len(network.requests) == 2
+    assert all(r.method == 'DELETE' and json.loads(r.data) == {'baseRevisions': {'content': 'content', 'metadata': 'metadata'}}
+               for r in network.requests)
+    assert network.requests[-1].get_header('Authorization') == 'Bearer replacement-token'
+
+
+# Catches a session revoked on the portal that signs Studio out without telling the user why.
+def test_revoked_session_signs_out_with_a_reason(tmp_path, monkeypatch):
+    path = tmp_path / "credentials.json"
+    write_credentials(path)
+    account = portal_account.PortalAccountService(credentials_path=path)
+    network = StubUrlopen((401, {"error": "invalid_token"}))
+    monkeypatch.setattr(portal_account, "urlopen", network)
+    monkeypatch.setattr(account, "_refresh_tokens", lambda *args, **kwargs: "invalid")
+    with pytest.raises(portal_account.PortalHTTPError):
+        account.request_json_authenticated("GET", "/api/gallery/v1/me")
+    snapshot = account.snapshot()
+    assert not snapshot.signed_in and not path.exists()
+    assert snapshot.error == "invalid_token"
+
+
+def test_gallery_request_does_not_retry_under_account_changed_during_refresh(tmp_path, monkeypatch):
+    from dataclasses import replace
+    path = tmp_path / "credentials.json"
+    write_credentials(path)
+    account = portal_account.PortalAccountService(credentials_path=path)
+    old = account._current_credentials()
+    network = StubUrlopen((401, {"error": "invalid_token"}))
+    monkeypatch.setattr(portal_account, "urlopen", network)
+    def refresh(*args, **kwargs):
+        account._set_current_credentials(replace(old, email="different@example.com", access_token="other-account"))
+        return "ok"
+    monkeypatch.setattr(account, "_refresh_tokens", refresh)
+    with pytest.raises(portal_account.PortalProtocolError, match="account changed"):
+        account.request_json_authenticated("POST", "/api/gallery/v1/splats/uploads", {},
+            expected_session=(old.email, old.connected_since))
+    assert len(network.requests) == 1
+
+
+def profile(name="Ada Lovelace", tier="Professional"):
+    return {
+        "display_name": name,
+        "email": "ada@example.com",
+        "customer_status": "active",
+        "customer_tier": tier,
+        "has_download_access": True,
+        "member_since": "2025-01-02T03:04:05Z",
+        "session": {
+            "device_name": "LichtFeld Studio",
+            "created_at": "2026-02-03T04:05:06Z",
+        },
+    }
+
+
+def start_response(interval=0, expires_in=600, device_code="device-secret"):
+    return {
+        "device_code": device_code,
+        "user_code": "KXQ4-7RTM",
+        "verification_uri": "https://portal.lichtfeld.io/link/",
+        "verification_uri_complete": "https://portal.lichtfeld.io/link/?code=KXQ4-7RTM",
+        "expires_in": expires_in,
+        "interval": interval,
+    }
+
+
+def write_credentials(
+    path: Path,
+    *,
+    origin=portal_account.DEFAULT_PORTAL_URL,
+    access="access-old",
+    refresh="refresh-old",
+    access_expires_at=None,
+    refresh_expires_at=None,
+    display_name="Ada Lovelace",
+    tier="Professional",
+    connection_enabled=True,
+):
+    now = time.time()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": portal_account.CREDENTIALS_VERSION,
+                "portal_origin": origin,
+                "access_token": access,
+                "access_expires_at": access_expires_at if access_expires_at is not None else now + 3600,
+                "refresh_token": refresh,
+                "refresh_expires_at": refresh_expires_at if refresh_expires_at is not None else now + 86400,
+                "display_name": display_name,
+                "email": "ada@example.com",
+                "customer_tier": tier,
+                "member_since": "2025-01-02T03:04:05Z",
+                "connected_since": "2026-02-03T04:05:06Z",
+                "connection_enabled": connection_enabled,
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+
+
+def request_path(request):
+    return urllib.parse.urlsplit(request.full_url).path
+
+
+def request_json(request):
+    return json.loads(request.data.decode("utf-8")) if request.data else None
+
+
+def make_service(tmp_path, *, waiter=None, base_url=None):
+    return portal_account.PortalAccountService(
+        base_url=base_url,
+        credentials_path=tmp_path / "account" / "credentials.json",
+        client_version="1.2.3",
+        platform="TestOS",
+        waiter=waiter,
+    )
+
+
+def test_account_runtime_state_publishes_session_identity_as_it_arrives(tmp_path, monkeypatch):
+    monkeypatch.setattr("lfs_plugins.ui.store._native_store", lambda: None)
+    service = make_service(tmp_path)
+    service._snapshot = replace(
+        service.snapshot(), signed_in=True, email="", connected_since=""
+    )
+    service._publish_account_state()
+    assert (RuntimeState.account_state.value["email"], RuntimeState.account_state.value["connected_since"]) == ("", "")
+
+    service._snapshot = replace(service.snapshot(), email="ada@example.com")
+    service._publish_account_state()
+    assert (RuntimeState.account_state.value["email"], RuntimeState.account_state.value["connected_since"]) == ("ada@example.com", "")
+
+    service._snapshot = replace(service.snapshot(), connected_since="session-1")
+    service._publish_account_state()
+    assert (RuntimeState.account_state.value["email"], RuntimeState.account_state.value["connected_since"]) == ("ada@example.com", "session-1")
+
+
+def test_device_flow_state_machine_polls_and_caches_profile(tmp_path, monkeypatch):
+    service_holder = {}
+    poll_count = 0
+
+    def pending_then_tokens(request):
+        nonlocal poll_count
+        poll_count += 1
+        snapshot = service_holder["service"].snapshot()
+        assert snapshot.linking is True
+        assert snapshot.user_code == "KXQ4-7RTM"
+        assert 0 < snapshot.countdown_seconds <= 600
+        if poll_count == 1:
+            return (400, {"error": "authorization_pending"})
+        return (200, token_pair())
+
+    stub = StubUrlopen(start_response(), pending_then_tokens, pending_then_tokens, profile())
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda _seconds: False)
+    service_holder["service"] = service
+
+    assert service.start_device_flow() is True
+    assert service.start_device_flow() is False
+    service.wait_for_idle()
+
+    snapshot = service.snapshot()
+    assert snapshot.signed_in is True
+    assert snapshot.linking is False
+    assert snapshot.display_name == "Ada Lovelace"
+    assert snapshot.tier == "Professional"
+    assert snapshot.label == "AL"
+    assert [request_path(request) for request in stub.requests] == [
+        portal_account.DEVICE_START_PATH,
+        portal_account.DEVICE_TOKEN_PATH,
+        portal_account.DEVICE_TOKEN_PATH,
+        portal_account.ME_PATH,
+    ]
+    assert request_json(stub.requests[0]) == {
+        "client_name": "LichtFeld Studio",
+        "client_version": "1.2.3",
+        "platform": "TestOS",
+        "scope": "desktop.basic gallery.sync",
+    }
+    assert request_json(stub.requests[1]) == {"device_code": "device-secret"}
+    stored = json.loads(service.credentials_file.read_text(encoding="utf-8"))
+    assert stored["portal_origin"] == portal_account.DEFAULT_PORTAL_URL
+    assert stored["display_name"] == "Ada Lovelace"
+    assert stored["customer_tier"] == "Professional"
+
+
+@pytest.mark.parametrize("error", [PermissionError("lock denied"), OSError("storage unavailable")])
+@pytest.mark.parametrize("existing_session", [False, True])
+def test_device_credentials_storage_failure_ends_linking(
+    tmp_path, monkeypatch, error, existing_session
+):
+    if existing_session:
+        write_credentials(tmp_path / "account" / "credentials.json")
+    service = make_service(tmp_path, waiter=lambda _seconds: False)
+    previous_credentials = service._current_credentials()
+    stub = StubUrlopen(start_response(), token_pair())
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+
+    def fail_save(_credentials):
+        raise error
+
+    monkeypatch.setattr(service, "_save_credentials", fail_save)
+    assert service.start_device_flow(reauthorize=True)
+    service.wait_for_idle()
+
+    snapshot = service.snapshot()
+    assert snapshot.linking is False
+    assert snapshot.error == "sign_in_unavailable"
+    assert snapshot.signed_in is existing_session
+    assert service._current_credentials() == previous_credentials
+    assert service.busy is False
+    assert len(stub.requests) == 2
+
+
+def test_device_start_failure_publishes_signed_out_error(tmp_path, monkeypatch):
+    stub = StubUrlopen(OSError("offline"))
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    assert service.start_device_flow() is True
+    service.wait_for_idle()
+
+    snapshot = service.snapshot()
+    assert snapshot.signed_in is False
+    assert snapshot.linking is False
+    assert snapshot.error == "sign_in_unavailable"
+    assert [request_path(request) for request in stub.requests] == [portal_account.DEVICE_START_PATH]
+
+
+@pytest.mark.parametrize("terminal_error", ["access_denied", "expired_token", "invalid_grant"])
+def test_terminal_device_errors_stop_polling(tmp_path, monkeypatch, terminal_error):
+    stub = StubUrlopen(start_response(), (400, {"error": terminal_error}))
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda _seconds: False)
+
+    service.start_device_flow()
+    service.wait_for_idle()
+
+    assert service.snapshot().signed_in is False
+    assert service.snapshot().linking is False
+    assert service.snapshot().error == terminal_error
+    assert len(stub.requests) == 2
+    assert not service.credentials_file.exists()
+
+
+def test_slow_down_adds_five_seconds_to_poll_interval(tmp_path, monkeypatch):
+    waits = []
+    stub = StubUrlopen(
+        start_response(interval=2),
+        (400, {"error": "slow_down"}),
+        token_pair(),
+        profile(),
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda seconds: waits.append(seconds) or False)
+
+    service.start_device_flow()
+    service.wait_for_idle()
+
+    assert waits == [2.0, 7.0]
+    assert service.snapshot().signed_in is True
+
+
+def test_poll_wait_is_capped_by_device_code_ttl(tmp_path, monkeypatch):
+    now = [1000.0]
+    waits = []
+
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+        return False
+
+    stub = StubUrlopen(start_response(interval=10, expires_in=3))
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    monkeypatch.setattr(portal_account.time, "time", lambda: now[0])
+    service = make_service(tmp_path, waiter=wait)
+
+    service.start_device_flow()
+    service.wait_for_idle()
+
+    assert waits == [3.0]
+    assert service.snapshot().error == "expired_token"
+    assert len(stub.requests) == 1
+
+
+def test_rate_limit_honors_retry_after_and_keeps_polling(tmp_path, monkeypatch):
+    waits = []
+    stub = StubUrlopen(
+        start_response(interval=2),
+        (429, {"error": "slow_down"}, {"Retry-After": "11"}),
+        token_pair(),
+        profile(),
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda seconds: waits.append(seconds) or False)
+
+    service.start_device_flow()
+    service.wait_for_idle()
+
+    assert waits == [2.0, 11.0]
+    assert service.snapshot().signed_in is True
+
+
+@pytest.mark.parametrize(
+    "transient_response",
+    [
+        OSError("offline"),
+        (503, {"error": "service_unavailable"}),
+        (200, b"not-json"),
+    ],
+    ids=["network", "http", "protocol"],
+)
+def test_transient_poll_failure_retries_and_recovers(tmp_path, monkeypatch, transient_response):
+    stub = StubUrlopen(start_response(), transient_response, token_pair(), profile())
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda _seconds: False)
+
+    service.start_device_flow()
+    service.wait_for_idle()
+
+    assert service.snapshot().signed_in is True
+    assert [request_path(request) for request in stub.requests] == [
+        portal_account.DEVICE_START_PATH,
+        portal_account.DEVICE_TOKEN_PATH,
+        portal_account.DEVICE_TOKEN_PATH,
+        portal_account.ME_PATH,
+    ]
+
+
+def test_five_consecutive_poll_failures_end_the_flow(tmp_path, monkeypatch):
+    failures = [(503, {"error": "service_unavailable"})] * 5
+    stub = StubUrlopen(start_response(), *failures)
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda _seconds: False)
+
+    service.start_device_flow()
+    service.wait_for_idle()
+
+    snapshot = service.snapshot()
+    assert snapshot.signed_in is False
+    assert snapshot.linking is False
+    assert snapshot.error == "sign_in_unavailable"
+    assert len(stub.requests) == 1 + portal_account._MAX_CONSECUTIVE_POLL_FAILURES
+
+
+def test_membership_required_during_device_poll_is_terminal(tmp_path, monkeypatch):
+    stub = StubUrlopen(start_response(), (403, {"error": "membership_required"}))
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda _seconds: False)
+
+    service.start_device_flow()
+    service.wait_for_idle()
+
+    snapshot = service.snapshot()
+    assert snapshot.signed_in is False
+    assert snapshot.linking is False
+    assert snapshot.error == "membership_required"
+    assert len(stub.requests) == 2
+
+
+def test_credentials_use_atomic_replace_and_mode_0600(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    real_replace = portal_account.os.replace
+    replaced = []
+
+    def checked_replace(source, destination):
+        replaced.append((Path(source), Path(destination)))
+        if os.name != "nt":
+            assert stat.S_IMODE(Path(source).stat().st_mode) == 0o600
+        real_replace(source, destination)
+
+    monkeypatch.setattr(portal_account.os, "replace", checked_replace)
+    credentials = service._credentials_from_token_pair(token_pair("access-atomic", "refresh-atomic"))
+
+    service._save_credentials(credentials)
+
+    assert len(replaced) == 1
+    assert replaced[0][1] == service.credentials_file
+    if os.name != "nt":
+        assert stat.S_IMODE(service.credentials_file.stat().st_mode) == 0o600
+    stored = json.loads(service.credentials_file.read_text(encoding="utf-8"))
+    assert stored["version"] == portal_account.CREDENTIALS_VERSION
+    assert stored["access_token"] == "access-atomic"
+    assert stored["refresh_token"] == "refresh-atomic"
+
+
+def test_401_refreshes_once_and_retries_with_rotated_access_token(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path)
+    stub = StubUrlopen(
+        (401, {"error": "invalid_token"}),
+        token_pair("access-rotated", "refresh-rotated"),
+        profile(),
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    assert service.sync_profile() is True
+
+    assert [request_path(request) for request in stub.requests] == [
+        portal_account.ME_PATH,
+        portal_account.REFRESH_PATH,
+        portal_account.ME_PATH,
+    ]
+    assert stub.requests[0].get_header("Authorization") == "Bearer access-old"
+    assert request_json(stub.requests[1]) == {"refresh_token": "refresh-old"}
+    assert stub.requests[2].get_header("Authorization") == "Bearer access-rotated"
+    stored = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert stored["refresh_token"] == "refresh-rotated"
+
+
+def test_second_401_does_not_refresh_twice_and_signs_out(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path)
+    stub = StubUrlopen(
+        (401, {"error": "invalid_token"}),
+        token_pair("access-rotated", "refresh-rotated"),
+        (401, {"error": "invalid_token"}),
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    assert service.sync_profile() is False
+
+    assert sum(request_path(request) == portal_account.REFRESH_PATH for request in stub.requests) == 1
+    assert not credentials_path.exists()
+    assert service.snapshot().signed_in is False
+
+
+def test_definitive_refresh_401_clears_credentials_and_signs_out(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path)
+    stub = StubUrlopen(
+        (401, {"error": "invalid_token"}),
+        (401, {"error": "invalid_token"}),
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    assert service.sync_profile() is False
+
+    assert [request_path(request) for request in stub.requests] == [
+        portal_account.ME_PATH,
+        portal_account.REFRESH_PATH,
+    ]
+    assert not credentials_path.exists()
+    assert service.snapshot().signed_in is False
+
+
+@pytest.mark.parametrize(
+    "refresh_failure",
+    [
+        OSError("offline"),
+        (503, {"error": "service_unavailable"}),
+        (200, b"not-json"),
+    ],
+    ids=["network", "http", "protocol"],
+)
+def test_transient_refresh_failure_keeps_credentials_and_cached_state(
+    tmp_path,
+    monkeypatch,
+    refresh_failure,
+):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path, display_name="Grace Hopper", tier="Supporter")
+    stub = StubUrlopen(
+        (401, {"error": "invalid_token"}),
+        refresh_failure,
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+    cached_snapshot = service.snapshot()
+
+    assert service.sync_profile() is False
+
+    assert credentials_path.exists()
+    assert service.snapshot() == cached_snapshot
+    stored = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert stored["access_token"] == "access-old"
+    assert stored["refresh_token"] == "refresh-old"
+
+
+def test_membership_required_keeps_cached_identity_and_does_not_refresh(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path, display_name="Grace Hopper", tier="Supporter")
+    stub = StubUrlopen((403, {"error": "membership_required"}))
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    assert service.sync_profile() is False
+
+    snapshot = service.snapshot()
+    assert snapshot.signed_in is True
+    assert snapshot.membership_required is True
+    assert snapshot.display_name == "Grace Hopper"
+    assert snapshot.tier == "Supporter"
+    assert snapshot.label == "GH"
+    assert credentials_path.exists()
+    assert [request_path(request) for request in stub.requests] == [portal_account.ME_PATH]
+
+
+def test_membership_required_during_refresh_keeps_credentials(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path)
+    stub = StubUrlopen(
+        (401, {"error": "invalid_token"}),
+        (403, {"error": "membership_required"}),
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    assert service.sync_profile() is False
+
+    assert service.snapshot().membership_required is True
+    assert credentials_path.exists()
+    stored = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert stored["refresh_token"] == "refresh-old"
+
+
+def test_origin_binding_never_transmits_tokens_to_different_base_url(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path)
+    stub = StubUrlopen()
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, base_url="https://staging.example.org")
+
+    service.initialize_async()
+    service.wait_for_idle()
+
+    assert service.snapshot().signed_in is False
+    assert service.snapshot().error == "portal_origin_mismatch"
+    assert service.sync_profile() is False
+    assert stub.requests == []
+    assert credentials_path.exists()
+    assert "staging.example.org" in service.snapshot().tooltip
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://portal.lichtfeld.io",
+        "http://localhost:8000",
+        "http://127.0.0.1.example.com:8000",
+    ],
+)
+def test_http_rejected_except_exact_loopback_host(tmp_path, url):
+    with pytest.raises(ValueError, match="127.0.0.1"):
+        make_service(tmp_path, base_url=url)
+
+
+def test_http_loopback_origin_is_allowed_and_normalized(tmp_path):
+    service = make_service(tmp_path, base_url="http://127.0.0.1:8000/")
+
+    assert service.base_url == "http://127.0.0.1:8000"
+    assert service.portal_url == "http://127.0.0.1:8000/"
+
+
+def test_refresh_failure_rereads_credentials_before_signing_out(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path)
+
+    def failed_refresh_after_other_instance_rotates(request):
+        assert request_json(request) == {"refresh_token": "refresh-old"}
+        write_credentials(
+            credentials_path,
+            access="access-from-other-instance",
+            refresh="refresh-from-other-instance",
+        )
+        return (401, {"error": "invalid_token"})
+
+    def profile_with_fresh_access(request):
+        assert request.get_header("Authorization") == "Bearer access-from-other-instance"
+        return (200, profile())
+
+    stub = StubUrlopen(
+        (401, {"error": "invalid_token"}),
+        failed_refresh_after_other_instance_rotates,
+        profile_with_fresh_access,
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    assert service.sync_profile() is True
+
+    assert credentials_path.exists()
+    assert service.snapshot().signed_in is True
+    assert sum(request_path(request) == portal_account.REFRESH_PATH for request in stub.requests) == 1
+
+
+def test_sign_out_deletes_local_credentials_when_offline(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path)
+    stub = StubUrlopen(urllib.error.URLError("offline"))
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    service.sign_out()
+
+    assert [request_path(request) for request in stub.requests] == [portal_account.REVOKE_PATH]
+    assert not credentials_path.exists()
+    assert service.snapshot().signed_in is False
+
+
+def test_sign_out_refreshes_expired_access_before_revoke(tmp_path, monkeypatch):
+    credentials_path = tmp_path / "account" / "credentials.json"
+    write_credentials(credentials_path, access_expires_at=time.time() - 1)
+    stub = StubUrlopen(token_pair("access-for-revoke", "refresh-for-revoke"), (204, None))
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path)
+
+    service.sign_out()
+
+    assert [request_path(request) for request in stub.requests] == [
+        portal_account.REFRESH_PATH,
+        portal_account.REVOKE_PATH,
+    ]
+    assert stub.requests[1].get_header("Authorization") == "Bearer access-for-revoke"
+    assert not credentials_path.exists()
+
+
+def test_token_material_never_appears_in_logs_or_urls(tmp_path, monkeypatch, caplog):
+    access_token = "ACCESS-MATERIAL-MUST-NOT-LOG"
+    refresh_token = "REFRESH-MATERIAL-MUST-NOT-LOG"
+    device_code = "DEVICE-MATERIAL-MUST-NOT-LOG"
+    stub = StubUrlopen(
+        start_response(device_code=device_code),
+        token_pair(access_token, refresh_token),
+        profile(),
+    )
+    monkeypatch.setattr(portal_account, "urlopen", stub)
+    service = make_service(tmp_path, waiter=lambda _seconds: False)
+
+    with caplog.at_level(logging.DEBUG, logger=portal_account.__name__):
+        service.start_device_flow()
+        service.wait_for_idle()
+
+    log_output = caplog.text
+    for token in (access_token, refresh_token, device_code):
+        assert token not in log_output
+        assert all(token not in request.full_url for request in stub.requests)

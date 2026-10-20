@@ -520,41 +520,6 @@ TEST_F(TensorBroadcastTest, MixedRankBroadcast) {
     compare_tensors(result23_custom, result23_torch, 1e-5f, 1e-6f, "MixedRank_2D+3D");
 }
 
-// ============= Performance Test =============
-
-TEST_F(TensorBroadcastTest, BroadcastPerformance) {
-    // Test performance of broadcasting large tensors
-    const size_t rows = 1000;
-    const size_t cols = 1000;
-
-    auto col_vector_custom = Tensor::randn({rows, 1}, Device::CUDA);
-    auto row_vector_custom = Tensor::randn({1, cols}, Device::CUDA);
-
-    auto start = std::chrono::high_resolution_clock::now();
-    auto result_custom = col_vector_custom.add(row_vector_custom);
-    cudaDeviceSynchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-
-    EXPECT_EQ(result_custom.shape(), TensorShape({rows, cols}));
-
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    LOG_INFO("Broadcast {}x1 + 1x{} took {} ms", rows, cols, duration.count());
-
-    // Also benchmark PyTorch for comparison
-    auto col_vector_torch = torch::randn({static_cast<int64_t>(rows), 1},
-                                         torch::TensorOptions().device(torch::kCUDA));
-    auto row_vector_torch = torch::randn({1, static_cast<int64_t>(cols)},
-                                         torch::TensorOptions().device(torch::kCUDA));
-
-    auto torch_start = std::chrono::high_resolution_clock::now();
-    auto result_torch = col_vector_torch + row_vector_torch;
-    cudaDeviceSynchronize();
-    auto torch_end = std::chrono::high_resolution_clock::now();
-
-    auto torch_duration = std::chrono::duration_cast<std::chrono::milliseconds>(torch_end - torch_start);
-    LOG_INFO("PyTorch broadcast {}x1 + 1x{} took {} ms", rows, cols, torch_duration.count());
-}
-
 // ============= Complex Expression Tests =============
 
 TEST_F(TensorBroadcastTest, ChainedBroadcastOperations) {
@@ -709,4 +674,85 @@ TEST_F(TensorBroadcastTest, BroadcastMinimum) {
 
     EXPECT_EQ(result_custom.shape(), TensorShape({3, 4}));
     compare_tensors(result_custom, result_torch, 1e-6f, 1e-7f, "BroadcastMinimum");
+}
+
+// Narrow rows run one thread per element and neighbouring dimensions that broadcast alike are merged
+// first; every operand layout must still match torch, including uneven tails and comparisons.
+TEST_F(TensorBroadcastTest, NarrowRowsAndMergedDimensionsMatchTorch) {
+    const std::vector<std::pair<std::vector<int64_t>, std::vector<int64_t>>> cases = {
+        {{1037, 3}, {1037, 1}},
+        {{1037, 1}, {1037, 3}},
+        {{1037, 3}, {1, 3}},
+        {{1037, 3}, {3}},
+        {{1037, 15, 3}, {1037, 1, 1}},
+        {{1037, 15, 3}, {1, 1, 3}},
+        {{1037, 15, 3}, {1037, 15, 1}},
+        {{1037, 1, 3}, {1, 15, 1}},
+        {{2, 1037, 3}, {2, 1037, 1}},
+        {{7, 1, 5}, {1, 9, 1}}};
+    for (const auto& [a_shape, b_shape] : cases) {
+        SCOPED_TRACE(::testing::PrintToString(a_shape) + " op " + ::testing::PrintToString(b_shape));
+        const auto as_shape = [](const std::vector<int64_t>& shape) {
+            std::vector<size_t> dims(shape.begin(), shape.end());
+            return TensorShape(dims);
+        };
+        const auto a = create_sequential_tensor(as_shape(a_shape));
+        const auto b = create_sequential_tensor(as_shape(b_shape)).mul(0.5f).add(1.0f);
+        const auto a_torch = create_torch_sequential(a_shape);
+        const auto b_torch = create_torch_sequential(b_shape) * 0.5f + 1.0f;
+        compare_tensors(a.mul(b), a_torch * b_torch, 1e-5f, 1e-6f, "mul");
+        compare_tensors(a.sub(b), a_torch - b_torch, 1e-5f, 1e-6f, "sub");
+        const auto greater = a.gt(b).to(DataType::Float32);
+        compare_tensors(greater, (a_torch > b_torch).to(torch::kFloat32), 0.0f, 0.0f, "gt");
+    }
+}
+
+TEST_F(TensorBroadcastTest, NarrowRowReductionsMatchTorch) {
+    for (const int64_t width : {1, 2, 3, 4, 15, 16, 17}) {
+        SCOPED_TRACE(width);
+        const std::vector<int64_t> shape{2051, width};
+        const auto values = create_sequential_tensor(TensorShape({2051, static_cast<size_t>(width)})).mul(0.01f);
+        const auto reference = create_torch_sequential(shape) * 0.01f;
+        compare_tensors(values.sum(1), reference.sum(1), 1e-4f, 1e-5f, "sum");
+        compare_tensors(values.mean(1), reference.mean(1), 1e-4f, 1e-5f, "mean");
+        compare_tensors(values.max(1), std::get<0>(reference.max(1)), 0.0f, 0.0f, "max");
+        compare_tensors(values.min(1), std::get<0>(reference.min(1)), 0.0f, 0.0f, "min");
+        compare_tensors(values.prod(1), reference.prod(1), 1e-4f, 1e-5f, "prod");
+        compare_tensors(values.sum(1, true), reference.sum(1, true), 1e-4f, 1e-5f, "sum keepdim");
+    }
+}
+
+// where merges dimensions and picks per-operand full, row, column or scalar access; every mix must
+// match torch.
+TEST_F(TensorBroadcastTest, WhereBroadcastLayoutsMatchTorch) {
+    struct Case {
+        std::vector<int64_t> cond, x, y;
+    };
+    const std::vector<Case> cases = {
+        {{1037, 15, 3}, {1037, 15, 3}, {1037, 15, 3}},
+        {{1037, 1, 1}, {1037, 15, 3}, {1037, 15, 3}},
+        {{1037, 15, 3}, {1, 1, 3}, {1037, 15, 3}},
+        {{1, 1, 1}, {1037, 15, 3}, {1037, 1, 1}},
+        {{1037, 1}, {1037, 3}, {1, 3}},
+        {{1037}, {1037}, {1}},
+        {{1037, 1, 3}, {1, 15, 1}, {1037, 15, 3}},
+        {{7, 1, 5, 1}, {1, 9, 1, 2}, {7, 9, 5, 2}},
+        {{1037, 15, 3}, {3}, {15, 1}},
+        {{15, 1}, {1037, 1, 3}, {1}},
+        {{5, 1}, {2, 1, 4}, {7, 1, 1, 1}}};
+    const auto as_shape = [](const std::vector<int64_t>& shape) {
+        return TensorShape(std::vector<size_t>(shape.begin(), shape.end()));
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(::testing::PrintToString(c.cond) + " " + ::testing::PrintToString(c.x) + " " +
+                     ::testing::PrintToString(c.y));
+        const auto cond_values = create_sequential_tensor(as_shape(c.cond));
+        const auto cond = cond_values.mod(3.0f).lt(1.0f);
+        const auto x = create_sequential_tensor(as_shape(c.x)).mul(2.0f);
+        const auto y = create_sequential_tensor(as_shape(c.y)).neg();
+        const auto cond_torch = torch::fmod(create_torch_sequential(c.cond), 3.0) < 1.0;
+        const auto x_torch = create_torch_sequential(c.x) * 2.0f;
+        const auto y_torch = -create_torch_sequential(c.y);
+        compare_tensors(Tensor::where(cond, x, y), torch::where(cond_torch, x_torch, y_torch), 0.0f, 0.0f, "where");
+    }
 }

@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "core/cuda_error.hpp"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -38,6 +40,10 @@ namespace lfs::core {
                 // Query device 0 (can be extended for multi-GPU)
                 cudaError_t err = cudaGetDeviceProperties(&prop, 0);
                 if (err != cudaSuccess) {
+                    ensure_cuda_success(
+                        err, "cudaGetDeviceProperties(tensor GPU configuration)",
+                        "device=0, fallback=conservative defaults",
+                        LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
                     // Fallback to safe defaults
                     cfg.sm_count = 108; // Assume A100/H100 for safety
                     cfg.max_threads_per_sm = 2048;
@@ -120,14 +126,6 @@ namespace lfs::core {
         }
     };
 
-    /**
-     * @brief Global device properties (for use in kernels)
-     *
-     * This is exported so kernels can access GPU properties without
-     * additional function calls.
-     */
-    inline const GPUConfig& gpu_config = GPUConfig::get();
-
 // ============================================================================
 // Compile-Time Constants (for __launch_bounds__)
 // ============================================================================
@@ -162,7 +160,7 @@ namespace lfs::core {
  *   my_kernel<<<grid, 256>>>(...)
  */
 #define OPTIMAL_GRID_SIZE(block_size) \
-    (lfs::core::gpu_config.optimal_grid_size(block_size))
+    (lfs::core::GPUConfig::get().optimal_grid_size(block_size))
 
 /**
  * @brief Get optimal grid size with a cap
@@ -171,6 +169,6 @@ namespace lfs::core {
  *   int grid = OPTIMAL_GRID_SIZE_CAPPED(256, 2048);  // Max 2048 blocks
  */
 #define OPTIMAL_GRID_SIZE_CAPPED(block_size, max_blocks) \
-    (lfs::core::gpu_config.optimal_grid_size_capped(block_size, max_blocks))
+    (lfs::core::GPUConfig::get().optimal_grid_size_capped(block_size, max_blocks))
 
 } // namespace lfs::core

@@ -6,12 +6,16 @@
 
 #include "core/export.hpp"
 #include "input/key_codes.hpp"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
+#include <nlohmann/json.hpp>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -21,16 +25,31 @@ namespace lfs::vis::input {
 
     enum class ToolMode {
         GLOBAL = 0,
-        SELECTION,
-        BRUSH,
-        TRANSLATE,
-        ROTATE,
-        SCALE,
-        ALIGN,
-        CROP_BOX,
+        SELECTION = 1,
+        TRANSLATE = 3,
+        ROTATE = 4,
+        SCALE = 5,
+        ALIGN = 6,
+        CROP_BOX = 7,
     };
 
+    enum class SelectionOp : uint8_t {
+        Add,
+        Remove,
+        Intersect,
+    };
+
+    // Highest persisted ToolMode value plus one. Value 2 was the removed brush tool mode.
     inline constexpr size_t kToolModeCount = 8;
+    inline constexpr std::array<ToolMode, 7> kAllToolModes = {
+        ToolMode::GLOBAL,
+        ToolMode::SELECTION,
+        ToolMode::ALIGN,
+        ToolMode::CROP_BOX,
+        ToolMode::TRANSLATE,
+        ToolMode::ROTATE,
+        ToolMode::SCALE,
+    };
 
     enum class Action {
         NONE = 0,
@@ -77,8 +96,7 @@ namespace lfs::vis::input {
         TOGGLE_SELECTION_CROP_FILTER,
         // Tools
         BRUSH_RESIZE,
-        CYCLE_BRUSH_MODE,
-        CONFIRM_POLYGON,
+        CONFIRM_POLYGON = 40,
         CANCEL_POLYGON,
         UNDO_POLYGON_VERTEX,
         CYCLE_SELECTION_VIS,
@@ -110,12 +128,34 @@ namespace lfs::vis::input {
         TOOL_ROTATE,
         TOOL_SCALE,
         TOOL_MIRROR,
-        TOOL_BRUSH,
-        TOOL_ALIGN,
+        TOOL_ALIGN = 67,
         // Pie menu
         PIE_MENU,
         DEPTH_ADJUST_NEAR, // Deprecated: migrated to DEPTH_ADJUST_FAR on load
         CAMERA_RESET_HOME,
+        HISTOGRAM_ZOOM_MARKED,
+        TOGGLE_CAMERA_FRUSTUMS,
+        SELECTION_INTERSECT,
+        // Appended to avoid renumbering existing persisted action ids.
+        SELECT_MODE_BOX,
+        SELECT_MODE_SPHERE,
+        CUT_SELECTION,
+        TOGGLE_PERFORMANCE_HUD,
+        OPEN_PREFERENCES,
+        TOGGLE_MCP_SERVER,
+        TOGGLE_MCP_BINDING,
+        TOGGLE_GRID,
+        SELECT_ALL_SCENE_NODES,
+        TOGGLE_SCENE_SELECTION_VISIBILITY,
+        TOGGLE_SCENE_SELECTION_TRAINING,
+        GROUP_SELECTED_SCENE_NODES,
+        UNGROUP_SELECTED_SCENE_NODE,
+        // Asset Manager consumes these only while its grid has focus.
+        ASSET_GALLERY_PRIMARY,
+        ASSET_GALLERY_COPY_LINK,
+        ASSET_REFRESH,
+        TOGGLE_PYTHON_CONSOLE,
+        CAMERA_RESTORE_HOME,
 
     };
 
@@ -137,6 +177,8 @@ namespace lfs::vis::input {
         LEFT = static_cast<int>(AppMouseButton::LEFT),
         RIGHT = static_cast<int>(AppMouseButton::RIGHT),
         MIDDLE = static_cast<int>(AppMouseButton::MIDDLE),
+        BACK = static_cast<int>(AppMouseButton::BACK),
+        FORWARD = static_cast<int>(AppMouseButton::FORWARD),
     };
 
     struct KeyTrigger {
@@ -194,7 +236,6 @@ namespace lfs::vis::input {
         Selection,
         SelectionGlobal,
         Depth,
-        Brush,
         CropBox,
         Editing,
         ViewGlobal,
@@ -210,6 +251,8 @@ namespace lfs::vis::input {
         bool allows_extra_modifiers = false;
         bool prefers_single_click = false;
         bool inherits_from_global = false;
+        // Held keys repeat the action even when the binding's on_repeat is off.
+        bool repeats_on_hold = false;
         ActionSection ui_section = ActionSection::None;
     };
 
@@ -235,6 +278,7 @@ namespace lfs::vis::input {
 
     struct CaptureState {
         bool active = false;
+        bool altgr_rejected = false;
         ToolMode mode = ToolMode::GLOBAL;
         Action action = Action::NONE;
         std::optional<InputTrigger> captured;
@@ -256,18 +300,29 @@ namespace lfs::vis::input {
         InputBindings();
 
         void loadProfile(const std::string& name);
-        void saveProfile(const std::string& name) const;
+        bool saveProfile(const std::string& name);
+        bool saveProfile(const std::string& name) const;
         bool loadProfileFromFile(const std::filesystem::path& path);
         bool saveProfileToFile(const std::filesystem::path& path) const;
         std::vector<std::string> getAvailableProfiles() const;
         const std::string& getCurrentProfileName() const { return current_profile_name_; }
         std::uint64_t getBindingsRevision() const { return bindings_revision_; }
 
-        static std::filesystem::path getConfigDir();
+        static std::optional<std::filesystem::path> getConfigDir();
+        [[nodiscard]] static bool isValidProfileName(std::string_view name) noexcept;
+        [[nodiscard]] static bool isValidTriggerForAction(Action action,
+                                                          const InputTrigger& trigger) noexcept;
+        [[nodiscard]] static bool isPersistenceEnabled() noexcept;
+        static void setPersistenceEnabled(bool enabled) noexcept;
 
         // Query effective bindings. Mode-local bindings are checked first; actions
         // marked as inherited then fall back to GLOBAL.
-        Action getActionForKey(ToolMode mode, int key, int modifiers) const;
+        // on_repeat, when given, receives the matched key binding's on_repeat flag.
+        Action getActionForKey(ToolMode mode, int key, int modifiers, bool* on_repeat = nullptr) const;
+        Action getActionForShortcut(ToolMode mode, int physical_key, int logical_key,
+                                    int modifiers, int printed_punctuation = KEY_UNKNOWN,
+                                    bool shift_needed_for_printed_key = false,
+                                    bool* on_repeat = nullptr) const;
         Action getActionForMouseButton(ToolMode mode, MouseButton button, int modifiers, bool is_double_click = false) const;
         // held_keys: non-modifier keys currently held in press order; chord lookup
         // checks newest first (e.g. R+Scroll for Camera Roll). Pass an empty list
@@ -303,6 +358,7 @@ namespace lfs::vis::input {
         void cancelCapture();
         void captureKey(int key, int mods);
         void captureKey(int physical_key, int logical_key, int mods);
+        bool takeAltGrCaptureRejection();
         void captureMouseButton(int button, int mods, std::optional<int> chord_key = std::nullopt);
         void captureMouseButton(int button, int mods, double x, double y, std::optional<int> chord_key = std::nullopt);
         void captureMouseButtonRelease(int button);
@@ -323,6 +379,9 @@ namespace lfs::vis::input {
 
         std::string current_profile_name_;
         std::vector<Binding> bindings_;
+        std::vector<nlohmann::json> preserved_profile_entries_;
+        std::set<std::pair<ToolMode, Action>> disabled_bindings_;
+        std::shared_ptr<int> callback_lifetime_ = std::make_shared<int>(0);
         std::uint64_t bindings_revision_ = 0;
 
         using KeyMapKey = std::tuple<ToolMode, int, int>;
@@ -333,7 +392,11 @@ namespace lfs::vis::input {
         using ScrollChordKey = std::tuple<ToolMode, int, int>;
         using DragChordKey = std::tuple<ToolMode, MouseButton, int, int>;
 
-        std::map<KeyMapKey, Action> key_map_;
+        struct KeyMapEntry {
+            Action action = Action::NONE;
+            bool on_repeat = false;
+        };
+        std::map<KeyMapKey, KeyMapEntry> key_map_;
         std::map<MouseMapKey, Action> mouse_button_map_;
         std::map<ScrollMapKey, Action> scroll_map_;
         std::map<DragMapKey, Action> drag_map_;
@@ -345,19 +408,33 @@ namespace lfs::vis::input {
 
         void rebuildLookupMaps();
         void notifyBindingsChanged();
+        [[nodiscard]] std::optional<std::filesystem::path> profilePath(std::string_view name) const;
+        bool saveProfileToFile(const std::filesystem::path& path,
+                               std::string_view profile_name) const;
+        void persistActiveProfileName() const;
 
         size_t migrateLoadedProfile(int version);
         size_t collapseRedundantModeBindings(int version);
+        [[nodiscard]] bool isDisabled(ToolMode mode, Action action) const;
+        [[nodiscard]] std::vector<std::pair<ToolMode, Action>> unreachableCoreActions() const;
+        void restoreUnreachableCoreActions();
+        void warnAboutUnreachableCoreActions();
     };
 
     LFS_VIS_API std::string getActionName(Action action);
     LFS_VIS_API std::string getKeyName(int key);
     LFS_VIS_API std::string getMouseButtonName(MouseButton button);
     LFS_VIS_API std::string getModifierString(int modifiers);
+    [[nodiscard]] LFS_VIS_API std::optional<SelectionOp> selectionOpForModifiers(
+        const InputBindings& bindings,
+        ToolMode mode,
+        int modifiers,
+        const std::vector<int>& held_keys = {});
     [[nodiscard]] LFS_VIS_API ShortcutScope shortcutScopeForAction(Action action);
 
     [[nodiscard]] LFS_VIS_API std::string_view actionNameKey(Action action);
     [[nodiscard]] LFS_VIS_API std::optional<Action> actionFromName(std::string_view name);
+    [[nodiscard]] LFS_VIS_API ToolMode toolModeFromName(std::string_view name);
     [[nodiscard]] LFS_VIS_API std::string getLocalizedActionName(Action action);
     [[nodiscard]] LFS_VIS_API std::string getLocalizedToolModeName(ToolMode mode);
     [[nodiscard]] LFS_VIS_API std::string localizeTriggerDescription(std::string description);

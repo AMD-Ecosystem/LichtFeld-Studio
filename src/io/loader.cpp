@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "io/loader.hpp"
+#include "core/file_extensions.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "io/filesystem_utils.hpp"
+#include "io/splat_path.hpp"
 #include "loader_service.hpp"
 #include <algorithm>
 #include <cctype>
@@ -39,8 +41,11 @@ namespace lfs::io {
                     return false;
                 }
 
+                if (is_ssog_path(path))
+                    return true;
+
                 // Check for SOG files
-                if (path.extension() == ".sog" || path.extension() == ".SOG") {
+                if (core::has_extension(path, ".sog")) {
                     LOG_TRACE("SOG file detected: {}", lfs::core::path_to_utf8(path));
                     return true;
                 }
@@ -58,12 +63,22 @@ namespace lfs::io {
                 }
 
                 // Check other file extensions
-                auto ext = path.extension().string();
+                auto ext = lfs::core::path_to_utf8(path.extension());
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
                 // Check common extensions
                 if (ext == ".ply") {
                     LOG_TRACE("PLY file detected: {}", lfs::core::path_to_utf8(path));
+                    return true;
+                }
+
+                if (ext == ".spz") {
+                    LOG_TRACE("SPZ file detected: {}", lfs::core::path_to_utf8(path));
+                    return true;
+                }
+
+                if (ext == ".rad") {
+                    LOG_TRACE("RAD file detected: {}", lfs::core::path_to_utf8(path));
                     return true;
                 }
 
@@ -127,13 +142,15 @@ namespace lfs::io {
     }
 
     bool Loader::isDatasetPath(const std::filesystem::path& path) {
+        if (is_ssog_path(path))
+            return false;
         if (!safe_exists(path)) {
             LOG_TRACE("Path does not exist for dataset check: {}", lfs::core::path_to_utf8(path));
             return false;
         }
 
         if (!safe_is_directory(path)) {
-            auto ext = path.extension().string();
+            auto ext = lfs::core::path_to_utf8(path.extension());
             std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
             // JSON files might be datasets (transforms.json)
@@ -143,7 +160,7 @@ namespace lfs::io {
             }
 
             // SOG files are NOT datasets - they're single splat files like PLY
-            if (ext == ".sog") {
+            if (ext == ".sog" || ext == ".ssog") {
                 LOG_TRACE("SOG file detected, not a dataset: {}", lfs::core::path_to_utf8(path));
                 return false;
             }
@@ -194,8 +211,8 @@ namespace lfs::io {
         }
 
         // Blender/NeRF markers
-        if (safe_exists(path / "transforms.json") ||
-            safe_exists(path / "transforms_train.json")) {
+        if (safe_exists(path / TRANSFORMS_DATASET_MARKERS[0]) ||
+            safe_exists(path / TRANSFORMS_DATASET_MARKERS[1])) {
             LOG_TRACE("Blender/NeRF dataset detected at: {}", lfs::core::path_to_utf8(path));
             return true;
         }
@@ -217,18 +234,20 @@ namespace lfs::io {
 
     // Static method to determine dataset type
     DatasetType Loader::getDatasetType(const std::filesystem::path& path) {
+        if (is_ssog_path(path))
+            return DatasetType::Unknown;
         if (!safe_exists(path)) {
             return DatasetType::Unknown;
         }
 
         if (!safe_is_directory(path)) {
-            auto ext = path.extension().string();
+            auto ext = lfs::core::path_to_utf8(path.extension());
             std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
             if (ext == ".json") {
                 return DatasetType::Transforms;
             }
             // SOG files are not datasets
-            if (ext == ".sog") {
+            if (ext == ".sog" || ext == ".ssog") {
                 return DatasetType::Unknown;
             }
             return DatasetType::Unknown;
@@ -259,8 +278,8 @@ namespace lfs::io {
         }
 
         // Check for Transforms markers
-        if (safe_exists(path / "transforms.json") ||
-            safe_exists(path / "transforms_train.json")) {
+        if (safe_exists(path / TRANSFORMS_DATASET_MARKERS[0]) ||
+            safe_exists(path / TRANSFORMS_DATASET_MARKERS[1])) {
             return DatasetType::Transforms;
         }
 

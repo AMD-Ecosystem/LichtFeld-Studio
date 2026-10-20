@@ -8,6 +8,7 @@
 #include "operator/operator_registry.hpp"
 #include "rendering/dirty_flags.hpp"
 #include "rendering/rendering_manager.hpp"
+#include "scene/scene_manager.hpp"
 #include <algorithm>
 #include <cctype>
 #include <string_view>
@@ -191,7 +192,7 @@ namespace lfs::vis::op {
         void refreshAfterHistoryPlayback(const DirtyMask flags = DirtyFlag::ALL) {
             invalidateUndoRedoPollState();
             if (auto* rm = services().renderingOrNull()) {
-                rm->markDirty(flags == 0 ? DirtyFlag::ALL : flags);
+                rm->markDirty(flags == 0 ? DirtyFlag::ALL : flags, lfs::vis::FrameReason::SceneChange);
             }
         }
 
@@ -368,14 +369,16 @@ namespace lfs::vis::op {
     }
 
     void UndoHistory::refreshResidencyLocked() {
-        const auto refresh_stack = [](std::deque<UndoEntryPtr>& stack) {
+        const auto refresh_stack = [this](std::deque<UndoEntryPtr>& stack) {
             const size_t hot_start = stack.size() > HOT_ENTRIES ? stack.size() - HOT_ENTRIES : 0;
             for (size_t index = 0; index < stack.size(); ++index) {
                 auto& entry = stack[index];
                 if (!entry) {
                     continue;
                 }
-                if (index < hot_start) {
+                // Keep an oversized final entry for undo semantics, but never let
+                // the count-based hot set override the GPU-residency byte ceiling.
+                if (entryBytes(entry) > max_bytes_ || index < hot_start) {
                     entry->offloadToCPU();
                 } else {
                     entry->restoreToPreferredDevice();
@@ -446,6 +449,10 @@ namespace lfs::vis::op {
     void UndoHistory::push(UndoEntryPtr entry) {
         if (!entry) {
             return;
+        }
+
+        if (auto* const scene_manager = services().sceneOrNull()) {
+            scene_manager->completePendingSelectionCounts();
         }
 
         const size_t entry_bytes = entryBytes(entry);
@@ -522,6 +529,36 @@ namespace lfs::vis::op {
             };
         }
 
+        // Discard the temporary alignment before replaying committed transforms.
+        if (operators().activeModalId() == to_string(BuiltinOp::AlignPickPoint)) {
+            operators().cancelModalOperator();
+        }
+
+        if (auto* const scene_manager = services().sceneOrNull()) {
+            try {
+                scene_manager->completePendingSelectionCounts();
+            } catch (const std::exception& e) {
+                LOG_ERROR("{} preflight failed: {}",
+                          undo_direction ? "Undo" : "Redo",
+                          e.what());
+                return HistoryResult{
+                    .success = false,
+                    .changed = false,
+                    .steps_performed = 0,
+                    .error = e.what(),
+                };
+            } catch (...) {
+                LOG_ERROR("{} preflight failed: unknown exception",
+                          undo_direction ? "Undo" : "Redo");
+                return HistoryResult{
+                    .success = false,
+                    .changed = false,
+                    .steps_performed = 0,
+                    .error = "unknown exception",
+                };
+            }
+        }
+
         std::unique_lock playback_lock(playback_mutex_, std::try_to_lock);
         if (!playback_lock.owns_lock()) {
             return HistoryResult{
@@ -596,6 +633,20 @@ namespace lfs::vis::op {
                 } else {
                     entry->redo();
                 }
+            } catch (const HistoryStaleEntryError& e) {
+                LOG_WARN("Discarding stale {} entry '{}': {}",
+                         undo_direction ? "undo" : "redo", entry->name(), e.what());
+                {
+                    std::lock_guard lock(mutex_);
+                    refreshResidencyLocked();
+                    updateAvailabilityLocked();
+                    bumpGenerationLocked();
+                }
+                result.success = false;
+                result.error = e.what();
+                refreshAfterHistoryPlayback(dirty_flags);
+                notifyObservers();
+                return result;
             } catch (const HistoryCorruptionError& e) {
                 LOG_ERROR("Fatal {} failure for '{}': {}",
                           undo_direction ? "undo" : "redo", entry->name(), e.what());
@@ -711,6 +762,18 @@ namespace lfs::vis::op {
         invalidateUndoRedoPollState();
         if (changed) {
             notifyObservers();
+        }
+    }
+
+    void UndoHistory::bindHydratedPayloadStorage(
+        const std::span<const lfs::core::Uuid> node_uuids) {
+        std::lock_guard lock(mutex_);
+        if (redo_stack_.empty()) {
+            return;
+        }
+        if (auto* const patch =
+                dynamic_cast<SceneGraphPatchEntry*>(redo_stack_.back().get())) {
+            patch->bindHydratedPayloadStorage(node_uuids);
         }
     }
 
@@ -1052,6 +1115,10 @@ namespace lfs::vis::op {
         return totalMemoryLocked();
     }
 
+    bool UndoHistory::isPlaybackActive() const {
+        std::lock_guard lock(mutex_);
+        return playback_depth_ > 0 && playback_thread_id_ == std::this_thread::get_id();
+    }
     bool UndoHistory::hasActiveTransaction() const {
         std::lock_guard lock(mutex_);
         return !transactions_.empty();

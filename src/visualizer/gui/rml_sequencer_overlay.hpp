@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include "gui/sequencer_viewport_edit_mode.hpp"
 #include "sequencer/rml_sequencer_panel.hpp"
 #include <RmlUi/Core/EventListener.h>
@@ -20,6 +22,7 @@ namespace Rml {
 } // namespace Rml
 
 namespace lfs::vis {
+    class SequencerFrameDemandTest_ApplyCurrentViewRecordsHistory_Test;
     struct Theme;
     class SequencerController;
 } // namespace lfs::vis
@@ -28,7 +31,7 @@ namespace lfs::vis::gui {
 
     class RmlUIManager;
 
-    class RmlSequencerOverlay {
+    class LFS_VIS_API RmlSequencerOverlay {
     public:
         enum class Action : uint8_t {
             ADD_KEYFRAME,
@@ -81,7 +84,6 @@ namespace lfs::vis::gui {
 
         void processInput(const lfs::vis::PanelInputState& input);
         void render(int screen_w, int screen_h);
-        void compositeToScreen(int screen_w, int screen_h) const;
         void destroyGraphicsResources();
         void reloadResources();
 
@@ -100,6 +102,8 @@ namespace lfs::vis::gui {
         [[nodiscard]] std::optional<EditResult> consumeFocalEdit();
 
     private:
+        friend class lfs::vis::SequencerFrameDemandTest_ApplyCurrentViewRecordsHistory_Test;
+        void syncInputOwnership();
         void initContext();
         [[nodiscard]] bool ensureContextReady();
         void syncTheme();

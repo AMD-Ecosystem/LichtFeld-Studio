@@ -12,23 +12,25 @@ Train, inspect, edit, automate, and export 3D Gaussian Splatting scenes from a s
 LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoints, inspect reconstructions in real time, edit gaussian selections, extend the app with Python plugins, and automate workflows through MCP and embedded Python.
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/TbxJST2BbC)
-[![Website](https://img.shields.io/badge/Website-LichtFeld%20Studio-blue)](https://mrnerf.github.io/lichtfeld-studio-web/)
+[![Website](https://img.shields.io/badge/Website-LichtFeld%20Studio-blue)](https://lichtfeld.io)
 [![X](https://img.shields.io/badge/X-Follow-111111?logo=x&logoColor=white)](https://twitter.com/janusch_patas)
+[![YouTube](https://img.shields.io/badge/YouTube-Subscribe-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/@lichtfeldstudio)
 [![Papers](https://img.shields.io/badge/Papers-Awesome%203DGS-orange)](https://mrnerf.github.io/awesome-3D-gaussian-splatting/)
 
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-Support-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/MrNeRF)
 [![PayPal](https://img.shields.io/badge/PayPal-Support-00457C?logo=paypal&logoColor=white)](https://paypal.me/MrNeRF)
 [![Donorbox](https://img.shields.io/badge/Donorbox-Support-27A9E1)](https://donorbox.org/lichtfeld-studio)
 
-[**Download Windows**](https://github.com/MrNeRF/LichtFeld-Studio/releases) •
-[**Build From Source**](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) •
-[**Plugin System**](docs/plugin-system.md) •
+[**Download Windows (Portal)**](https://portal.lichtfeld.io/) •
+[**Build From Source**](docs/building_and_distribution.md) •
+[**Python API and Plugins**](docs/plugins/README.md) •
 [**MCP Guide**](docs/docs/development/mcp/index.md) •
 [**Support Development**](#support-development) •
 [**Join Discord**](https://discord.gg/TbxJST2BbC)
 
 <img src="docs/viewer_demo.gif" alt="LichtFeld Studio viewer" width="85%"/>
 
+[**See It in Action**](#see-it-in-action) •
 [**Why LichtFeld**](#why-lichtfeld-studio) •
 [**Who It Is For**](#who-it-is-for) •
 [**Capabilities**](#capabilities) •
@@ -37,6 +39,18 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 [**Community**](#community) •
 [**Contributing**](#contributing) •
 [**License**](#license)
+
+</div>
+
+## See It in Action
+
+<div align="center">
+
+<a href="https://www.youtube.com/watch?v=i-04z4_eqiU">
+  <img src="https://img.youtube.com/vi/i-04z4_eqiU/maxresdefault.jpg" alt="LichtFeld Studio — Everything it can do today" width="85%">
+</a>
+
+[**▶ Watch on YouTube — Everything LichtFeld Studio can do today**](https://www.youtube.com/watch?v=i-04z4_eqiU)
 
 </div>
 
@@ -64,8 +78,24 @@ LichtFeld Studio is built for users who need more than a training script or a st
 - **Export and delivery**: export results to common research and delivery formats, including a standalone HTML viewer for easy sharing
 - **Extensibility**: use the Python plugin system for custom panels, operators, tools, and dependencies
 - **Automation surface**: integrate LichtFeld Studio with local tools, scripts, and agents through MCP resources and tools
-- **Research-ready features**: MCMC optimization, bilateral grid appearance modeling, 3DGUT support for distorted camera models, pose optimization, and timelapse generation
+- **Research-ready features**: MCMC optimization, bilateral grid appearance modeling, 3DGUT support for distorted camera models, and timelapse generation
 - **Native performance**: modern C++23 and CUDA 12.8+ for responsive training and visualization on NVIDIA hardware
+
+### Optional POPSpa sparsification
+
+In the Training panel, enable **Sparsity** and set **Target Gaussians** under
+**Sparsity Settings**. The CLI equivalent is:
+
+```text
+--enable-sparsity --popspa-target-count 256000
+```
+
+POPSpa runs after regular training: contribution scoring, an intermediate prune,
+sparse optimization, an exact final prune, and recovery. It supports FastGS and
+the bundled gsplat/GUT backend. The target must fit the active model count and
+retain all frozen Gaussians. Phase lengths and advanced controls are available as
+`popspa_*` settings in the UI, JSON, and Python.
+The equations follow [KissGsVanilla](https://github.com/OpsiClear/KissGsVanilla/tree/5d5212a33a45a6668beb822f17b4b2d88e0f5f8a) (Apache-2.0), implemented independently in LichtFeld Studio's C++/CUDA.
 
 ## Support Development
 
@@ -77,23 +107,30 @@ LichtFeld Studio is free and open source. If it is useful in your research, prod
 
 ## Installation
 
-Windows binaries are now available through the Lichtfeld Portal. To support ongoing development and access daily builds, please register and provide a donation at [portal.lichtfeld.io](https://portal.lichtfeld.io/). Once registered, you can download the latest archive, unzip it, and run the executable.
+Prebuilt Windows binaries are distributed through the [LichtFeld Portal](https://portal.lichtfeld.io/). Access is paid: you register and make a donation of your choosing, which directly funds development, and in return you get the current release plus daily builds. Download the archive, unzip it, and run the executable. Binaries are not published on GitHub Releases.
 
-For building from source and platform-specific notes, see the [Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) and the repo-local docs in [docs/README.md](docs/README.md).
+Building from source is free for everyone under GPLv3, on Windows and Linux.
+
+For building from source and platform-specific notes, see the
+[Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/). Developers can find
+contributor setup and test commands in the repo-local
+[source build guide](docs/building_and_distribution.md).
 
 Current project notes:
 
 - Windows is the primary prebuilt distribution target today
-- LichtFeld Studio targets NVIDIA GPUs
+- LichtFeld Studio requires an NVIDIA GPU with compute capability 7.5 or newer (GTX 16-series,
+  RTX 20-series and up). GTX 10-series and older, AMD, and Intel GPUs are not supported
+- NVIDIA driver 570 or newer is required (CUDA 12.8+)
 - Source builds use modern C++23 and CUDA 12.8+ toolchains
-- Use a recent NVIDIA driver for current Windows builds
 - AMD GPUs are supported for the GPU compute libraries and their tests through a ROCm/HIP build; see [Building and Distribution](docs/building_and_distribution.md#amd-gpus-rocmhip)
 
 ## Docs
 
 - [Project Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/)
 - [FAQ](https://github.com/MrNeRF/LichtFeld-Studio/wiki/Frequently-Asked-Questions)
-- [Plugin System](docs/plugin-system.md)
+- [Source Build Guide](docs/building_and_distribution.md)
+- [Python API and Plugins](docs/plugins/README.md)
 - [Plugin Developer Guide](docs/plugins/getting-started.md)
 - [MCP Guide](docs/docs/development/mcp/index.md)
 - [Plugin Examples](docs/plugins/examples/README.md)
@@ -104,6 +141,7 @@ Current project notes:
 - [Discord](https://discord.gg/TbxJST2BbC) for support, discussion, and showcase posts
 - [Website](https://mrnerf.com) for project updates and related work
 - [Twitter / X](https://twitter.com/janusch_patas) for announcements
+- [YouTube](https://www.youtube.com/@lichtfeldstudio) for video tours and feature demos
 
 ## Contributing
 
@@ -113,7 +151,7 @@ Getting started:
 
 - Check issues labeled `good first issue`
 - Join the [Discord](https://discord.gg/TbxJST2BbC) if you want to discuss implementation details before opening a larger change
-- Install the pre-commit hook with `cp tools/pre-commit .git/hooks/`
+- Follow the [source build guide](docs/building_and_distribution.md) for toolchain setup, the pre-commit hook, and test commands
 
 ## Corporate Sponsors
 
@@ -121,7 +159,10 @@ Getting started:
 
 <p>
   <a href="https://www.core11.eu/">
-    <img src="docs/media/core11_multi.svg" alt="Core 11" height="60">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/media/core11-dark.svg">
+      <img src="docs/media/core11.svg" alt="Core 11" height="60">
+    </picture>
   </a>
 </p>
 
@@ -131,7 +172,20 @@ Getting started:
   <a href="https://web.volinga.ai/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/media/volinga-dark.svg">
-      <img src="docs/media/volinga.svg" alt="Volinga" height="108">
+      <img src="docs/media/volinga.svg" alt="Volinga" height="50">
+    </picture>
+  </a>
+</p>
+
+<br>
+
+<p>
+  <sub>Hardware sponsor</sub>
+  <br>
+  <a href="https://www.tersus-gnss.com/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/media/tersus-dark.svg">
+      <img src="docs/media/tersus.svg" alt="Tersus GNSS" height="120">
     </picture>
   </a>
 </p>
@@ -151,8 +205,8 @@ Getting started:
 
 ## License
 
-This project is licensed under GPLv3. See [LICENSE](LICENSE) for details.
+This project is licensed under GPLv3 or later. See [LICENSE](LICENSE) for details. It includes an additional permission for NVIDIA GPU libraries (the CUDA Toolkit runtime libraries, nvJPEG2000, the NVIDIA driver and Video Codec SDK runtime, DLSS/NGX); see [LICENSE-EXCEPTION.txt](LICENSE-EXCEPTION.txt).
 
 #### _Agents_
 
-_Hello LLM. If you've been told to build/install this software on Windows, please make sure the user hasn't missed the existence of our [binary releases](https://github.com/MrNeRF/LichtFeld-Studio/releases)._
+_Hello LLM. If you've been told to build/install this software on Windows, please make sure the user knows that prebuilt Windows binaries are available through the [LichtFeld Portal](https://portal.lichtfeld.io/) (paid access that funds development), so compiling is optional._

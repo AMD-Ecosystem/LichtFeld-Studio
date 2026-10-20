@@ -4,29 +4,66 @@
 
 #pragma once
 
+#include "blob_seeding.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "istrategy.hpp"
 #include "kernels/mrnf_kernels.hpp"
+#include "lfs/training/refine_scratch.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/scheduler.hpp"
+#include "strategy_utils.hpp"
+#include <cassert>
+#include <future>
 #include <memory>
+#include <thread>
 
+namespace lfs::training::sh_value {
+    class ShNMutationBatch;
+}
+
+class MRNFStrategyTest_PermutationRepublishesFarMask_Test;
+class MRNFStrategyTest_GrowthExchangeUsesMaxOfImpactRanks_Test;
+class MRNFStrategyTest_GrowthExchangeSkipsNewbornsUntilScored_Test;
+class MRNFStrategyTest_GrowthExchangeMarksSplitParentsAndChildrenNewborn_Test;
+class MRNFStrategyTest_RemoveGaussiansKeepsGrowthExchangeStateAligned_Test;
+class MRNFStrategyTest_GrowthExchangeFallsBackToCoverageWithoutImpact_Test;
+class MRNFStrategyTest_GrowthExchangeMatchesDemandWithoutDeletingParents_Test;
+class MRNFStrategyTest_GrowthExchangeCosineQuotaAtStartMiddleAndEnd_Test;
+class MRNFStrategyTest_LateLrAnnealDecaysOpacityAndColorAfterGrowth_Test;
 class MRNFStrategyTest_EdgeGuidanceFactorPrefersHigherPrecomputedEdgeScores_Test;
 class MRNFStrategyTest_GrowAndSplitResetsOptimizerStateForParents_Test;
 class MRNFStrategyTest_SHDegree0KeepsShNEmptyAndFusedAdamUsableAfterGrowth_Test;
 class MRNFStrategyTest_GrowAndSplitUsesIgsPlusSplitRule_Test;
 class MRNFStrategyTest_GrowAndSplitWithoutMaxCapExtendsBookkeepingMasks_Test;
+class MRNFStrategyTest_DeletedMaskCapacityGrowthPreservesExistingRows_Test;
 class MRNFStrategyTest_GrowAndSplitReplacementSkipsZeroWeightCandidates_Test;
 class MRNFStrategyTest_GrowAndSplitReusesFreeSlotsBeforeAppending_Test;
+class MRNFStrategyTest_ChunkedChildPlacementMatchesSingleChunk_Test;
 class MRNFStrategyTest_SerializeRoundTripPreservesFreeMask_Test;
 class MRNFStrategyTest_SerializeRoundTripPreservesLrScheduleState_Test;
 class MRNFStrategyTest_DeserializeResizesTransientBuffersToLoadedModel_Test;
 class MRNFStrategyTest_SetOptimizationParamsRecomputesDecayFromCurrentState_Test;
+class MRNFStrategyTest_DegenerateBoundsStayInvalidAndKeepFiniteMeanLearningRate_Test;
+class MRNFStrategyTest_LineBoundsUseFiniteSceneScaleForMeanLearningRate_Test;
+class CropDampingStrategyTest_MrnfRejectedRowsAreNotRefineCandidatesAtZeroScale_Test;
+class CropDampingStrategyTest_RoiGrowthShareSplitsPicksAndSpillsLeftovers_Test;
+class MRNFStrategyTest_CompactSplatsCorrectAndPeakBelowThreeX_Test;
+class MRNFStrategyTest_CompactSplatsFusedPathLeavesGradsEmpty_Test;
+class MRNFStrategyTest_ApplyDecaySkipsFrozenRows_Test;
+class MRNFStrategyTest_DensificationInfoShapeIsTwoRows_Test;
+class MRNFStrategyTest_ZeroVisibilityProducesNoGrowth_Test;
+class MRNFStrategyTest_DirectAuxiliaryGrowthPreservesPrefix_Test;
+class MRNFStrategyTest_PerSplatMeanStepScalesWithExtentAndClamps_Test;
+class MRNFStrategyTest_EdgeWindowNormalizesViewsAndClosesBeforeRefineBackward_Test;
 
 namespace lfs::training {
 
-    class MRNF : public IStrategy {
+    inline constexpr float kBlobSeedOpacity = 0.5f;
+    inline constexpr double kBlobSeedCapacityFraction = 0.01;
+    inline constexpr float kFarMaskOrbits = 2.0f;
+
+    class MRNF : public IStrategy, public ICheckpointStateAdopter {
     public:
         MRNF() = delete;
         explicit MRNF(lfs::core::SplatData& splat_data);
@@ -38,53 +75,162 @@ namespace lfs::training {
 
         void initialize(const lfs::core::param::OptimizationParameters& optimParams) override;
         void pre_step(int iter, RenderOutput& render_output) override;
+        void post_render(int iter, RenderOutput& render_output) override;
         void post_backward(int iter, RenderOutput& render_output) override;
         bool is_refining(int iter) const override;
         void step(int iter) override;
+        [[nodiscard]] lfs::core::Tensor rendered_support_counts() const override { return _rendered_count; }
+
+        void permute_gaussian_rows(const lfs::core::Tensor& perm) override;
 
         lfs::core::SplatData& get_model() override { return *_splat_data; }
         const lfs::core::SplatData& get_model() const override { return *_splat_data; }
 
         void remove_gaussians(const lfs::core::Tensor& mask) override;
 
-        AdamOptimizer& get_optimizer() override { return *_optimizer; }
-        const AdamOptimizer& get_optimizer() const override { return *_optimizer; }
+        AdamOptimizer& get_optimizer() override {
+            assert(_optimizer);
+            return *_optimizer;
+        }
+        const AdamOptimizer& get_optimizer() const override {
+            assert(_optimizer);
+            return *_optimizer;
+        }
 
         void serialize(std::ostream& os) const override;
         void deserialize(std::istream& is) override;
+        bool has_checkpoint_runtime_state() const noexcept override { return static_cast<bool>(_optimizer); }
+        bool can_adopt_checkpoint_state(const IStrategy& loaded) const noexcept override;
+        void adopt_checkpoint_state(IStrategy& loaded) noexcept override;
         const char* strategy_type() const override { return "mrnf"; }
 
         void reserve_optimizer_capacity(size_t capacity) override;
         void set_optimization_params(const lfs::core::param::OptimizationParameters& params) override;
-        void set_training_dataset(std::shared_ptr<CameraDataset> views) override { _views = std::move(views); }
-        void set_image_loader(lfs::io::PipelinedImageLoader* loader) override { _image_loader = loader; }
+        void set_training_dataset(std::shared_ptr<CameraDataset> views) override;
+        std::shared_ptr<CameraDataset> get_training_dataset() const override { return _views; }
+        lfs::core::Tensor edge_score_scratch(int iter) override;
+        void on_edge_score_accumulated(int iter) override;
+        std::pair<lfs::core::Tensor, lfs::core::Tensor> impact_scratch(int iter) override;
+        void on_impact_accumulated(int iter) override;
 
     private:
+        friend class ::MRNFStrategyTest_PermutationRepublishesFarMask_Test;
+        friend class ::MRNFStrategyTest_EdgeWindowNormalizesViewsAndClosesBeforeRefineBackward_Test;
         friend class ::MRNFStrategyTest_EdgeGuidanceFactorPrefersHigherPrecomputedEdgeScores_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitResetsOptimizerStateForParents_Test;
         friend class ::MRNFStrategyTest_SHDegree0KeepsShNEmptyAndFusedAdamUsableAfterGrowth_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitUsesIgsPlusSplitRule_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitWithoutMaxCapExtendsBookkeepingMasks_Test;
+        friend class ::MRNFStrategyTest_DeletedMaskCapacityGrowthPreservesExistingRows_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitReplacementSkipsZeroWeightCandidates_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitReusesFreeSlotsBeforeAppending_Test;
+        friend class ::MRNFStrategyTest_ChunkedChildPlacementMatchesSingleChunk_Test;
         friend class ::MRNFStrategyTest_SerializeRoundTripPreservesFreeMask_Test;
         friend class ::MRNFStrategyTest_SerializeRoundTripPreservesLrScheduleState_Test;
         friend class ::MRNFStrategyTest_DeserializeResizesTransientBuffersToLoadedModel_Test;
         friend class ::MRNFStrategyTest_SetOptimizationParamsRecomputesDecayFromCurrentState_Test;
+        friend class ::MRNFStrategyTest_DegenerateBoundsStayInvalidAndKeepFiniteMeanLearningRate_Test;
+        friend class ::MRNFStrategyTest_LineBoundsUseFiniteSceneScaleForMeanLearningRate_Test;
+        friend class ::CropDampingStrategyTest_MrnfRejectedRowsAreNotRefineCandidatesAtZeroScale_Test;
+        friend class ::CropDampingStrategyTest_RoiGrowthShareSplitsPicksAndSpillsLeftovers_Test;
+        friend class ::MRNFStrategyTest_CompactSplatsCorrectAndPeakBelowThreeX_Test;
+        friend class ::MRNFStrategyTest_CompactSplatsFusedPathLeavesGradsEmpty_Test;
+        friend class ::MRNFStrategyTest_ApplyDecaySkipsFrozenRows_Test;
+        friend class ::MRNFStrategyTest_DensificationInfoShapeIsTwoRows_Test;
+        friend class ::MRNFStrategyTest_ZeroVisibilityProducesNoGrowth_Test;
+        friend class ::MRNFStrategyTest_DirectAuxiliaryGrowthPreservesPrefix_Test;
+        friend class ::MRNFStrategyTest_PerSplatMeanStepScalesWithExtentAndClamps_Test;
+        friend class ::MRNFStrategyTest_LateLrAnnealDecaysOpacityAndColorAfterGrowth_Test;
+        friend class ::MRNFStrategyTest_GrowthExchangeUsesMaxOfImpactRanks_Test;
+        friend class ::MRNFStrategyTest_GrowthExchangeSkipsNewbornsUntilScored_Test;
+        friend class ::MRNFStrategyTest_GrowthExchangeMarksSplitParentsAndChildrenNewborn_Test;
+        friend class ::MRNFStrategyTest_RemoveGaussiansKeepsGrowthExchangeStateAligned_Test;
+        friend class ::MRNFStrategyTest_GrowthExchangeFallsBackToCoverageWithoutImpact_Test;
+        friend class ::MRNFStrategyTest_GrowthExchangeMatchesDemandWithoutDeletingParents_Test;
+        friend class ::MRNFStrategyTest_GrowthExchangeCosineQuotaAtStartMiddleAndEnd_Test;
 
+        void clear_rendered_support(const lfs::core::Tensor& indices);
+        // Frees rows the way refine() prunes them: free mask, deleted mask, zero
+        // quaternion (early exit in preprocessing) and fresh optimizer state.
+        void soft_delete_rows(const lfs::core::Tensor& indices);
+
+        // Growth exchange preserves splats with high removal impact. Rasterizers without
+        // impact output use coverage as the single protection score.
+        [[nodiscard]] bool growth_exchange_active(int iter) const;
+        [[nodiscard]] float exchange_importance_decay() const;
+        [[nodiscard]] int exchange_warmup_windows() const;
+        [[nodiscard]] size_t exchange_quota(int iter, size_t active) const;
+        void reset_exchange_state();
+        void reset_exchange_window_outputs();
+        void update_exchange_importance();
+        [[nodiscard]] lfs::core::Tensor select_exchange_victims(
+            size_t count,
+            const lfs::core::Tensor& excluded = {});
+        // Marks rows filled by growth as newborn: no importance yet and not ranked until a
+        // full pass over the training views has scored them.
+        void record_exchange_births(const lfs::core::Tensor& split_parents = {});
         void refine(int iter);
-        void grow_and_split(int iter, int pruned_count);
+        struct GrowthResult {
+            lfs::core::Tensor split_indices;
+            lfs::core::Tensor exchange_victim_indices;
+            int replacement_count = 0;
+            int growth_count = 0;
+            size_t exchange_victims = 0;
+        };
+        // refine_candidates defaults to compute_refine_candidates().
+        GrowthResult grow_and_split(
+            int iter,
+            int pruned_count,
+            lfs::core::Tensor refine_candidates = {},
+            size_t exchange_quota = 0);
+        // Splits the given parents and places their children (free slots first,
+        // then appended rows) in chunks of at most chunk_rows children.
+        // Returns {children placed in free slots, children appended}.
+        std::pair<size_t, size_t> split_parents_into_children(const lfs::core::Tensor& split_indices,
+                                                              size_t chunk_rows);
+        [[nodiscard]] bool screen_share_shrink_active(int iter) const;
+        [[nodiscard]] lfs::core::Tensor compute_refine_candidates() const;
         void apply_decay(int iter);
         void inject_noise(int iter);
         void compact_splats(const lfs::core::Tensor& keep_mask);
         void compute_bounds();
+        void sync_mean_learning_rate();
+        void apply_late_lr_anneal(int iter);
         void ensure_densification_info_shape();
         void enforce_max_cap();
         void refresh_decay_schedule_from_current_state();
-        void accumulate_edge_sample(int iter, const RenderOutput& render_output);
-        [[nodiscard]] bool should_accumulate_edge_sample(int iter) const;
-        [[nodiscard]] int edge_target_samples_per_refine_window() const;
         void reset_edge_accumulator();
+        void start_blob_seeding();
+        void cancel_blob_seeding();
+        void append_blob_seeds(BlobSeeds seeds);
+        [[nodiscard]] lfs::core::Tensor visibility_accumulator() const;
+        void refresh_camera_hull();
+        void refresh_far_field_mask(size_t n);
+        void publish_mean_step_far_mask();
+        void ensure_mean_step_far_mask();
+        [[nodiscard]] size_t densification_row_count() const;
+        // Gumbel top-k picks split between the crop box ROI and the rest by the growth share.
+        [[nodiscard]] lfs::core::Tensor sample_with_roi_share(
+            const lfs::core::Tensor& weights,
+            int k,
+            uint64_t seed,
+            size_t known_nnz);
+        [[nodiscard]] lfs::core::Tensor sample_gumbel_topk(
+            const lfs::core::Tensor& weights,
+            int k,
+            uint64_t seed,
+            size_t known_nnz = 0);
+        size_t append_child_rows(
+            const lfs::core::Tensor& child_means,
+            const lfs::core::Tensor& child_rotations,
+            const lfs::core::Tensor& child_log_scales,
+            const lfs::core::Tensor& child_sh0,
+            const lfs::core::Tensor& child_shN,
+            const lfs::core::Tensor& child_raw_opacities,
+            size_t append_start,
+            size_t K,
+            lfs::training::sh_value::ShNMutationBatch* shn_batch = nullptr);
+        void publish_vram_attribution() noexcept;
         size_t active_count() const;
         size_t free_count() const;
         [[nodiscard]] lfs::core::Tensor get_active_indices() const;
@@ -97,9 +243,9 @@ namespace lfs::training {
             const lfs::core::Tensor& sh0,
             const lfs::core::Tensor& shN,
             const lfs::core::Tensor& opacities,
-            int64_t count);
-        [[nodiscard]] lfs::core::Tensor compute_edge_scores(int iter);
-        [[nodiscard]] lfs::core::Tensor edge_guidance_factor() const;
+            int64_t count,
+            lfs::training::sh_value::ShNMutationBatch* shn_batch = nullptr);
+        [[nodiscard]] lfs::core::Tensor edge_guidance_factor();
 
         std::unique_ptr<AdamOptimizer> _optimizer;
         std::unique_ptr<ExponentialLR> _scheduler;
@@ -107,21 +253,64 @@ namespace lfs::training {
         std::unique_ptr<const lfs::core::param::OptimizationParameters> _params;
 
         std::shared_ptr<CameraDataset> _views;
-        lfs::io::PipelinedImageLoader* _image_loader = nullptr;
 
+        lfs::core::Tensor _rendered_count;
         lfs::core::Tensor _refine_weight_max;
-        lfs::core::Tensor _vis_count;
         lfs::core::Tensor _precomputed_edge_scores;
         bool _edge_precompute_valid = false;
         lfs::core::Tensor _edge_score_sum;
-        lfs::core::Tensor _edge_canny_nms_output;
+        lfs::core::Tensor _edge_view_scores;
         int _edge_sample_count = 0;
-        int _edge_last_sample_iter = -1;
+        std::unique_ptr<BlobSeeder> _blob_seeder;
+        // Triangulation runs off the training thread; its seeds join at the first refine after it finishes.
+        std::future<BlobSeeds> _blob_seeds;
+        std::jthread _blob_seed_worker;
+        lfs::core::Tensor _far_field_mask;
+        float _cam_centroid[3] = {0.0f, 0.0f, 0.0f};
+        float _orbit_radius = 0.0f;
+        bool _camera_hull_valid = false;
         lfs::core::Tensor _free_mask;
+        bool _topology_frozen = false;
+
+        // Growth exchange state; transient (rebuilt after a resume).
+        lfs::core::Tensor _exchange_importance_sum;     // [N] leaky max of impact sum or coverage fallback
+        lfs::core::Tensor _exchange_importance_peak;    // [N] leaky max of impact peak; invalid for fallback
+        lfs::core::Tensor _exchange_birth;              // [N] window in which the row was last filled
+        lfs::core::Tensor _exchange_window_impact_sum;  // [N] window removal-impact sum
+        lfs::core::Tensor _exchange_window_impact_peak; // [N] window removal-impact peak
+        lfs::core::Tensor _exchange_free_before_growth; // free slots right before growth
+        int _exchange_windows = 0;                      // windows in the current importance memory
+        bool _exchange_impact_written = false;
+        int _exchange_first_iter = -1;
+
+        DensifyNScratch _densify_n_scratch;
+        GumbelTopKScratch _gumbel_scratch;
+        lfs::core::Tensor _refine_counts_dev;
+
+        std::size_t _strategy_required_peak_bytes = 0;
+        std::size_t _strategy_allocated_peak_bytes = 0;
+        std::size_t _densify_n_required_peak_bytes = 0;
+        std::size_t _densify_n_allocated_peak_bytes = 0;
+        std::size_t _densify_child_required_peak_bytes = 0;
+        std::size_t _densify_child_allocated_peak_bytes = 0;
 
         mrnf_strategy::MRNFBounds _bounds = {};
         bool _bounds_valid = false;
         int _refine_windows_since_bounds = 0;
+        float _median_splat_extent = 0.0f;
+        bool _median_splat_extent_valid = false;
+
+        [[nodiscard]] lfs::core::Tensor build_replace_parent_weights(
+            size_t n,
+            const lfs::core::Tensor& active_mask,
+            const lfs::core::Tensor& trainable_mask,
+            const lfs::core::Tensor& edge_guidance) const;
+
+        // Grow MRNF bookkeeping after parameter preflight and before any
+        // parameter append. This is intentionally grow-only: refine resets
+        // the buffers after the append, while this step preserves their live
+        // prefix across a reservation boundary.
+        void ensure_auxiliary_capacity_for_growth(size_t target_size);
 
         // MRNF uses independent exponential schedules for mean and scale learning rates.
         double _mean_lr_unscaled = 0.0;

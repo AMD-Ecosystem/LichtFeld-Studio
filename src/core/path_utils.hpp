@@ -4,13 +4,18 @@
 
 #pragma once
 
+#include "core/native_fs.hpp"
+
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
+#include <share.h>
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -307,6 +312,20 @@ namespace lfs::core {
 #endif
     }
 
+    // UTF-8 representation for a filename-taking library at its I/O boundary.
+    // Do not use this representation in UI, project JSON, or subprocess arguments.
+    inline std::string path_to_native_utf8(const std::filesystem::path& path) {
+        return path_to_utf8(lfs::core::native_fs::native_path(path));
+    }
+
+    inline std::string path_to_generic_utf8(const std::filesystem::path& p) {
+#ifdef _WIN32
+        return wstring_to_utf8(p.generic_wstring());
+#else
+        return p.generic_string();
+#endif
+    }
+
     /**
      * @brief Convert UTF-8 string to filesystem path
      *
@@ -333,6 +352,49 @@ namespace lfs::core {
     }
 
     /**
+     * @brief Copy process arguments into a UTF-8 representation.
+     *
+     * Windows applications must enter through wmain so the CRT does not first
+     * decode arguments using the active code page. Linux keeps its native argv
+     * surface and simply copies it into the same representation.
+     */
+    inline std::vector<std::string> utf8_argv(int argc, char* argv[]) {
+        std::vector<std::string> result;
+        result.reserve(argc > 0 ? static_cast<std::size_t>(argc) : 0);
+        for (int i = 0; i < argc; ++i) {
+            result.emplace_back(argv[i] != nullptr ? argv[i] : "");
+        }
+        return result;
+    }
+
+#ifdef _WIN32
+    inline std::vector<std::string> utf8_argv(int argc, wchar_t* argv[]) {
+        std::vector<std::string> result;
+        result.reserve(argc > 0 ? static_cast<std::size_t>(argc) : 0);
+        for (int i = 0; i < argc; ++i) {
+            result.emplace_back(argv[i] != nullptr ? wstring_to_utf8(argv[i]) : std::string{});
+        }
+        return result;
+    }
+#endif
+
+    /**
+     * @brief Open a C stdio file using a filesystem path without an ACP round trip.
+     */
+    inline std::FILE* open_file(const std::filesystem::path& path, const char* mode) {
+#ifdef _WIN32
+        const auto wide_mode = utf8_to_wstring(mode != nullptr ? std::string(mode) : std::string{});
+        if (wide_mode.empty()) {
+            return nullptr;
+        }
+        // Preserve fopen's read/write sharing without the deprecated CRT API.
+        return _wfsopen(native_fs::native_path(path).c_str(), wide_mode.c_str(), _SH_DENYNO);
+#else
+        return std::fopen(path.c_str(), mode);
+#endif
+    }
+
+    /**
      * @brief Open an output file stream with proper Unicode path handling
      *
      * On Windows, std::ofstream constructor with std::filesystem::path may not work
@@ -348,14 +410,7 @@ namespace lfs::core {
         const std::filesystem::path& path,
         std::ios_base::openmode mode,
         std::ofstream& stream) {
-#ifdef _WIN32
-        // On Windows, explicitly use wstring to open with Unicode support
-        // This ensures we bypass any narrow string conversion issues
-        stream.open(path.wstring(), mode);
-#else
-        // On Linux/Mac, standard ofstream works with UTF-8 paths
-        stream.open(path, mode);
-#endif
+        stream.open(native_fs::native_path(path), mode);
         return stream.is_open();
     }
 
@@ -384,13 +439,7 @@ namespace lfs::core {
         const std::filesystem::path& path,
         std::ios_base::openmode mode,
         std::ifstream& stream) {
-#ifdef _WIN32
-        // On Windows, explicitly use wstring to open with Unicode support
-        stream.open(path.wstring(), mode);
-#else
-        // On Linux/Mac, standard ifstream works with UTF-8 paths
-        stream.open(path, mode);
-#endif
+        stream.open(native_fs::native_path(path), mode);
         return stream.is_open();
     }
 
@@ -416,8 +465,8 @@ namespace lfs::core {
      */
     inline bool reveal_in_file_manager(const std::filesystem::path& path) {
         std::error_code ec;
-        const std::filesystem::path absolute = std::filesystem::weakly_canonical(path, ec);
-        if (ec || absolute.empty() || !std::filesystem::exists(absolute, ec))
+        const std::filesystem::path absolute = native_fs::weakly_canonical(path, ec);
+        if (ec || absolute.empty() || !native_fs::exists(absolute, ec))
             return false;
 
 #ifdef _WIN32

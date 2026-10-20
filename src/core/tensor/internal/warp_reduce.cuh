@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "tensor_functors.hpp"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -61,7 +63,7 @@ namespace lfs::core {
 #pragma unroll
             for (int offset = LFS_WARP_REDUCE_SIZE / 2; offset > 0; offset /= 2) {
                 T other = __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val, offset);
-                val = (val > other) ? val : other;
+                val = ops::max_reduce_op{}(val, other);
             }
             return val;
         }
@@ -74,7 +76,7 @@ namespace lfs::core {
 #pragma unroll
             for (int offset = LFS_WARP_REDUCE_SIZE / 2; offset > 0; offset /= 2) {
                 T other = __shfl_xor_sync(LFS_WARP_REDUCE_MASK, val, offset);
-                val = (val < other) ? val : other;
+                val = ops::min_reduce_op{}(val, other);
             }
             return val;
         }
@@ -266,10 +268,10 @@ namespace lfs::core {
 
                 if (is_aligned && idx + 3 < n) {
                     float4 vals = reinterpret_cast<const float4*>(input)[vec_idx];
-                    val = fmaxf(fmaxf(vals.x, vals.y), fmaxf(vals.z, vals.w));
+                    val = ops::max_reduce_op{}(ops::max_reduce_op{}(vals.x, vals.y), ops::max_reduce_op{}(vals.z, vals.w));
                 } else if (idx < n) {
                     for (size_t i = idx; i < n && i < idx + 4; ++i) {
-                        val = fmaxf(val, input[i]);
+                        val = ops::max_reduce_op{}(val, input[i]);
                     }
                 }
             } else {
@@ -297,10 +299,10 @@ namespace lfs::core {
 
                 if (is_aligned && idx + 3 < n) {
                     float4 vals = reinterpret_cast<const float4*>(input)[vec_idx];
-                    val = fminf(fminf(vals.x, vals.y), fminf(vals.z, vals.w));
+                    val = ops::min_reduce_op{}(ops::min_reduce_op{}(vals.x, vals.y), ops::min_reduce_op{}(vals.z, vals.w));
                 } else if (idx < n) {
                     for (size_t i = idx; i < n && i < idx + 4; ++i) {
-                        val = fminf(val, input[i]);
+                        val = ops::min_reduce_op{}(val, input[i]);
                     }
                 }
             } else {
@@ -421,10 +423,10 @@ namespace lfs::core {
 
                     if (is_aligned && idx + 3 < segment_size) {
                         float4 vals = reinterpret_cast<const float4*>(segment_start)[base / 4 + vec_idx];
-                        val = fmaxf(val, fmaxf(fmaxf(vals.x, vals.y), fmaxf(vals.z, vals.w)));
+                        val = ops::max_reduce_op{}(val, ops::max_reduce_op{}(ops::max_reduce_op{}(vals.x, vals.y), ops::max_reduce_op{}(vals.z, vals.w)));
                     } else if (idx < segment_size) {
                         for (size_t i = idx; i < segment_size && i < idx + 4; ++i) {
-                            val = fmaxf(val, segment_start[i]);
+                            val = ops::max_reduce_op{}(val, segment_start[i]);
                         }
                     }
                 }
@@ -462,10 +464,10 @@ namespace lfs::core {
 
                     if (is_aligned && idx + 3 < segment_size) {
                         float4 vals = reinterpret_cast<const float4*>(segment_start)[base / 4 + vec_idx];
-                        val = fminf(val, fminf(fminf(vals.x, vals.y), fminf(vals.z, vals.w)));
+                        val = ops::min_reduce_op{}(val, ops::min_reduce_op{}(ops::min_reduce_op{}(vals.x, vals.y), ops::min_reduce_op{}(vals.z, vals.w)));
                     } else if (idx < segment_size) {
                         for (size_t i = idx; i < segment_size && i < idx + 4; ++i) {
-                            val = fminf(val, segment_start[i]);
+                            val = ops::min_reduce_op{}(val, segment_start[i]);
                         }
                     }
                 }

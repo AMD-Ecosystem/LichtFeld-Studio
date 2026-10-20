@@ -4,11 +4,16 @@
 
 #pragma once
 
+#include <SDL3/SDL_events.h>
+#include <atomic>
 #include <functional>
 #include <string>
 #include <vector>
 
 struct SDL_Window;
+#ifdef __linux__
+union _XEvent;
+#endif
 
 namespace lfs::vis::gui {
 
@@ -25,8 +30,6 @@ namespace lfs::vis::gui {
 #endif
 
     public:
-        using DragEnterCallback = std::function<void(const std::vector<std::string>& mime_types)>;
-        using DragLeaveCallback = std::function<void()>;
         using FileDropCallback = std::function<void(const std::vector<std::string>& paths)>;
 
         ~NativeDragDrop();
@@ -42,23 +45,19 @@ namespace lfs::vis::gui {
         [[nodiscard]] bool isDragHovering() const { return drag_hovering_; }
 
         // Set callbacks
-        void setDragEnterCallback(DragEnterCallback cb) { on_drag_enter_ = std::move(cb); }
-        void setDragLeaveCallback(DragLeaveCallback cb) { on_drag_leave_ = std::move(cb); }
         void setFileDropCallback(FileDropCallback cb) { on_file_drop_ = std::move(cb); }
 
         // Force-reset hovering state (called when file drop is confirmed via SDL callback)
         void resetHovering() { setDragHovering(false); }
 
-        // Poll for X11 events (call each frame on Linux)
+        // Per-frame hook for platforms that need polling (no-op on X11 and Windows)
         void pollEvents();
 
     private:
         SDL_Window* window_ = nullptr;
-        bool drag_hovering_ = false;
+        std::atomic<bool> drag_hovering_{false};
         bool initialized_ = false;
 
-        DragEnterCallback on_drag_enter_;
-        DragLeaveCallback on_drag_leave_;
         FileDropCallback on_file_drop_;
 
         // Platform-specific implementation data
@@ -67,6 +66,10 @@ namespace lfs::vis::gui {
 
         void setDragHovering(bool hovering);
         void handleFileDrop(const std::vector<std::string>& paths);
+#ifdef __linux__
+        static bool SDLCALL waylandEventWatch(void* userdata, SDL_Event* event);
+        static bool x11EventHook(void* userdata, union _XEvent* xevent);
+#endif
     };
 
 } // namespace lfs::vis::gui

@@ -8,16 +8,19 @@ add_subdirectory(rasterization/fastgs)
 # Add LibTorch-free gsplat backend
 add_subdirectory(rasterization/gsplat)
 
-# Add igs+ edge-compute rasterizer
-add_subdirectory(rasterization/edge_compute)
-
 # LibTorch-free CUDA kernels
 set(LFS_TRAINING_KERNEL_SOURCES
+    kernels/loss_tensor_contract.cpp
     kernels/camera_loss_heatmap.cu
+    kernels/thin_structure.cu
+    kernels/blob_seeding.cu
+    kernels/gradient_residual.cu
     kernels/ssim.cu
     kernels/l1_loss.cu
     kernels/ssim_reduction.cu
     kernels/regularization.cu
+    kernels/effective_rank_regularization.cu
+    kernels/popspa.cu
     kernels/bilateral_grid_forward.cu
     kernels/bilateral_grid_backward.cu
     kernels/bilateral_grid_tv.cu
@@ -26,9 +29,14 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/mcmc_kernels.cu
     kernels/mrnf_kernels.cu
     kernels/densification_kernels.cu
+    kernels/morton_reorder_kernels.cu
     kernels/grad_alpha.cu
+    kernels/depth_loss.cu
+    kernels/normal_loss.cu
+    kernels/normal_consistency_loss.cu
+    kernels/roi_weight_map.cu
     kernels/image_kernels.cu
-    components/sparsity_optimizer_kernels.cu
+    kernels/mask_preprocess.cu
 )
 
 # Create CUDA kernels library
@@ -44,6 +52,7 @@ target_link_libraries(lfs_training_kernels
     PUBLIC
         lfs_core         # For lfs::core::Tensor (tensor merged into lfs_core)
         CUDA::cudart
+        lfs_core_cuda    # q16 encode/decode kernels
 )
 
 set_target_properties(lfs_training_kernels PROPERTIES
@@ -56,12 +65,12 @@ set_target_properties(lfs_training_kernels PROPERTIES
 # CUDA compiler options for lfs_training_kernels
 target_compile_options(lfs_training_kernels PRIVATE
     # CUDA device code + MSVC host compiler flags (Windows only)
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
 
     # CUDA device code for non-Windows
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} -lineinfo --extended-lambda --expt-relaxed-constexpr>
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
 )
 
 if(MSVC)
@@ -69,6 +78,10 @@ if(MSVC)
             $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
     )
 endif()
+
+# Shared depth-anchor fit + sidecar cache (reused by the preprocess CLI)
+add_subdirectory(depth_anchor)
+
 # Optimizer sources
 if(USE_HIP)
     # Compute tranche: build the kernel-facing training pieces (optimizer,
@@ -101,27 +114,50 @@ if(USE_HIP)
 else()
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
+    sh_value_codec.cpp
+    sh_value_storage.cpp
+    morton_reorder.cpp
+    live_model_mutation_guard.cpp
     optimizer/scheduler.cpp
     losses/regularization.cpp
+    losses/effective_rank_regularization.cpp
     losses/photometric_loss.cpp
+    losses/mask_loss.cpp
     strategies/strategy_utils.cpp
+    strategies/postprocess_compaction.cpp
     strategies/mcmc.cpp
     strategies/mrnf.cpp
+    strategies/blob_seeding.cpp
     strategies/strategy_factory.cpp
     strategies/improved_gs_plus.cpp
     rasterization/fast_rasterizer.cpp
     rasterization/gsplat_rasterizer.cpp
-    rasterization/edge_rasterizer.cpp
+    rasterization/pop_scores.cpp
+    components/config_serialization.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
     components/ppisp_controller.cu
     components/ppisp_controller_pool.cu
     components/ppisp_file.cpp
-    components/sparsity_optimizer.cpp
+    components/popspa_controller.cpp
     control/command_api.cpp
+    metrics/compare_images.cpp
+    metrics/eval_image_labels.cpp
+    metrics/eval_mask.cpp
+    metrics/eval_mask_kernels.cu
+    metrics/flip.cu
+    metrics/mesh_mask_kernels.cu
     metrics/metrics.cpp
-    checkpoint.cpp
-    trainer.cpp
+        checkpoint.cpp
+        project_snapshot_chapters.cpp
+        training_snapshot_service.cpp
+        progress.cpp
+        training_cropbox_mask.cpp
+        trainer.cpp
+        trainer_popspa.cpp
+        normal_auto_generate.cpp
+        vram_ledger.cpp
+        perf_bench.cpp
     training_setup.cpp
 )
 endif()
@@ -141,12 +177,10 @@ target_include_directories(lfs_training
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/rasterization/include  # For rasterization_api.h
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/optimizer/include
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/utils
-	${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/rasterization/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/utils
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization  # For gsplat headers
 )
-# indicators.hpp is a PUBLIC system include so consumers (visualizer, mcp) also suppress its warnings
-target_include_directories(lfs_training SYSTEM PUBLIC
+# indicators.hpp is an implementation detail of progress.cpp.
+target_include_directories(lfs_training SYSTEM PRIVATE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/external>
 )
 
@@ -172,11 +206,13 @@ target_link_libraries(lfs_training
         lfs_io                  # For CacheLoader, exporter, pipelined loader
         lfs_event_bridge        # Shared event bridge for cross-module singletons
         lfs_training_kernels    # LibTorch-free SSIM kernels
-        fastlfs_backend         # For adam_step_raw CUDA kernel (LibTorch-free)
+        fastlfs_backend         # LibTorch-free FastGS rasterization and optimizer kernels
         gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
-	edge_compute_backend    # For igs+ edge score rasterization
     PRIVATE
+        lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
+        lfs_preprocessing       # MoGe-2 normal auto-generate
         lfs_python_utils
+        lfs_rendering           # Mesh2Splat for mesh initialization
 )
 endif()
 

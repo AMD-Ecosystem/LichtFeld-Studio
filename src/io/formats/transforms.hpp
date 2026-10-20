@@ -13,9 +13,14 @@
 
 namespace lfs::io {
 
+    std::filesystem::path GetTransformImagePath(
+        const std::filesystem::path& dir_path,
+        const std::string& frame_file_path);
+
     std::tuple<std::vector<CameraData>, lfs::core::Tensor, std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>>> read_transforms_cameras_and_images(
         const std::filesystem::path& transPath,
-        const LoadOptions& options = {});
+        const LoadOptions& options = {},
+        std::vector<std::string>* warnings = nullptr);
 
     PointCloud generate_random_point_cloud();
 

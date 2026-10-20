@@ -24,7 +24,8 @@ namespace lfs::python {
 
         bool has_handlers_impl() {
             return PyViewportDrawRegistry::instance().has_handlers() ||
-                   PyTransformGizmoRegistry::instance().has_attached();
+                   PyTransformGizmoRegistry::instance().has_attached() ||
+                   PyGizmoRegistry::instance().has_gizmos();
         }
 
         bool sync_document_impl(void* document_ptr) {
@@ -47,6 +48,22 @@ namespace lfs::python {
                 LOG_ERROR("Viewport overlay document sync failed: {}", e.what());
             }
             return false;
+        }
+
+        void unload_document_impl() {
+            if (!can_acquire_gil()) {
+                LOG_DEBUG("Viewport overlay document unload skipped: Python not ready");
+                return;
+            }
+
+            const GilAcquire gil;
+            try {
+                auto overlays = nb::module_::import_("lfs_plugins.overlays");
+                if (nb::hasattr(overlays, "on_document_unloaded"))
+                    overlays.attr("on_document_unloaded")();
+            } catch (const std::exception& e) {
+                LOG_ERROR("Viewport overlay document unload failed: {}", e.what());
+            }
         }
 
         void invoke_overlay_impl(const float* view_matrix, const float* proj_matrix,
@@ -80,6 +97,10 @@ namespace lfs::python {
             auto* dl = static_cast<vis::gui::NativeOverlayDrawList*>(draw_list_ptr);
             PyTransformGizmoRegistry::instance().draw_all(view, proj, vp_p, vp_s, dl);
 
+            PyGizmoContext gizmo_ctx;
+            gizmo_ctx.set_camera_state(view, proj, vp_p, vp_s, cp, cf);
+            PyGizmoRegistry::instance().draw_all(gizmo_ctx);
+
             auto* overlay = static_cast<lfs::rendering::ScreenOverlayRenderer*>(overlay_renderer_ptr);
             if (!overlay || !overlay->isFrameActive()) {
                 return;
@@ -88,62 +109,66 @@ namespace lfs::python {
             const lfs::rendering::ScreenOverlayRenderer::ScopedClipRect clip(
                 *overlay, vp_p, {vp_p.x + vp_s.x, vp_p.y + vp_s.y});
 
-            for (const auto& cmd : draw_ctx.get_draw_commands()) {
-                const lfs::rendering::OverlayColor color{cmd.r, cmd.g, cmd.b, cmd.a};
+            const auto submit_commands = [&](const auto& ctx) {
+                for (const auto& cmd : ctx.get_draw_commands()) {
+                    const lfs::rendering::OverlayColor color{cmd.r, cmd.g, cmd.b, cmd.a};
 
-                switch (cmd.type) {
-                case PyViewportDrawContext::DrawCommand::LINE_2D:
-                    overlay->addLine({cmd.x1, cmd.y1}, {cmd.x2, cmd.y2}, color, cmd.thickness);
-                    break;
-                case PyViewportDrawContext::DrawCommand::CIRCLE_2D:
-                    overlay->addCircle({cmd.x1, cmd.y1}, cmd.radius, color, 0, cmd.thickness);
-                    break;
-                case PyViewportDrawContext::DrawCommand::RECT_2D:
-                    overlay->addRect({cmd.x1, cmd.y1}, {cmd.x2, cmd.y2}, color, cmd.thickness);
-                    break;
-                case PyViewportDrawContext::DrawCommand::FILLED_RECT_2D:
-                    overlay->addRectFilled({cmd.x1, cmd.y1}, {cmd.x2, cmd.y2}, color);
-                    break;
-                case PyViewportDrawContext::DrawCommand::FILLED_CIRCLE_2D:
-                    overlay->addCircleFilled({cmd.x1, cmd.y1}, cmd.radius, color);
-                    break;
-                case PyViewportDrawContext::DrawCommand::TEXT_2D: {
-                    const float size_px = cmd.font_size > 0.0f ? cmd.font_size : 14.0f;
-                    overlay->addText({cmd.x1, cmd.y1}, cmd.text, color, size_px);
-                    break;
-                }
-                case PyViewportDrawContext::DrawCommand::LINE_3D: {
-                    auto s = draw_ctx.world_to_screen({cmd.x1, cmd.y1, cmd.z1});
-                    auto e = draw_ctx.world_to_screen({cmd.x2, cmd.y2, cmd.z2});
-                    if (s && e) {
-                        auto [sx, sy] = *s;
-                        auto [ex, ey] = *e;
-                        overlay->addLine({sx, sy}, {ex, ey}, color, cmd.thickness);
-                    }
-                    break;
-                }
-                case PyViewportDrawContext::DrawCommand::POINT_3D: {
-                    auto p = draw_ctx.world_to_screen({cmd.x1, cmd.y1, cmd.z1});
-                    if (p) {
-                        auto [px, py] = *p;
-                        overlay->addCircleFilled({px, py}, cmd.radius, color);
-                    }
-                    break;
-                }
-                case PyViewportDrawContext::DrawCommand::TEXT_3D: {
-                    auto p = draw_ctx.world_to_screen({cmd.x1, cmd.y1, cmd.z1});
-                    if (p) {
-                        auto [px, py] = *p;
+                    switch (cmd.type) {
+                    case PyViewportDrawContext::DrawCommand::LINE_2D:
+                        overlay->addLine({cmd.x1, cmd.y1}, {cmd.x2, cmd.y2}, color, cmd.thickness);
+                        break;
+                    case PyViewportDrawContext::DrawCommand::CIRCLE_2D:
+                        overlay->addCircle({cmd.x1, cmd.y1}, cmd.radius, color, 0, cmd.thickness);
+                        break;
+                    case PyViewportDrawContext::DrawCommand::RECT_2D:
+                        overlay->addRect({cmd.x1, cmd.y1}, {cmd.x2, cmd.y2}, color, cmd.thickness);
+                        break;
+                    case PyViewportDrawContext::DrawCommand::FILLED_RECT_2D:
+                        overlay->addRectFilled({cmd.x1, cmd.y1}, {cmd.x2, cmd.y2}, color);
+                        break;
+                    case PyViewportDrawContext::DrawCommand::FILLED_CIRCLE_2D:
+                        overlay->addCircleFilled({cmd.x1, cmd.y1}, cmd.radius, color);
+                        break;
+                    case PyViewportDrawContext::DrawCommand::TEXT_2D: {
                         const float size_px = cmd.font_size > 0.0f ? cmd.font_size : 14.0f;
-                        overlay->addText({px, py}, cmd.text, color, size_px);
+                        overlay->addText({cmd.x1, cmd.y1}, cmd.text, color, size_px);
+                        break;
                     }
-                    break;
+                    case PyViewportDrawContext::DrawCommand::LINE_3D: {
+                        auto s = ctx.world_to_screen({cmd.x1, cmd.y1, cmd.z1});
+                        auto e = ctx.world_to_screen({cmd.x2, cmd.y2, cmd.z2});
+                        if (s && e) {
+                            auto [sx, sy] = *s;
+                            auto [ex, ey] = *e;
+                            overlay->addLine({sx, sy}, {ex, ey}, color, cmd.thickness);
+                        }
+                        break;
+                    }
+                    case PyViewportDrawContext::DrawCommand::POINT_3D: {
+                        auto p = ctx.world_to_screen({cmd.x1, cmd.y1, cmd.z1});
+                        if (p) {
+                            auto [px, py] = *p;
+                            overlay->addCircleFilled({px, py}, cmd.radius, color);
+                        }
+                        break;
+                    }
+                    case PyViewportDrawContext::DrawCommand::TEXT_3D: {
+                        auto p = ctx.world_to_screen({cmd.x1, cmd.y1, cmd.z1});
+                        if (p) {
+                            auto [px, py] = *p;
+                            const float size_px = cmd.font_size > 0.0f ? cmd.font_size : 14.0f;
+                            overlay->addText({px, py}, cmd.text, color, size_px);
+                        }
+                        break;
+                    }
+                    default:
+                        assert(false && "Unknown DrawCommand type");
+                        break;
+                    }
                 }
-                default:
-                    assert(false && "Unknown DrawCommand type");
-                    break;
-                }
-            }
+            };
+            submit_commands(draw_ctx);
+            submit_commands(gizmo_ctx);
         }
 
     } // namespace
@@ -151,6 +176,7 @@ namespace lfs::python {
     void register_viewport_overlay_bridge() {
         set_viewport_overlay_callbacks(has_handlers_impl, invoke_overlay_impl);
         set_viewport_overlay_document_sync_callback(sync_document_impl);
+        set_viewport_overlay_document_unload_callback(unload_document_impl);
     }
 
 } // namespace lfs::python

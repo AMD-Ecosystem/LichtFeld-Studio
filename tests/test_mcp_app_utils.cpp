@@ -2,13 +2,17 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "app/include/app/mcp_app_utils.hpp"
+#include "core/camera.hpp"
+#include "core/error.hpp"
 #include "core/scene.hpp"
 #include "mcp/mcp_tools.hpp"
+#include "visualizer/scene_capture_job_queue.hpp"
 #include "visualizer/visualizer.hpp"
 
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <future>
 #include <gtest/gtest.h>
 #include <mutex>
@@ -76,9 +80,85 @@ namespace {
         std::expected<void, std::string> startTraining() override {
             return std::unexpected("not implemented");
         }
-        std::expected<std::filesystem::path, std::string> saveCheckpoint(
-            const std::optional<std::filesystem::path>&) override {
-            return std::unexpected("not implemented");
+        lfs::Result<void> projectSave(bool) override {
+            return {};
+        }
+        lfs::Result<void> projectSaveAs(
+            const std::filesystem::path&, bool) override {
+            return {};
+        }
+        lfs::Result<void> projectCreateAt(
+            const std::filesystem::path&,
+            lfs::vis::ProjectSwitchDisposition,
+            bool = false) override {
+            return {};
+        }
+        lfs::Result<lfs::vis::ProjectOpenOutcome> projectOpen(
+            const std::filesystem::path&,
+            lfs::vis::ProjectSwitchDisposition) override {
+            return lfs::vis::ProjectOpenOutcome::Opened;
+        }
+        lfs::Result<void> projectCompact() override {
+            return {};
+        }
+        lfs::Result<bool> projectIsDirty() override {
+            return false;
+        }
+        lfs::Result<bool> projectHasPath() override {
+            return false;
+        }
+        lfs::Result<lfs::vis::ProjectInfo>
+        projectGetInfo() override {
+            ++info_calls_;
+            lfs::vis::ProjectInfo info;
+            info.path = path_;
+            info.generation = published_generation_;
+            info.project_write_running = false;
+            return info;
+        }
+        lfs::Result<std::optional<lfs::io::project::ProjectLicense>>
+        projectGetLicense() override {
+            return std::optional<lfs::io::project::ProjectLicense>{};
+        }
+        lfs::Result<void> projectSetLicense(
+            const lfs::io::project::ProjectLicense&) override {
+            return {};
+        }
+        lfs::Result<void> projectClearLicense() override { return {}; }
+
+        lfs::Result<lfs::vis::ProjectWritePoll>
+        projectPollWrite() override {
+            ++poll_calls_;
+            lfs::vis::ProjectWritePoll poll;
+            poll.running = remaining_running_ > 0;
+            if (remaining_running_ > 0) {
+                --remaining_running_;
+            }
+            poll.generation = poll.running
+                                  ? previous_generation_
+                                  : published_generation_;
+            poll.path = path_;
+            return poll;
+        }
+
+        void setWaitState(
+            std::filesystem::path path,
+            const std::uint64_t previous_generation,
+            const std::uint64_t published_generation,
+            const int remaining_running) {
+            path_ = std::move(path);
+            previous_generation_ = previous_generation;
+            published_generation_ = published_generation;
+            remaining_running_ = remaining_running;
+            info_calls_ = 0;
+            poll_calls_ = 0;
+        }
+
+        [[nodiscard]] int infoCalls() const {
+            return info_calls_;
+        }
+        [[nodiscard]] int pollCalls() const {
+            return poll_calls_;
         }
 
         [[nodiscard]] int postCount() const {
@@ -121,9 +201,78 @@ namespace {
         std::deque<WorkItem> work_queue_;
         int post_count_ = 0;
         bool accept_work_ = true;
+        std::filesystem::path path_;
+        std::uint64_t previous_generation_ = 0;
+        std::uint64_t published_generation_ = 0;
+        int remaining_running_ = 0;
+        int info_calls_ = 0;
+        int poll_calls_ = 0;
     };
 
 } // namespace
+
+TEST(SceneCaptureJobQueueTest, MeshAddedBeforeRequestUsesNextFramesMeshState) {
+    lfs::vis::SceneCaptureJobQueue jobs;
+    int completed = 0;
+    int canceled = 0;
+    bool scene_has_mesh = false;
+    ASSERT_TRUE(jobs.post({.run = [&] { ++completed; }, .cancel = [&] { ++canceled; }}));
+    scene_has_mesh = true; // mutation after posting, before the next frame
+    ASSERT_TRUE(jobs.beginFrame(scene_has_mesh));
+    EXPECT_TRUE(jobs.needsSceneReadback());
+    jobs.completeFrame();
+    EXPECT_EQ(completed, 1);
+    EXPECT_EQ(canceled, 0);
+}
+
+TEST(SceneCaptureJobQueueTest, ViewerThreadRenderWorkWaitsForNextCaptureGate) {
+    lfs::vis::SceneCaptureJobQueue jobs;
+    int completed = 0;
+    EXPECT_FALSE(jobs.beginFrame(true));
+    EXPECT_FALSE(jobs.needsSceneReadback()); // current frame's gate
+    ASSERT_TRUE(jobs.post({.run = [&] { ++completed; }, .cancel = [] {}}));
+    jobs.completeFrame(); // current frame's render work
+    EXPECT_EQ(completed, 0);
+    ASSERT_TRUE(jobs.beginFrame(true));
+    EXPECT_TRUE(jobs.needsSceneReadback());
+    jobs.completeFrame();
+    EXPECT_EQ(completed, 1);
+}
+
+TEST(SceneCaptureJobQueueTest, SceneSwitchCancelsPendingAndActiveJobsExactlyOnce) {
+    lfs::vis::SceneCaptureJobQueue jobs;
+    int completed = 0;
+    int canceled = 0;
+    const auto post = [&] {
+        return jobs.post({.run = [&] { ++completed; }, .cancel = [&] { ++canceled; }});
+    };
+    ASSERT_TRUE(post());
+    ASSERT_TRUE(jobs.beginFrame(true));
+    ASSERT_TRUE(post());
+    jobs.cancelAll(); // scene replacement before the capture gate
+    jobs.cancelAll(); // scene cleared event may follow
+    EXPECT_FALSE(jobs.needsSceneReadback());
+    EXPECT_FALSE(jobs.beginFrame(true));
+    jobs.completeFrame();
+    EXPECT_EQ(completed, 0);
+    EXPECT_EQ(canceled, 2);
+}
+
+TEST(SceneCaptureJobQueueTest, IdleRequestDemandsAFrameWithoutAnotherSceneEvent) {
+    lfs::vis::SceneCaptureJobQueue jobs;
+    int completed = 0;
+    EXPECT_FALSE(jobs.hasPending());
+    EXPECT_FALSE(jobs.hasWork());
+    ASSERT_TRUE(jobs.post({.run = [&] { ++completed; }, .cancel = [] {}}));
+    EXPECT_TRUE(jobs.hasPending());
+    EXPECT_TRUE(jobs.hasWork());
+    ASSERT_TRUE(jobs.beginFrame(false));
+    EXPECT_FALSE(jobs.hasPending());
+    EXPECT_FALSE(jobs.needsSceneReadback());
+    jobs.completeFrame();
+    EXPECT_EQ(completed, 1);
+    EXPECT_FALSE(jobs.hasWork());
+}
 
 TEST(McpAppUtilsTest, PostAndWaitExecutesInlineOnViewerThread) {
     FakeVisualizer viewer;
@@ -138,6 +287,19 @@ TEST(McpAppUtilsTest, PostAndWaitExecutesInlineOnViewerThread) {
     EXPECT_EQ(viewer.postCount(), 0);
     EXPECT_TRUE(result["success"].get<bool>());
     EXPECT_EQ(result["mode"], "inline");
+}
+
+TEST(McpAppUtilsTest, PostAndWaitBlocksNativeDialogsOnlyForTheGuiWork) {
+    FakeVisualizer viewer;
+    EXPECT_FALSE(lfs::vis::gui::nativeFileDialogsBlocked());
+    const auto blocked = lfs::app::post_and_wait(&viewer, [] {
+        EXPECT_TRUE(lfs::vis::gui::nativeFileDialogsBlocked());
+        EXPECT_TRUE(lfs::vis::gui::OpenFileDialog().empty());
+        return nlohmann::json{{"success", true}};
+    });
+    EXPECT_EQ(blocked["error"],
+              "This MCP operation requested a native file dialog. Use project_save_as, project_open, scene.load_ply, or scene.load_dataset with an explicit path instead.");
+    EXPECT_FALSE(lfs::vis::gui::nativeFileDialogsBlocked());
 }
 
 TEST(McpAppUtilsTest, PostAndWaitQueuesAndWaitsOffViewerThread) {
@@ -162,6 +324,27 @@ TEST(McpAppUtilsTest, PostAndWaitQueuesAndWaitsOffViewerThread) {
     const auto result = result_future.get();
     EXPECT_TRUE(result["success"].get<bool>());
     EXPECT_EQ(result["mode"], "queued");
+}
+
+TEST(McpAppUtilsTest, PostAndWaitReturnsQueuedExceptionWithoutUnwindingWorkQueue) {
+    FakeVisualizer viewer;
+    std::promise<void> result_promise;
+    auto result_future = result_promise.get_future();
+
+    std::jthread worker([&](std::stop_token) {
+        try {
+            (void)lfs::app::post_and_wait(&viewer, []() -> nlohmann::json {
+                throw std::runtime_error("posted work failed");
+            });
+            result_promise.set_value();
+        } catch (...) {
+            result_promise.set_exception(std::current_exception());
+        }
+    });
+
+    ASSERT_TRUE(viewer.waitForPostedWork());
+    EXPECT_NO_THROW(EXPECT_TRUE(viewer.runNextWorkItem()));
+    EXPECT_THROW(result_future.get(), std::runtime_error);
 }
 
 TEST(McpAppUtilsTest, ToolRegistryHandlerUsingPostAndWaitExecutesInlineOnViewerThread) {
@@ -201,4 +384,67 @@ TEST(McpAppUtilsTest, PostAndWaitReturnsShutdownErrorOnViewerThreadWhenWorkRejec
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), "Viewer is shutting down");
+}
+
+TEST(McpAppUtilsTest, WaitForProjectGenerationPollsUntilTerminalThenInfosOnce) {
+    FakeVisualizer viewer;
+    const std::filesystem::path path{"/tmp/wait-generation.licht"};
+    viewer.setWaitState(path, 4, 5, 3);
+
+    const auto info = lfs::app::wait_for_project_generation(
+        &viewer, 4, path, true);
+
+    ASSERT_TRUE(info) << lfs::format_for_developer(info.error());
+    EXPECT_EQ(info->generation, 5u);
+    ASSERT_TRUE(info->path.has_value());
+    EXPECT_EQ(*info->path, path);
+    EXPECT_EQ(viewer.infoCalls(), 1);
+    EXPECT_GE(viewer.pollCalls(), 4);
+}
+
+TEST(McpAppUtilsTest, WaitForProjectWritePollsUntilTerminalThenInfosOnce) {
+    FakeVisualizer viewer;
+    const std::filesystem::path path{"/tmp/wait-write.licht"};
+    viewer.setWaitState(path, 2, 2, 2);
+
+    const auto info = lfs::app::wait_for_project_write(
+        &viewer, "Project compaction");
+
+    ASSERT_TRUE(info) << lfs::format_for_developer(info.error());
+    EXPECT_EQ(info->generation, 2u);
+    EXPECT_EQ(viewer.infoCalls(), 1);
+    EXPECT_GE(viewer.pollCalls(), 3);
+}
+
+TEST(SceneNodeCountsTest, ReopenedCameraGroupReportsCameraChildren) {
+    // Project restore writes camera-group gaussian_count as 0. The scene tree
+    // counts camera children, and that is the count MCP must report.
+    const auto make_camera = []() {
+        return std::make_shared<lfs::core::Camera>(
+            lfs::core::Tensor::eye(3, lfs::core::Device::CPU),
+            lfs::core::Tensor::zeros({3}, lfs::core::Device::CPU),
+            100.0f, 100.0f, 32.0f, 32.0f,
+            lfs::core::Tensor(), lfs::core::Tensor(), lfs::core::CameraModelType::PINHOLE,
+            "frame.png", std::filesystem::path{}, std::filesystem::path{}, 64, 64, 0);
+    };
+
+    lfs::core::Scene scene;
+    const auto group_id = scene.addCameraGroup("Training", lfs::core::NULL_NODE, 0);
+    ASSERT_NE(group_id, lfs::core::NULL_NODE);
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_NE(scene.addCamera("frame" + std::to_string(i) + ".png", group_id, make_camera()),
+                  lfs::core::NULL_NODE);
+    }
+
+    const auto* group = scene.getNodeById(group_id);
+    ASSERT_NE(group, nullptr);
+    EXPECT_EQ(group->gaussian_count.load(std::memory_order_acquire), 0u);
+    EXPECT_EQ(lfs::app::SceneNodeCounts(scene).get(*group), 3u);
+    EXPECT_EQ(group->gaussian_count.load(std::memory_order_acquire), 0u);
+
+    const auto plain = scene.addGroup("notes");
+    ASSERT_NE(plain, lfs::core::NULL_NODE);
+    const auto* plain_node = scene.getNodeById(plain);
+    ASSERT_NE(plain_node, nullptr);
+    EXPECT_EQ(lfs::app::SceneNodeCounts(scene).get(*plain_node), 0u);
 }

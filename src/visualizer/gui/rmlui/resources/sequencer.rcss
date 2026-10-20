@@ -4,7 +4,8 @@ body {
     flex-direction: column;
     margin: 0;
     padding: 0;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
     width: 100%;
     height: 100%;
 }
@@ -23,6 +24,7 @@ body {
 
 #panel.is-floating {
     padding-top: 10dp;
+    padding-bottom: 6dp;
 }
 
 #floating-header {
@@ -54,6 +56,9 @@ body {
 }
 
 #transport-row {
+    flex-shrink: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
     display: flex;
     flex-direction: row;
     width: 100%;
@@ -69,6 +74,7 @@ body {
     flex-direction: row;
     align-items: center;
     gap: 4dp;
+    flex-shrink: 0;
 }
 
 #right-controls {
@@ -76,9 +82,11 @@ body {
     flex-direction: row;
     align-items: center;
     gap: 4dp;
+    flex-shrink: 0;
 }
 
 #transport {
+    flex-shrink: 0;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -164,6 +172,10 @@ body {
     white-space: nowrap;
 }
 
+.transport-label-short {
+    display: none;
+}
+
 .transport-info {
     font-size: 12dp;
     opacity: 0.6;
@@ -172,6 +184,65 @@ body {
 
 .transport-info.quality-group {
     margin-left: 2dp;
+}
+
+#resolution-field {
+    position: relative;
+    display: flex;
+    align-items: center;
+    padding: 0 4dp;
+    min-height: 18dp;
+    border-width: 1dp;
+    border-color: transparent;
+    border-radius: 4dp;
+    cursor: pointer;
+    transition: border-color 0.12s quadratic-out, background-color 0.12s quadratic-out;
+}
+
+#resolution-field:hover,
+#resolution-field.is-editing {
+    border-color: #45475a;
+    background-color: #313244;
+}
+
+#resolution-field.is-editing {
+    cursor: text;
+    opacity: 1;
+}
+
+#resolution-info,
+#resolution-input {
+    font-size: 12dp;
+    color: #cdd6f4;
+}
+
+#resolution-info {
+    white-space: nowrap;
+}
+
+#resolution-input {
+    display: none;
+    width: 80dp;
+    padding: 0;
+    margin: 0;
+    min-height: 0;
+    background-color: transparent;
+    border-width: 0;
+    box-shadow: none;
+}
+
+#resolution-field.is-editing #resolution-info {
+    display: none;
+}
+
+#resolution-field.is-editing #resolution-input {
+    display: block;
+}
+
+#resolution-input:focus,
+#resolution-input:focus-visible {
+    border-width: 0;
+    box-shadow: none;
 }
 
 .transport-sep {
@@ -194,21 +265,11 @@ body {
     align-items: center;
     justify-content: flex-end;
     box-sizing: border-box;
-    decorator: vertical-gradient(#3a3c52 #2c2d3e);
-    background-color: #313244;
     border-width: 1dp;
-    border-color: #45475a;
     border-radius: 6dp;
-    font-family: "JetBrains Mono";
     font-size: 12dp;
     cursor: ew-resize;
     transition: border-color 0.12s quadratic-out, background-color 0.12s quadratic-out;
-}
-
-#quality-scrub:hover,
-#quality-scrub.is-dragging,
-#quality-scrub.is-editing {
-    border-color: #89b4fa;
 }
 
 #quality-scrub.is-editing {
@@ -221,20 +282,15 @@ body {
     top: 0;
     bottom: 0;
     width: 0%;
-    decorator: horizontal-gradient(rgba(116,168,249,110) rgba(137,180,250,140));
-    background-color: rgba(137, 180, 250, 90);
     border-radius: 5dp;
 }
 
 #quality-display,
 #quality-input {
     position: relative;
-    z-index: 1;
     width: 100%;
     text-align: right;
-    font-family: "JetBrains Mono";
     font-size: 12dp;
-    color: #cdd6f4;
 }
 
 #quality-display {
@@ -299,6 +355,70 @@ body {
     font-size: 12dp;
     opacity: 0.4;
     margin-left: 2dp;
+}
+
+.sequence-fps-field {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    width: 58dp;
+    min-height: 22dp;
+    padding: 0 6dp;
+    box-sizing: border-box;
+    border-width: 1dp;
+    border-color: transparent;
+    border-radius: 4dp;
+    cursor: pointer;
+    transition: border-color 0.12s quadratic-out, background-color 0.12s quadratic-out;
+}
+
+.sequence-fps-field:hover,
+.sequence-fps-field.active,
+.sequence-fps-field.is-editing {
+    border-color: #45475a;
+    background-color: #313244;
+}
+
+.sequence-fps-field.is-editing {
+    cursor: text;
+}
+
+#sequence-fps-display,
+#sequence-fps-input {
+    width: 100%;
+    text-align: right;
+    font-size: 12dp;
+    color: #cdd6f4;
+}
+
+#sequence-fps-display {
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+#sequence-fps-input {
+    display: none;
+    padding: 0;
+    margin: 0;
+    min-height: 0;
+    background-color: transparent;
+    border-width: 0;
+    box-shadow: none;
+}
+
+.sequence-fps-field.is-editing #sequence-fps-display {
+    display: none;
+}
+
+.sequence-fps-field.is-editing #sequence-fps-input {
+    display: block;
+}
+
+#sequence-fps-input:focus,
+#sequence-fps-input:focus-visible {
+    border-width: 0;
+    box-shadow: none;
 }
 
 .snap-check {
@@ -372,11 +492,13 @@ body {
 }
 
 .ruler-label {
-    display: block;
+    display: inline-block;
     position: absolute;
     top: 0;
     font-size: 12dp;
     color: rgba(200, 210, 230, 220);
+    white-space: nowrap;
+    transform: translateX(-50%);
 }
 
 #track-area {
@@ -408,6 +530,55 @@ body {
     margin-top: -6dp;
     text-align: center;
     font-size: 12dp;
+}
+
+#sequence-strip {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 100%;
+    height: 22dp;
+    margin-top: -11dp;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+.sequence-clip {
+    display: block;
+    position: absolute;
+    top: 2dp;
+    height: 18dp;
+    min-width: 2dp;
+    box-sizing: border-box;
+    border-width: 1dp;
+    border-color: rgba(105, 175, 255, 190);
+    border-radius: 4dp;
+    background-color: rgba(70, 120, 190, 95);
+}
+
+.sequence-clip-label {
+    display: block;
+    position: absolute;
+    left: 8dp;
+    right: 8dp;
+    top: 2dp;
+    height: 14dp;
+    font-size: 11dp;
+    line-height: 14dp;
+    color: rgba(230, 238, 255, 230);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sequence-frame-tick {
+    display: block;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1dp;
+    background-color: rgba(230, 238, 255, 95);
 }
 
 #keyframes {
@@ -464,9 +635,46 @@ body {
     background-color: #ff6688;
     border-radius: 7dp;
     pointer-events: none;
+    transform-origin: 50% 50%;
+    transition: transform 0.12s quadratic-out, background-color 0.12s quadratic-out;
+}
+
+#playhead-handle.hot {
+    transform: scale(1.2);
+    background-color: #ff99aa;
+}
+
+#timeline-scrollbar {
+    display: none;
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 100%;
+    height: 6dp;
+    border-radius: 3dp;
+    background-color: rgba(160, 160, 180, 40);
+    overflow: hidden;
+}
+
+#timeline-scrollbar.visible {
+    display: block;
+}
+
+#timeline-scrollbar-thumb {
+    display: block;
+    position: absolute;
+    top: 0;
+    height: 100%;
+    border-radius: 3dp;
+    background-color: rgba(200, 210, 230, 120);
+}
+
+#timeline-scrollbar.hot #timeline-scrollbar-thumb {
+    background-color: rgba(230, 238, 255, 200);
 }
 
 #time-display {
+    flex-shrink: 0;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -504,7 +712,6 @@ body {
 
 #duration,
 #duration-input {
-    font-family: "JetBrains Mono";
     font-size: 12dp;
     color: #cdd6f4;
 }
@@ -539,6 +746,7 @@ body {
 }
 
 #easing-stripe {
+    flex-shrink: 0;
     display: block;
     width: auto;
     height: 36dp;
@@ -620,9 +828,10 @@ body {
 }
 
 #film-strip-panel {
+    flex-shrink: 0;
     display: block;
     width: auto;
-    height: 56px;
+    height: 56dp;
     position: relative;
     margin-top: -1px;
     margin-left: -16dp;
@@ -864,4 +1073,59 @@ body {
 .timeline-tooltip-line.title {
     font-size: 12dp;
     margin-bottom: 2dp;
+}
+
+@media (max-width: 1240dp) {
+    .ctx-indicator {
+        display: none;
+    }
+
+    #btn-camera-path .transport-label,
+    #btn-export .transport-label,
+    #btn-clear .transport-label {
+        display: none;
+    }
+
+    #btn-camera-path .cam-path-icon,
+    #btn-export .export-icon,
+    #btn-clear .clear-icon {
+        margin-right: 0;
+    }
+}
+
+@media (max-width: 1120dp) {
+    .transport-sep {
+        display: none;
+    }
+}
+
+@media (max-width: 660dp) {
+    .transport-label-full {
+        display: none;
+    }
+
+    .transport-label-short {
+        display: block;
+    }
+}
+
+@media (max-width: 580dp) {
+    #duration-field {
+        display: none;
+    }
+
+    #time-display {
+        margin-left: 0;
+        padding-left: 4dp;
+    }
+
+    #left-controls,
+    #right-controls {
+        gap: 2dp;
+    }
+
+    #transport-row {
+        justify-content: flex-start;
+        gap: 6dp;
+    }
 }

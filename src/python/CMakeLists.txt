@@ -8,10 +8,6 @@ message(STATUS "Configuring Python components (runner + nanobind module)")
 find_package(Python REQUIRED COMPONENTS Interpreter Development Development.Module Development.SABIModule)
 find_package(nanobind CONFIG REQUIRED)
 
-option(LFS_DEV_IMPORT_SOURCE_PYTHON
-    "Import built-in Python packages from src/python in non-portable builds"
-    ON)
-
 # vcpkg extension modules use release ABI; debug libpython has Py_DEBUG which
 # changes _PyRuntimeState layout, causing ABI mismatch crashes.
 # Force release Python library for debug builds on both Python::Python and Python::Module
@@ -85,6 +81,8 @@ target_include_directories(lfs_python_runtime
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/core/include
+        ${CMAKE_SOURCE_DIR}/src/io/include
+        ${CMAKE_SOURCE_DIR}/src/visualizer/include
 )
 
 target_link_libraries(lfs_python_runtime
@@ -92,6 +90,7 @@ target_link_libraries(lfs_python_runtime
         Python::Python
         glm::glm
     PRIVATE
+        lfs_core
         lfs_logger
 )
 
@@ -119,8 +118,9 @@ if(WIN32 AND _IS_MULTI_CONFIG)
     )
 endif()
 
-# Static library for other Python utilities
-add_library(lfs_python_utils STATIC
+# Windows consumers must share runner callbacks, initialization status and
+# package/plugin state with the existing Python runtime DLL.
+set(LFS_PYTHON_UTILS_SOURCES
     runner.cpp
     python_buffer_analysis.cpp
     package_manager.cpp
@@ -129,17 +129,29 @@ add_library(lfs_python_utils STATIC
     uv_runner.cpp
 )
 
-target_include_directories(lfs_python_utils
+set(LFS_PYTHON_UTILS_RUNTIME_DEPENDENCY)
+if(WIN32)
+    target_sources(lfs_python_runtime PRIVATE ${LFS_PYTHON_UTILS_SOURCES})
+    add_library(lfs_python_utils INTERFACE)
+    target_link_libraries(lfs_python_utils INTERFACE lfs_python_runtime)
+    set(LFS_PYTHON_UTILS_IMPL_TARGET lfs_python_runtime)
+else()
+    add_library(lfs_python_utils STATIC ${LFS_PYTHON_UTILS_SOURCES})
+    set(LFS_PYTHON_UTILS_RUNTIME_DEPENDENCY lfs_python_runtime)
+    set(LFS_PYTHON_UTILS_IMPL_TARGET lfs_python_utils)
+endif()
+
+target_include_directories(${LFS_PYTHON_UTILS_IMPL_TARGET}
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src
 )
 
-target_link_libraries(lfs_python_utils
+target_link_libraries(${LFS_PYTHON_UTILS_IMPL_TARGET}
     PUBLIC
         Python::Python
         lfs_core
-        lfs_python_runtime
+        ${LFS_PYTHON_UTILS_RUNTIME_DEPENDENCY}
         lfs::tree_sitter
         lfs::tree_sitter_python
 )
@@ -154,12 +166,12 @@ if(LFS_DEV_IMPORT_SOURCE_PYTHON AND NOT BUILD_PORTABLE)
     message(STATUS "Python dev mode: built-in Python imports from ${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
-target_compile_definitions(lfs_python_utils
+target_compile_definitions(${LFS_PYTHON_UTILS_IMPL_TARGET}
     PUBLIC
         ${LFS_PYTHON_UTILS_DEFINITIONS}
 )
 
-set_target_properties(lfs_python_utils PROPERTIES
+set_target_properties(${LFS_PYTHON_UTILS_IMPL_TARGET} PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
@@ -175,6 +187,7 @@ nanobind_add_module(
     lfs_py
     NB_STATIC
     lfs/module.cpp
+    lfs/py_error.cpp
     lfs/py_animation.cpp
     lfs/py_command.cpp
     lfs/py_gizmo.cpp
@@ -184,10 +197,12 @@ nanobind_add_module(
     lfs/py_scene.cpp
     lfs/py_scripts.cpp
     lfs/py_cameras.cpp
+    lfs/py_diagnostics.cpp
     lfs/py_io.cpp
     lfs/py_packages.cpp
     lfs/py_params.cpp
     lfs/py_plugins.cpp
+    lfs/py_operator_properties.cpp
     lfs/py_ui.cpp
     lfs/py_ui_context.cpp
     lfs/py_ui_theme.cpp
@@ -236,8 +251,6 @@ set_target_properties(lfs_py PROPERTIES
 # and hook bridges through ELF symbol interposition.
 target_compile_definitions(lfs_py PRIVATE
     LFS_PYTHON_EXECUTABLE="${Python_EXECUTABLE}"
-    $<$<CONFIG:Debug>:DEBUG_BUILD>
-    $<$<CONFIG:Release>:RELEASE_BUILD>
 )
 
 
@@ -263,14 +276,13 @@ endif()
 
 target_link_libraries(lfs_py PRIVATE
     ${LFS_PY_INTERNAL_LINK_LIBS}
-    $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
-    $<IF:$<PLATFORM_ID:Windows>,OpenMeshTools,OpenMeshToolsStatic>
-    OpenImageIO::OpenImageIO
+    OpenMeshCore
+    OpenMeshTools
     CUDA::cudart
     CUDA::curand
+    SDL3::SDL3
     ${CMAKE_DL_LIBS}
-    imgui::imgui
-    implot::implot
+    GPUOpen::VulkanMemoryAllocator
     $<IF:$<PLATFORM_ID:Windows>,RmlUi::RmlUi,lfs_rmlui>
 )
 
@@ -294,6 +306,17 @@ endif()
 # Windows: Copy required DLLs next to the .pyd for Python module loading
 # Python's DLL search doesn't use the app's directory, only the module's directory
 if(WIN32)
+    # An implementation-only runtime change may leave its import library (and
+    # therefore the PYD link) unchanged. Keep the adjacent DLL current anyway.
+    add_custom_target(lfs_python_runtime_copy
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:lfs_python_runtime>" "${CMAKE_CURRENT_BINARY_DIR}"
+        DEPENDS lfs_python_runtime
+        COMMENT "Syncing Python runtime DLL next to the module"
+        VERBATIM
+    )
+    add_dependencies(lfs_py lfs_python_runtime_copy)
+
     # Copy project DLLs
     add_custom_command(TARGET lfs_py POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -515,6 +538,7 @@ add_custom_target(lfs_python_support_copy ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:lfs_py>
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/_lfs_panel_contract.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/_lfs_path_io.py
         ${CMAKE_CURRENT_SOURCE_DIR}/lfs_splat_lod_hierarchy.py
         $<TARGET_FILE_DIR:lfs_py>
     COMMENT "Copying internal Python support modules"
@@ -565,6 +589,7 @@ if(BUILD_PORTABLE)
         FILES_MATCHING PATTERN "*.py"
     )
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/_lfs_panel_contract.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/_lfs_path_io.py"
         DESTINATION "${CMAKE_INSTALL_BINDIR}"
     )
 else()
@@ -573,6 +598,7 @@ else()
         FILES_MATCHING PATTERN "*.py"
     )
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/_lfs_panel_contract.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/_lfs_path_io.py"
         DESTINATION "${PYTHON_INSTALL_DIR}"
     )
 endif()

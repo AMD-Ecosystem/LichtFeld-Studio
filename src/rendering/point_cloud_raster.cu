@@ -2,7 +2,9 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "environment_math.hpp"
 #include "point_cloud_raster.cuh"
+#include "point_cloud_style.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -41,6 +43,9 @@ namespace lfs::rendering::pcraster {
         __global__ void rasterizePointsKernel(LaunchParams params, std::uint64_t* packed_buffer) {
             const int idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (idx >= static_cast<int>(params.n_points)) {
+                return;
+            }
+            if (params.deleted_mask && params.deleted_mask[idx]) {
                 return;
             }
 
@@ -97,6 +102,25 @@ namespace lfs::rendering::pcraster {
                     }
                     desaturate = true;
                 }
+            } else if (params.has_crop_ellipsoid) {
+                const float* T = params.crop_ellipsoid.to_local;
+                const float lx = matMulRow(T, 0, x, y, z, 1.0f);
+                const float ly = matMulRow(T, 1, x, y, z, 1.0f);
+                const float lz = matMulRow(T, 2, x, y, z, 1.0f);
+                const float rx = fmaxf(fabsf(params.crop_ellipsoid.radii[0]), 1e-8f);
+                const float ry = fmaxf(fabsf(params.crop_ellipsoid.radii[1]), 1e-8f);
+                const float rz = fmaxf(fabsf(params.crop_ellipsoid.radii[2]), 1e-8f);
+                const float norm = (lx * lx) / (rx * rx) +
+                                   (ly * ly) / (ry * ry) +
+                                   (lz * lz) / (rz * rz);
+                const bool inside = norm <= 1.0f;
+                const bool visible = params.crop_ellipsoid.inverse ? !inside : inside;
+                if (!visible) {
+                    if (!params.crop_ellipsoid.desaturate) {
+                        return;
+                    }
+                    desaturate = true;
+                }
             }
 
             const float* V = params.view;
@@ -116,11 +140,9 @@ namespace lfs::rendering::pcraster {
                 const float dx = view_x / len;
                 const float dy = view_y / len;
                 const float dz = view_z / len;
-                const float pi = 3.14159265358979323846f;
-                const float u = 0.5f + atan2f(dx, -dz) / (2.0f * pi);
-                const float v = 0.5f + asinf(fminf(fmaxf(dy, -1.0f), 1.0f)) / pi;
-                pixel_x = u * static_cast<float>(params.width - 1);
-                pixel_y = v * static_cast<float>(params.height - 1);
+                const auto uv = envmath::equirectUvForDirection({dx, dy, dz});
+                pixel_x = uv.u * static_cast<float>(params.camera_width - 1) - static_cast<float>(params.origin_x);
+                pixel_y = uv.v * static_cast<float>(params.camera_height - 1) - static_cast<float>(params.origin_y);
                 if (!isfinite(pixel_x) || !isfinite(pixel_y) ||
                     pixel_x < 0.0f || pixel_x >= static_cast<float>(params.width) ||
                     pixel_y < 0.0f || pixel_y >= static_cast<float>(params.height)) {
@@ -145,8 +167,10 @@ namespace lfs::rendering::pcraster {
                     ndc_z < 0.0f || ndc_z > 1.0f) {
                     return;
                 }
-                pixel_x = (ndc_x * 0.5f + 0.5f) * static_cast<float>(params.width - 1);
-                pixel_y = (ndc_y * 0.5f + 0.5f) * static_cast<float>(params.height - 1);
+                pixel_x = (ndc_x * 0.5f + 0.5f) * static_cast<float>(params.camera_width - 1) -
+                          static_cast<float>(params.origin_x);
+                pixel_y = (0.5f - ndc_y * 0.5f) * static_cast<float>(params.camera_height - 1) -
+                          static_cast<float>(params.origin_y);
                 depth = params.orthographic ? -view_z : fmaxf(-view_z, 0.0f);
                 if (depth <= 0.0f && !params.orthographic) {
                     return;
@@ -157,7 +181,7 @@ namespace lfs::rendering::pcraster {
             int radius = 1;
             if (params.orthographic) {
                 const float pixels_per_world =
-                    static_cast<float>(params.height) / fmaxf(params.ortho_scale, 1e-5f);
+                    static_cast<float>(params.camera_height) / fmaxf(params.ortho_scale, 1e-5f);
                 radius = max(1, static_cast<int>(ceilf(voxel * pixels_per_world * 0.5f)));
             } else {
                 radius = max(1, static_cast<int>(ceilf(voxel * params.focal_y / fmaxf(depth, 1e-4f))));
@@ -171,9 +195,25 @@ namespace lfs::rendering::pcraster {
             b = fminf(fmaxf(b, 0.0f), 1.0f);
             if (desaturate) {
                 const float gray = 0.299f * r + 0.587f * g + 0.114f * b;
-                r = r + (gray - r) * 0.75f;
-                g = g + (gray - g) * 0.75f;
-                b = b + (gray - b) * 0.75f;
+                r = r + (gray - r) * DESATURATE_BLEND;
+                g = g + (gray - g) * DESATURATE_BLEND;
+                b = b + (gray - b) * DESATURATE_BLEND;
+            }
+
+            // Match the selection-group and additive/subtractive preview colors
+            // used by the Vulkan point renderer. Unmarked points keep their RGB.
+            const unsigned group = params.selection_mask ? params.selection_mask[idx] : 0;
+            const bool committed = group != 0;
+            const bool in_preview = params.preview_mask && params.preview_mask[idx] != 0;
+            const bool preview = in_preview && (params.preview_additive ? !committed : committed);
+            if (params.selection_colors && (committed || preview)) {
+                const float* tint = params.selection_colors + 4 * (preview ? SELECTION_PREVIEW_COLOR_INDEX : group);
+                const float blend = preview ? SELECTION_PREVIEW_BLEND : SELECTION_COMMITTED_BLEND;
+                r += (tint[0] - r) * blend;
+                g += (tint[1] - g) * blend;
+                b += (tint[2] - b) * blend;
+                const float scale = preview ? SELECTION_PREVIEW_SCALE : SELECTION_COMMITTED_SCALE;
+                radius = static_cast<int>(ceilf(fmaxf(radius + 1.0f, radius * scale)));
             }
 
             const std::uint64_t packed = packDepthColor(depth, r, g, b);
@@ -240,7 +280,12 @@ namespace lfs::rendering::pcraster {
 
     } // namespace
 
-    cudaError_t launchPointCloudRaster(const LaunchParams& params) {
+    cudaError_t launchPointCloudRaster(const LaunchParams& request) {
+        LaunchParams params = request;
+        if (params.camera_width <= 0 || params.camera_height <= 0) {
+            params.camera_width = params.width;
+            params.camera_height = params.height;
+        }
         if (params.width <= 0 || params.height <= 0 || params.n_points == 0 ||
             (params.channels != 3 && params.channels != 4) ||
             !params.image || !params.depth) {

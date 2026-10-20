@@ -15,9 +15,17 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <cmath>
+#include <stdexcept>
+
 namespace nb = nanobind;
 
 namespace {
+
+    void validate_simplify_ratio(const double ratio) {
+        if (!std::isfinite(ratio))
+            throw std::invalid_argument("ratio must be finite");
+    }
 
     struct PyProgressCallback {
         nb::object callback;
@@ -70,8 +78,7 @@ namespace lfs::python {
             int target_count() const { return owner_->target_count; }
             int post_prune_count() const { return owner_->post_prune_count; }
             double requested_ratio() const { return owner_->requested_ratio; }
-            int requested_knn_k() const { return owner_->requested_knn_k; }
-            double requested_merge_cap() const { return owner_->requested_merge_cap; }
+            float requested_lod_base() const { return owner_->requested_lod_base; }
             float requested_opacity_prune_threshold() const { return owner_->requested_opacity_prune_threshold; }
 
             const std::vector<int32_t>& final_roots() const { return owner_->final_roots; }
@@ -132,10 +139,8 @@ namespace lfs::python {
                          "Count remaining after opacity pruning")
             .def_prop_ro("requested_ratio", &PySplatSimplifyMergeTree::requested_ratio,
                          "Requested simplify ratio")
-            .def_prop_ro("requested_knn_k", &PySplatSimplifyMergeTree::requested_knn_k,
-                         "Requested kNN neighborhood size")
-            .def_prop_ro("requested_merge_cap", &PySplatSimplifyMergeTree::requested_merge_cap,
-                         "Requested per-pass merge cap")
+            .def_prop_ro("requested_lod_base", &PySplatSimplifyMergeTree::requested_lod_base,
+                         "Requested LOD base factor")
             .def_prop_ro("requested_opacity_prune_threshold",
                          &PySplatSimplifyMergeTree::requested_opacity_prune_threshold,
                          "Requested opacity prune threshold")
@@ -164,9 +169,9 @@ namespace lfs::python {
             "simplify_splats",
             [](const std::string& source_name,
                double ratio,
-               int knn_k,
-               double merge_cap,
+               float lod_base,
                float opacity_prune_threshold) {
+                validate_simplify_ratio(ratio);
                 auto* scene = get_application_scene();
                 if (!scene)
                     throw std::runtime_error("No scene available");
@@ -180,15 +185,16 @@ namespace lfs::python {
 
                 core::SplatSimplifyOptions opts;
                 opts.ratio = ratio;
-                opts.knn_k = knn_k;
-                opts.merge_cap = merge_cap;
+                opts.lod_base = lod_base;
                 opts.opacity_prune_threshold = opacity_prune_threshold;
-                invoke_splat_simplify_start(source_name, opts);
+                {
+                    nb::gil_scoped_release release;
+                    invoke_splat_simplify_start(source_name, opts);
+                }
             },
             nb::arg("source_name"),
             nb::arg("ratio") = 0.1,
-            nb::arg("knn_k") = 16,
-            nb::arg("merge_cap") = 0.5,
+            nb::arg("lod_base") = 2.0f,
             nb::arg("opacity_prune_threshold") = 0.1f,
             "Simplify a splat node asynchronously and create a new output node.");
 
@@ -196,14 +202,13 @@ namespace lfs::python {
             "simplify_splat_data_with_history",
             [](const PySplatData& source,
                double ratio,
-               int knn_k,
-               double merge_cap,
+               float lod_base,
                float opacity_prune_threshold,
                nb::object progress) {
+                validate_simplify_ratio(ratio);
                 core::SplatSimplifyOptions opts;
                 opts.ratio = ratio;
-                opts.knn_k = knn_k;
-                opts.merge_cap = merge_cap;
+                opts.lod_base = lod_base;
                 opts.opacity_prune_threshold = opacity_prune_threshold;
 
                 PyProgressCallback py_progress{std::move(progress)};
@@ -229,8 +234,7 @@ namespace lfs::python {
             },
             nb::arg("source"),
             nb::arg("ratio") = 0.1,
-            nb::arg("knn_k") = 16,
-            nb::arg("merge_cap") = 0.5,
+            nb::arg("lod_base") = 2.0f,
             nb::arg("opacity_prune_threshold") = 0.1f,
             nb::arg("progress") = nb::none(),
             "Synchronously simplify SplatData and return both the simplified output and its merge tree.");

@@ -28,9 +28,10 @@ class TestIOBasics:
 class TestDatasetDetection:
     """Tests for dataset path detection."""
 
-    def test_is_dataset_path_colmap(self, lf, bicycle_dataset):
+    def test_is_dataset_path_colmap(self, lf, tmp_path):
         """Test COLMAP dataset detection."""
-        assert lf.io.is_dataset_path(str(bicycle_dataset))
+        (tmp_path / "cameras.txt").touch()
+        assert lf.io.is_dataset_path(str(tmp_path))
 
     def test_is_dataset_path_false_for_file(self, lf, tmp_output):
         """Test that regular file is not detected as dataset."""
@@ -83,6 +84,38 @@ class TestLoadResult:
             str(bicycle_dataset), resize_factor=8, images_folder="images_8"
         )
         assert result.load_time_ms >= 0
+
+    @pytest.mark.slow
+    def test_dataset_point_cloud_setters_keep_one_device(self, lf, test_data_dir):
+        """Setting one field from a CUDA tensor must follow the cloud's device.
+
+        The COLMAP loader returns a CPU cloud. Setters that always moved to
+        CUDA left means and colors on different devices, and the next filter
+        failed its device check.
+        """
+        datasets = sorted(
+            d for d in test_data_dir.iterdir()
+            if (d / "sparse").is_dir() and (d / "images_8").is_dir()
+        )
+        if not datasets:
+            pytest.skip("no COLMAP dataset with images_8 in the test data")
+        result = lf.io.load(str(datasets[0]), resize_factor=8, images_folder="images_8")
+        cloud = result.point_cloud
+        assert cloud is not None
+        count = cloud.size
+        assert count > 1
+
+        assert cloud.means.device == "cpu"
+        cloud.set_colors(cloud.colors.cuda())
+        assert cloud.colors.device == cloud.means.device
+        cloud.set_means(cloud.means.cuda())
+        assert cloud.means.device == cloud.colors.device
+
+        keep = lf.Tensor.arange(0, count, 1.0, device="cpu") < float(count // 2)
+        removed = cloud.filter(keep)
+        assert removed == count - count // 2
+        assert cloud.size == count // 2
+        assert cloud.colors.shape[0] == cloud.size
 
 
 class TestLoadPLY:
@@ -157,9 +190,94 @@ class TestLoadProgress:
             progress=on_progress,
         )
 
+        # Reaching the return value proves the released load completed.
+        assert result.loader_used
         # Progress callback should have been called
         assert len(progress_calls) > 0
 
         # Progress values should be in [0, 100] (percentage)
         for progress, _ in progress_calls:
             assert 0.0 <= progress <= 100.0
+
+
+_ONE_PIXEL_PNG = bytes(
+    [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+        0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ]
+)
+
+
+class TestMissingDatasetImages:
+    """Python-visible load warnings for missing dataset images."""
+
+    @pytest.mark.gpu
+    def test_transforms_load_warns_and_keeps_missing_camera(self, lf, tmp_path):
+        dataset = tmp_path / "missing_images"
+        dataset.mkdir()
+        (dataset / "present.png").write_bytes(_ONE_PIXEL_PNG)
+        (dataset / "transforms.json").write_text(
+            """{
+  "w": 1,
+  "h": 1,
+  "fl_x": 1.0,
+  "fl_y": 1.0,
+  "cx": 0.5,
+  "cy": 0.5,
+  "frames": [
+    {
+      "file_path": "present.png",
+      "transform_matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
+    },
+    {
+      "file_path": "missing.png",
+      "transform_matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
+    }
+  ]
+}
+"""
+        )
+
+        result = lf.io.load(str(dataset))
+        assert result.is_dataset is True
+        assert any("missing.png" in warning and "missing" in warning for warning in result.warnings)
+
+        cameras = result.cameras
+        assert cameras is not None
+        assert len(cameras) == 1
+        assert cameras[0].image_name == "present.png"
+        assert cameras[0].has_image is True
+
+        records = cameras.cameras()
+        assert len(records) == 2
+        by_name = {camera.image_name: camera for camera in records}
+        assert by_name["present.png"].has_image is True
+        assert by_name["missing.png"].has_image is False
+
+    def test_transforms_all_missing_fails(self, lf, tmp_path):
+        dataset = tmp_path / "all_missing_images"
+        dataset.mkdir()
+        (dataset / "transforms.json").write_text(
+            """{
+  "w": 1,
+  "h": 1,
+  "fl_x": 1.0,
+  "fl_y": 1.0,
+  "cx": 0.5,
+  "cy": 0.5,
+  "frames": [
+    {
+      "file_path": "missing.png",
+      "transform_matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
+    }
+  ]
+}
+"""
+        )
+
+        with pytest.raises(RuntimeError, match="missing"):
+            lf.io.load(str(dataset))

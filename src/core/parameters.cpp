@@ -3,25 +3,540 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/parameters.hpp"
+#include "core/file_extensions.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
+#include "core/optimization_properties.hpp"
 #include "core/path_utils.hpp"
+#include "core/property_registry.hpp"
+#include "io/project_path.hpp"
+#include <any>
+#include <array>
+#include <cassert>
+#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <ranges>
 #include <set>
 #include <sstream>
+#include <stdexcept>
+#include <string_view>
 
 namespace lfs::core {
     namespace param {
         namespace {
+            using prop::PropertyMeta;
+            using prop::PropertyObjectRef;
+            using prop::PropertyRegistry;
+            using prop::PropType;
+
+            [[nodiscard]] float mrnf_shs_lr_for_capacity(const int max_cap) {
+                constexpr double kReferenceCapacity = 1'000'000.0;
+                const double cap = std::max(static_cast<double>(max_cap), kReferenceCapacity);
+                return static_cast<float>(0.005 * std::sqrt(kReferenceCapacity / cap));
+            }
+
+            [[nodiscard]] float mrnf_grow_fraction_for_capacity(const int max_cap) {
+                constexpr double kReferenceCapacity = 1'000'000.0;
+                constexpr double kSaturationCapacity = 5'000'000.0;
+                constexpr double kAtReference = 0.0758;
+                constexpr double kAtSaturation = 0.12;
+                const double cap = std::clamp(static_cast<double>(max_cap),
+                                              kReferenceCapacity, kSaturationCapacity);
+                const double t = std::log(cap / kReferenceCapacity) /
+                                 std::log(kSaturationCapacity / kReferenceCapacity);
+                return static_cast<float>(kAtReference + t * (kAtSaturation - kAtReference));
+            }
+
+            [[nodiscard]] std::string_view optimization_json_key(const PropertyMeta& meta) {
+                return meta.json_key.empty() ? std::string_view(meta.id) : std::string_view(meta.json_key);
+            }
+
+            [[nodiscard]] prop::PropertyGroup optimization_property_snapshot() {
+                ensure_optimization_properties_registered();
+                auto group = PropertyRegistry::instance().get_group_snapshot("optimization");
+                if (!group)
+                    throw std::runtime_error("Optimization property registry is unavailable");
+                return std::move(*group);
+            }
+
+            [[nodiscard]] std::optional<std::string> validate_registered_optimization_enums(
+                const nlohmann::json& json) {
+                if (!json.is_object())
+                    return std::nullopt;
+
+                const auto group = optimization_property_snapshot();
+                for (const auto& meta : group.properties) {
+                    if (meta.type != PropType::Enum)
+                        continue;
+
+                    const std::string key(optimization_json_key(meta));
+                    if (!json.contains(key))
+                        continue;
+
+                    std::string accepted_values;
+                    for (const auto& item : meta.enum_items) {
+                        if (!accepted_values.empty())
+                            accepted_values += ", ";
+                        accepted_values += item.wire_value.empty() ? item.identifier : item.wire_value;
+                    }
+
+                    const auto& value = json.at(key);
+                    if (!value.is_string()) {
+                        return std::format(
+                            "Invalid value {} for optimization field '{}'; accepted values: {}",
+                            value.dump(), meta.id, accepted_values);
+                    }
+
+                    const auto wire_value = value.get<std::string>();
+                    const auto item = std::ranges::find_if(meta.enum_items, [&wire_value](const auto& candidate) {
+                        const auto& candidate_wire = candidate.wire_value.empty()
+                                                         ? candidate.identifier
+                                                         : candidate.wire_value;
+                        return candidate_wire == wire_value;
+                    });
+                    if (item == meta.enum_items.end()) {
+                        return std::format(
+                            "Invalid value '{}' for optimization field '{}'; accepted values: {}",
+                            wire_value, meta.id, accepted_values);
+                    }
+                }
+                return std::nullopt;
+            }
+
+            [[nodiscard]] bool is_json_integer(const nlohmann::json& value) {
+                return value.is_number_integer() || value.is_number_unsigned();
+            }
+
+            [[nodiscard]] bool is_json_int32(const nlohmann::json& value) {
+                return is_json_integer(value) &&
+                       value.get<long double>() >= std::numeric_limits<int>::min() &&
+                       value.get<long double>() <= std::numeric_limits<int>::max();
+            }
+
+            [[nodiscard]] bool is_json_size_t(const nlohmann::json& value) {
+                return is_json_integer(value) && value.get<long double>() >= 0.0L &&
+                       value.get<long double>() <= std::numeric_limits<size_t>::max();
+            }
+
+            [[nodiscard]] std::string_view optimization_json_type_name(const PropType type) {
+                switch (type) {
+                case PropType::Bool: return "boolean";
+                case PropType::Int: return "integer";
+                case PropType::Float: return "number";
+                case PropType::String:
+                case PropType::Enum: return "string";
+                case PropType::SizeT: return "non-negative integer";
+                case PropType::Vec3:
+                case PropType::Color3: return "array of 3 numbers";
+                case PropType::IntVector: return "array of integers";
+                case PropType::FloatVector: return "array of numbers";
+                default: return "valid JSON value";
+                }
+            }
+
+            [[nodiscard]] bool optimization_json_type_matches(
+                const PropType type,
+                const nlohmann::json& value) {
+                switch (type) {
+                case PropType::Bool: return value.is_boolean();
+                case PropType::Int: return is_json_int32(value);
+                case PropType::Float: return value.is_number();
+                case PropType::String:
+                case PropType::Enum: return value.is_string();
+                case PropType::SizeT: return is_json_size_t(value);
+                case PropType::Vec3:
+                case PropType::Color3:
+                    return value.is_array() && value.size() == 3 &&
+                           std::ranges::all_of(value, [](const auto& component) { return component.is_number(); });
+                case PropType::IntVector:
+                    return value.is_array() && std::ranges::all_of(value, is_json_integer);
+                case PropType::FloatVector:
+                    return value.is_array() && std::ranges::all_of(value, [](const auto& item) { return item.is_number(); });
+                default: return true;
+                }
+            }
+
+            [[nodiscard]] std::optional<std::string> validate_optimization_json_types(
+                const nlohmann::json& json) {
+                if (!json.is_object())
+                    return std::nullopt;
+                const auto check = [&json](const std::string_view key, const std::string_view expected, auto predicate)
+                    -> std::optional<std::string> {
+                    if (json.contains(key) && !predicate(json.at(key)))
+                        return std::format("Invalid type for optimization.{}; expected {}", key, expected);
+                    return std::nullopt;
+                };
+                if (auto error = check("strategy", "string", [](const auto& value) { return value.is_string(); }))
+                    return error;
+                if (auto error = check("enable_save_eval_images", "boolean", [](const auto& value) { return value.is_boolean(); }))
+                    return error;
+                if (auto error = check("ppisp_sidecar_path", "string", [](const auto& value) { return value.is_string(); }))
+                    return error;
+                if (auto error = check("bg_image_path", "string", [](const auto& value) { return value.is_string(); }))
+                    return error;
+
+                const auto group = optimization_property_snapshot();
+                for (const auto& meta : group.properties) {
+                    const std::string key(optimization_json_key(meta));
+                    if (!json.contains(key))
+                        continue;
+                    const auto& value = json.at(key);
+                    if (!optimization_json_type_matches(meta.type, value)) {
+                        return std::format(
+                            "Invalid type for optimization.{}; expected {}",
+                            meta.id, optimization_json_type_name(meta.type));
+                    }
+                }
+
+                for (const auto& key : {"eval_steps", "save_steps"}) {
+                    if (!json.contains(key))
+                        continue;
+                    const auto& value = json.at(key);
+                    if (!value.is_array() || !std::ranges::all_of(value, is_json_size_t)) {
+                        return std::format(
+                            "Invalid type for optimization.{}; expected array of non-negative integers",
+                            key);
+                    }
+                }
+                if (json.contains("bg_color")) {
+                    const auto& value = json.at("bg_color");
+                    if (!value.is_array() || value.size() != 3 ||
+                        !std::ranges::all_of(value, [](const auto& component) { return component.is_number(); })) {
+                        return "Invalid type for optimization.bg_color; expected array of 3 numbers";
+                    }
+                }
+                return std::nullopt;
+            }
+
+            [[nodiscard]] std::optional<std::string> validate_dataset_json_types(const nlohmann::json& json) {
+                if (!json.is_object())
+                    return std::nullopt;
+                const auto check = [&json](const std::string_view key, const std::string_view expected, auto predicate)
+                    -> std::optional<std::string> {
+                    if (json.contains(key) && !predicate(json.at(key)))
+                        return std::format("Invalid type for dataset.{}; expected {}", key, expected);
+                    return std::nullopt;
+                };
+                if (auto error = check("data_path", "string", [](const auto& v) { return v.is_string(); }))
+                    return error;
+                if (auto error = check("output_folder", "string", [](const auto& v) { return v.is_string(); }))
+                    return error;
+                if (auto error = check("output_path", "string", [](const auto& v) { return v.is_string(); }))
+                    return error;
+                if (auto error = check("images", "string", [](const auto& v) { return v.is_string(); }))
+                    return error;
+                if (auto error = check("resize_factor", "integer", is_json_int32))
+                    return error;
+                if (auto error = check("max_width", "integer", is_json_int32))
+                    return error;
+                if (auto error = check("min_track_length", "integer", is_json_int32))
+                    return error;
+                if (auto error = check("test_every", "integer", is_json_int32))
+                    return error;
+                if (auto error = check("timelapse_images", "array of strings", [](const auto& v) { return v.is_array() && std::ranges::all_of(v, [](const auto& item) { return item.is_string(); }); }))
+                    return error;
+                if (auto error = check("timelapse_every", "integer", is_json_int32))
+                    return error;
+                if (auto error = check("output_name", "string", [](const auto& v) { return v.is_string(); }))
+                    return error;
+                if (auto error = check("invert_masks", "boolean", [](const auto& v) { return v.is_boolean(); }))
+                    return error;
+                if (auto error = check("mask_threshold", "number", [](const auto& v) { return v.is_number(); }))
+                    return error;
+                if (auto error = check("centralize_dataset", "string", [](const auto& v) { return v.is_string(); }))
+                    return error;
+                if (auto error = check("loading_params", "object", [](const auto& v) { return v.is_object(); }))
+                    return error;
+                if (json.contains("loading_params")) {
+                    const auto& loading = json.at("loading_params");
+                    for (const auto key : {"use_cpu_memory", "print_cache_status", "use_16bit_color", "use_8bit_color"}) {
+                        if (loading.contains(key) && !loading.at(key).is_boolean())
+                            return std::format("Invalid type for dataset.loading_params.{}; expected boolean", key);
+                    }
+                    for (const auto key : {"min_cpu_free_memory_ratio", "min_cpu_free_GB"}) {
+                        if (loading.contains(key) && !loading.at(key).is_number())
+                            return std::format("Invalid type for dataset.loading_params.{}; expected number", key);
+                    }
+                    if (loading.contains("print_status_freq_num") && !is_json_int32(loading.at("print_status_freq_num")))
+                        return "Invalid type for dataset.loading_params.print_status_freq_num; expected integer";
+                }
+                return std::nullopt;
+            }
+
+            [[nodiscard]] std::optional<std::string> validate_server_json_types(const nlohmann::json& json) {
+                if (!json.is_object())
+                    return std::nullopt;
+                if (json.contains("tcp_server_connection_port") &&
+                    !is_json_int32(json.at("tcp_server_connection_port")))
+                    return "Invalid type for server.tcp_server_connection_port; expected integer";
+                if (json.contains("tcp_broadcast_connection_port") &&
+                    !is_json_int32(json.at("tcp_broadcast_connection_port")))
+                    return "Invalid type for server.tcp_broadcast_connection_port; expected integer";
+                if (json.contains("tcp_connection") && !json.at("tcp_connection").is_boolean())
+                    return "Invalid type for server.tcp_connection; expected boolean";
+                return std::nullopt;
+            }
+
+            void write_registered_optimization_properties(
+                nlohmann::json& json,
+                const OptimizationParameters& params) {
+                const auto group = optimization_property_snapshot();
+                const auto ref = PropertyObjectRef::cpp(
+                    const_cast<OptimizationParameters*>(&params));
+
+                for (const auto& meta : group.properties) {
+                    if (!meta.getter)
+                        throw std::runtime_error("Optimization property has no getter: " + meta.id);
+
+                    const std::string key(optimization_json_key(meta));
+                    const auto value = meta.getter(ref);
+                    switch (meta.type) {
+                    case PropType::Bool:
+                        json[key] = std::any_cast<bool>(value);
+                        break;
+                    case PropType::Int:
+                        json[key] = std::any_cast<int>(value);
+                        break;
+                    case PropType::Float:
+                        json[key] = std::any_cast<float>(value);
+                        break;
+                    case PropType::String:
+                        json[key] = std::any_cast<std::string>(value);
+                        break;
+                    case PropType::SizeT:
+                        json[key] = std::any_cast<size_t>(value);
+                        break;
+                    case PropType::Enum: {
+                        const int enum_value = std::any_cast<int>(value);
+                        const auto item = std::ranges::find_if(meta.enum_items, [enum_value](const auto& candidate) {
+                            return candidate.value == enum_value;
+                        });
+                        if (item == meta.enum_items.end())
+                            throw std::runtime_error("Optimization enum has an invalid value: " + meta.id);
+                        json[key] = item->wire_value.empty() ? item->identifier : item->wire_value;
+                        break;
+                    }
+                    default:
+                        throw std::runtime_error("Unsupported registered optimization JSON type: " + meta.id);
+                    }
+                }
+            }
+
+            void read_registered_optimization_properties(
+                const nlohmann::json& json,
+                OptimizationParameters& params,
+                const bool skip_missing = false) {
+                const auto group = optimization_property_snapshot();
+                auto ref = PropertyObjectRef::cpp(&params);
+
+                for (const auto& meta : group.properties) {
+                    const std::string key(optimization_json_key(meta));
+                    if (!json.contains(key) && (skip_missing || !meta.json_required))
+                        continue;
+
+                    const auto& value = json.at(key);
+                    if (meta.id == "strategy")
+                        continue;
+                    if (!meta.setter)
+                        throw std::runtime_error("Optimization property has no setter: " + meta.id);
+
+                    switch (meta.type) {
+                    case PropType::Bool:
+                        meta.setter(ref, std::any(value.get<bool>()));
+                        break;
+                    case PropType::Int:
+                        meta.setter(ref, std::any(value.get<int>()));
+                        break;
+                    case PropType::Float:
+                        meta.setter(ref, std::any(value.get<float>()));
+                        break;
+                    case PropType::String:
+                        meta.setter(ref, std::any(value.get<std::string>()));
+                        break;
+                    case PropType::SizeT:
+                        meta.setter(ref, std::any(value.get<size_t>()));
+                        break;
+                    case PropType::Enum: {
+                        const auto wire_value = value.get<std::string>();
+                        const auto item = std::ranges::find_if(meta.enum_items, [&wire_value](const auto& candidate) {
+                            const auto& candidate_wire = candidate.wire_value.empty()
+                                                             ? candidate.identifier
+                                                             : candidate.wire_value;
+                            return candidate_wire == wire_value;
+                        });
+                        if (item == meta.enum_items.end()) {
+                            LOG_WARN("Unknown enum value '{}' for optimization field '{}'; keeping current value",
+                                     wire_value, meta.id);
+                            break;
+                        }
+                        meta.setter(ref, std::any(item->value));
+                        break;
+                    }
+                    default:
+                        throw std::runtime_error("Unsupported registered optimization JSON type: " + meta.id);
+                    }
+                }
+            }
+
+            nlohmann::json parse_overlay_object(const std::string_view text) {
+                if (text.empty())
+                    return nlohmann::json::object();
+                auto parsed = nlohmann::json::parse(text);
+                if (!parsed.is_object())
+                    return nlohmann::json::object();
+                return parsed;
+            }
+
+            bool overlay_has_key(const std::string_view text, const std::string_view key) {
+                if (text.empty() || key.empty())
+                    return false;
+                return parse_overlay_object(text).contains(key);
+            }
+
+            // Older builds keep both keys as unknown data while rewriting steps_scaler,
+            // so the image share is trusted only next to the total it was written with.
+            std::optional<float> stored_image_count_scaler(const nlohmann::json& json, const float steps_scaler) {
+                if (!json.contains("image_count_scaler") || !json.contains("image_count_scaler_total"))
+                    return std::nullopt;
+                if (json.at("image_count_scaler_total").get<float>() != steps_scaler)
+                    return std::nullopt;
+                return json.at("image_count_scaler").get<float>();
+            }
+
+            void apply_optimization_json_overlay(
+                OptimizationParameters& params,
+                const nlohmann::json& json,
+                const bool skip_missing = false) {
+                if (json.contains("strategy")) {
+                    const auto strategy = json.at("strategy").get<std::string>();
+                    if (const auto canonical = canonical_strategy_name(strategy); !canonical.empty()) {
+                        params.strategy = std::string(canonical);
+                    } else {
+                        LOG_WARN("Invalid strategy '{}' in JSON, using default", strategy);
+                    }
+                }
+                if (const auto removed = json.find("background_improvements");
+                    removed != json.end() && removed->is_boolean() && removed->get<bool>()) {
+                    LOG_WARN("Ignoring background_improvements: the option was removed and MRNF trains with its default profile");
+                }
+                if (const auto removed = json.find("hard_clip_stop_iter");
+                    removed != json.end() && removed->is_number_integer() && removed->get<int>() != 0) {
+                    LOG_WARN("Ignoring hard_clip_stop_iter: MRNF no longer hard-clips splats by screen share");
+                }
+                constexpr float kRemovedOversizeSplitDefault = 0.15f;
+                if (const auto removed = json.find("oversize_split_fraction");
+                    removed != json.end() && removed->is_number() && removed->get<float>() > 0.0f &&
+                    removed->get<float>() != kRemovedOversizeSplitDefault) {
+                    LOG_WARN("Ignoring oversize_split_fraction: MRNF no longer reserves growth for oversized splats");
+                }
+                read_registered_optimization_properties(json, params, skip_missing);
+                if (const auto image_count_scaler = stored_image_count_scaler(json, params.steps_scaler))
+                    params.image_count_scaler = *image_count_scaler;
+
+                if (json.contains("eval_steps")) {
+                    params.eval_steps.clear();
+                    for (const auto& step : json.at("eval_steps"))
+                        params.eval_steps.push_back(step.get<size_t>());
+                }
+                if (json.contains("save_steps")) {
+                    params.save_steps.clear();
+                    for (const auto& step : json.at("save_steps"))
+                        params.save_steps.push_back(step.get<size_t>());
+                }
+                if (json.contains("enable_save_eval_images"))
+                    params.enable_save_eval_images = json.at("enable_save_eval_images");
+                if (json.contains("ppisp_sidecar_path")) {
+                    params.ppisp_sidecar_path =
+                        utf8_to_path(json.at("ppisp_sidecar_path").get<std::string>());
+                }
+                if (json.contains("bg_color") && json.at("bg_color").is_array() &&
+                    json.at("bg_color").size() == 3) {
+                    params.bg_color = {
+                        json.at("bg_color")[0],
+                        json.at("bg_color")[1],
+                        json.at("bg_color")[2]};
+                }
+                if (json.contains("bg_image_path")) {
+                    params.bg_image_path =
+                        utf8_to_path(json.at("bg_image_path").get<std::string>());
+                }
+
+                if (json.contains("depth_loss_mode") &&
+                    (params.depth_loss_mode == "pearson" ||
+                     params.depth_loss_mode == "adaptive-warped-l1")) {
+                    LOG_WARN(
+                        "Migrating legacy depth loss mode '{}' to 'ssi'; the current depth "
+                        "pipeline auto-detects whether the prior stores depth or disparity",
+                        params.depth_loss_mode);
+                    params.depth_loss_mode = "ssi";
+                }
+            }
+
+            void apply_dataset_json_overlay(DatasetConfig& dataset, const nlohmann::json& j) {
+                if (j.contains("data_path"))
+                    dataset.data_path = utf8_to_path(j["data_path"].get<std::string>());
+                if (j.contains("output_folder"))
+                    dataset.output_path = utf8_to_path(j["output_folder"].get<std::string>());
+                if (j.contains("output_path"))
+                    dataset.output_path = utf8_to_path(j["output_path"].get<std::string>());
+                if (j.contains("images"))
+                    dataset.images = j["images"].get<std::string>();
+                if (j.contains("resize_factor"))
+                    dataset.resize_factor = j["resize_factor"].get<int>();
+                if (j.contains("max_width"))
+                    dataset.max_width = j["max_width"].get<int>();
+                if (j.contains("min_track_length"))
+                    dataset.min_track_length = j["min_track_length"].get<int>();
+                if (j.contains("test_every"))
+                    dataset.test_every = j["test_every"].get<int>();
+                if (j.contains("timelapse_images"))
+                    dataset.timelapse_images = j["timelapse_images"].get<std::vector<std::string>>();
+                if (j.contains("timelapse_every"))
+                    dataset.timelapse_every = j["timelapse_every"].get<int>();
+                if (j.contains("output_name"))
+                    dataset.output_name = j["output_name"].get<std::string>();
+                if (j.contains("invert_masks"))
+                    dataset.invert_masks = j["invert_masks"].get<bool>();
+                if (j.contains("mask_threshold"))
+                    dataset.mask_threshold = j["mask_threshold"].get<float>();
+                if (j.contains("centralize_dataset"))
+                    dataset.centralize_dataset = j["centralize_dataset"].get<std::string>();
+                if (j.contains("loading_params") && j["loading_params"].is_object()) {
+                    const auto& loading = j["loading_params"];
+                    auto merged = dataset.loading_params.to_json();
+                    for (auto it = loading.begin(); it != loading.end(); ++it)
+                        merged[it.key()] = it.value();
+                    dataset.loading_params = LoadingParams::from_json(merged);
+                }
+            }
+
+            [[nodiscard]] lfs::Error config_import_error(std::string detail, const std::filesystem::path& path) {
+                lfs::SmallFields fields;
+                fields.add("path", path_to_utf8(path));
+                return lfs::make_error(lfs::ErrorInit{
+                    .code = lfs::ErrorCode::InvalidArgument,
+                    .domain = lfs::ErrorDomain::IO,
+                    .user_message = "The config file could not be imported.",
+                    .detail = std::move(detail),
+                    .detection = LFS_SOURCE_SITE_CURRENT(),
+                    .fields = std::move(fields),
+                });
+            }
+
             std::expected<nlohmann::json, std::string> read_json_file(const std::filesystem::path& path) {
-                if (!std::filesystem::exists(path)) {
+                if (!lfs::core::native_fs::exists(path)) {
                     return std::unexpected(std::format("Config file not found: {}", path_to_utf8(path)));
                 }
 
@@ -49,6 +564,7 @@ namespace lfs::core {
             stop_refine = apply(stop_refine);
             reset_every = apply(reset_every);
             refine_every = apply(refine_every);
+            morton_reorder_interval = apply(morton_reorder_interval);
             sh_degree_interval = apply(sh_degree_interval);
             grow_until_iter = apply(grow_until_iter);
 
@@ -76,9 +592,41 @@ namespace lfs::core {
         }
 
         int OptimizationParameters::resolved_total_iterations() const {
-            const int base_iters = static_cast<int>(iterations);
-            const int sparse_tail = enable_sparsity ? std::max(0, sparsify_steps) : 0;
-            return base_iters + sparse_tail;
+            uint64_t total = std::min(uint64_t(iterations), uint64_t(std::numeric_limits<int>::max()));
+            if (enable_sparsity)
+                total += uint64_t(std::max(0, popspa_sparsify_steps)) + uint64_t(std::max(0, popspa_refine_steps));
+            return static_cast<int>(std::min(total, uint64_t(std::numeric_limits<int>::max())));
+        }
+
+        bool OptimizationParameters::normal_supervision_active(const int iter) const {
+            if (!use_normal_loss)
+                return false;
+            const float total_f = static_cast<float>(std::max(1, resolved_total_iterations()));
+            const int start_iter = static_cast<int>(normal_start_fraction * total_f);
+            if (iter < start_iter)
+                return false;
+            // 1.0 keeps supervision on through the inclusive last iteration.
+            return normal_end_fraction >= 1.0f ||
+                   static_cast<float>(iter) < normal_end_fraction * total_f;
+        }
+
+        float OptimizationParameters::scale_reg_at(const int iter) const {
+            if (scale_reg_decay_power < 0.0f)
+                return scale_reg;
+            const float p = std::max(scale_reg_decay_power, 0.0f);
+            const float t = std::clamp(static_cast<float>(iter) /
+                                           static_cast<float>(std::max<size_t>(iterations, 1)),
+                                       0.0f, 1.0f);
+            return scale_reg * (p + 1.0f) * std::pow(1.0f - t, p);
+        }
+
+        void OptimizationParameters::resolve_mrnf_capacity_defaults() {
+            if (canonical_strategy_name(strategy) != kStrategyMRNF)
+                return;
+            if (grow_fraction < 0.0f)
+                grow_fraction = mrnf_grow_fraction_for_capacity(max_cap);
+            if (shs_lr < 0.0f)
+                shs_lr = mrnf_shs_lr_for_capacity(max_cap);
         }
 
         int OptimizationParameters::resolved_ppisp_controller_activation_step(const int total_iterations) const {
@@ -90,110 +638,422 @@ namespace lfs::core {
             return std::max(0, total_iterations - tail_iters);
         }
 
-        nlohmann::json OptimizationParameters::to_json() const {
+        bool is_eval_mask_box(const std::string_view spec) {
+            return spec.starts_with("bbox:");
+        }
 
+        bool is_eval_mask_cropbox(const std::string_view spec) {
+            return spec == "cropbox";
+        }
+
+        bool is_eval_mask_folder(const std::string_view spec) {
+            return spec.starts_with("masks:");
+        }
+
+        std::string_view eval_mask_folder(const std::string_view spec) {
+            assert(is_eval_mask_folder(spec));
+            return spec.substr(6);
+        }
+
+        namespace {
+            template <size_t N>
+            std::optional<std::array<float, N>> parse_float_list(std::string_view rest) {
+                std::array<float, N> values{};
+                for (size_t i = 0; i < N; ++i) {
+                    const auto comma = rest.find(',');
+                    if ((comma == std::string_view::npos) != (i + 1 == N))
+                        return std::nullopt;
+                    auto token = rest.substr(0, comma);
+                    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front())))
+                        token.remove_prefix(1);
+                    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back())))
+                        token.remove_suffix(1);
+                    const auto [end, error] = std::from_chars(token.data(), token.data() + token.size(), values[i]);
+                    if (token.empty() || error != std::errc{} || end != token.data() + token.size() ||
+                        !std::isfinite(values[i]))
+                        return std::nullopt;
+                    if (comma != std::string_view::npos)
+                        rest.remove_prefix(comma + 1);
+                }
+                return values;
+            }
+        } // namespace
+
+        std::optional<std::array<float, 6>> parse_eval_mask_box(const std::string_view spec) {
+            if (!is_eval_mask_box(spec))
+                return std::nullopt;
+            const auto box = parse_float_list<6>(spec.substr(5));
+            if (!box)
+                return std::nullopt;
+            for (size_t axis = 0; axis < 3; ++axis) {
+                if (!((*box)[axis] < (*box)[axis + 3]))
+                    return std::nullopt;
+            }
+            return box;
+        }
+
+        bool is_eval_mask_depth(const std::string_view spec) {
+            return spec.starts_with("depth:");
+        }
+
+        bool is_eval_mask_points(const std::string_view spec) {
+            return spec == "points" || spec.starts_with("points:");
+        }
+
+        std::optional<std::string_view> eval_mask_splat_file(const std::string_view spec) {
+            if (!spec.starts_with("splat:") || spec.size() == 6)
+                return std::nullopt;
+            return spec.substr(6);
+        }
+
+        std::optional<std::string_view> eval_mask_points_file(const std::string_view spec) {
+            if (!spec.starts_with("points:") || parse_float_list<2>(spec.substr(7)))
+                return std::nullopt;
+            return spec.substr(7);
+        }
+
+        std::optional<std::array<int, 2>> parse_eval_mask_points(const std::string_view spec) {
+            if (!is_eval_mask_points(spec))
+                return std::nullopt;
+            if (spec == "points" || eval_mask_points_file(spec))
+                return std::array<int, 2>{2, 3};
+            const auto values = parse_float_list<2>(spec.substr(7));
+            if (!values)
+                return std::nullopt;
+            const std::array<int, 2> limits{32, 64};
+            std::array<int, 2> result{};
+            for (size_t i = 0; i < 2; ++i) {
+                const float value = (*values)[i];
+                if (value != std::floor(value) || value < 0.0f || value > static_cast<float>(limits[i]))
+                    return std::nullopt;
+                result[i] = static_cast<int>(value);
+            }
+            return result;
+        }
+
+        std::optional<std::array<float, 2>> parse_eval_mask_depth(const std::string_view spec) {
+            if (!is_eval_mask_depth(spec))
+                return std::nullopt;
+            const auto range = parse_float_list<2>(spec.substr(6));
+            if (!range || !((*range)[0] >= 0.0f) || !((*range)[0] < (*range)[1]))
+                return std::nullopt;
+            return range;
+        }
+
+        std::string normalize_eval_mask(const std::string_view spec) {
+            if (spec.empty())
+                return {};
+            if (const auto box = parse_eval_mask_box(spec))
+                return std::format("bbox:{},{},{},{},{},{}", (*box)[0], (*box)[1], (*box)[2], (*box)[3], (*box)[4], (*box)[5]);
+            if (const auto range = parse_eval_mask_depth(spec))
+                return std::format("depth:{},{}", (*range)[0], (*range)[1]);
+            const auto normalize_path = [](const std::string_view path) {
+                std::error_code error;
+                auto absolute = std::filesystem::absolute(utf8_to_path(std::string(path)), error);
+                if (error)
+                    return std::string(path);
+                auto canonical = lfs::core::native_fs::weakly_canonical(absolute, error);
+                return path_to_utf8((error ? absolute : canonical).lexically_normal());
+            };
+            if (const auto file = eval_mask_splat_file(spec))
+                return "splat:" + normalize_path(*file);
+            if (const auto file = eval_mask_points_file(spec))
+                return "points:" + normalize_path(*file);
+            if (const auto points = parse_eval_mask_points(spec))
+                return std::format("points:{},{}", (*points)[0], (*points)[1]);
+            if (is_eval_mask_box(spec) || is_eval_mask_depth(spec) || is_eval_mask_points(spec) ||
+                is_eval_mask_cropbox(spec))
+                return std::string(spec);
+            if (is_eval_mask_folder(spec))
+                return "masks:" + normalize_path(eval_mask_folder(spec));
+            return normalize_path(spec);
+        }
+
+        lfs::Result<std::vector<EvalPixelSet>> parse_eval_pixel_sets(const std::string_view list) {
+            const auto invalid = [](std::string reason) {
+                return lfs::make_error(lfs::ErrorInit{
+                    .code = lfs::ErrorCode::InvalidArgument,
+                    .domain = lfs::ErrorDomain::Core,
+                    .user_message = std::move(reason),
+                    .detection = LFS_SOURCE_SITE_CURRENT(),
+                });
+            };
+            std::vector<EvalPixelSet> sets;
+            if (list.empty())
+                return sets;
+            std::string_view rest = list;
+            while (true) {
+                const auto comma = rest.find(',');
+                auto entry = rest.substr(0, comma);
+                while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.front())))
+                    entry.remove_prefix(1);
+                while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.back())))
+                    entry.remove_suffix(1);
+                const auto set = std::ranges::find(kEvalPixelSets, entry, eval_pixel_set_name);
+                if (set == kEvalPixelSets.end())
+                    return invalid(entry.empty() ? std::string("empty entry") : std::format("unknown set '{}'", entry));
+                if (std::ranges::find(sets, *set) != sets.end())
+                    return invalid(std::format("'{}' is listed twice", entry));
+                sets.push_back(*set);
+                if (comma == std::string_view::npos)
+                    return sets;
+                rest.remove_prefix(comma + 1);
+            }
+        }
+
+        nlohmann::json OptimizationParameters::to_json() const {
             nlohmann::json opt_json;
-            opt_json["iterations"] = iterations;
-            opt_json["means_lr"] = means_lr;
-            opt_json["means_lr_end"] = means_lr_end;
-            opt_json["shs_lr"] = shs_lr;
-            opt_json["opacity_lr"] = opacity_lr;
-            opt_json["scaling_lr"] = scaling_lr;
-            opt_json["scaling_lr_end"] = scaling_lr_end;
-            opt_json["rotation_lr"] = rotation_lr;
-            opt_json["lambda_dssim"] = lambda_dssim;
-            opt_json["min_opacity"] = min_opacity;
-            opt_json["refine_every"] = refine_every;
-            opt_json["start_refine"] = start_refine;
-            opt_json["stop_refine"] = stop_refine;
-            opt_json["grad_threshold"] = grad_threshold;
-            opt_json["sh_degree"] = sh_degree;
-            opt_json["opacity_reg"] = opacity_reg;
-            opt_json["scale_reg"] = scale_reg;
-            opt_json["init_opacity"] = init_opacity;
-            opt_json["init_scaling"] = init_scaling;
-            opt_json["max_cap"] = max_cap;
-            opt_json["eval_steps"] = eval_steps;
-            opt_json["save_steps"] = save_steps;
-            opt_json["enable_eval"] = enable_eval;
-            opt_json["enable_save_eval_images"] = enable_save_eval_images;
-            opt_json["headless"] = headless;
+            write_registered_optimization_properties(opt_json, *this);
+
             const auto canonical_strategy = canonical_strategy_name(strategy);
             opt_json["strategy"] = canonical_strategy.empty() ? strategy : std::string(canonical_strategy);
-            opt_json["mip_filter"] = mip_filter;
-            opt_json["use_bilateral_grid"] = use_bilateral_grid;
-            opt_json["bilateral_grid_X"] = bilateral_grid_X;
-            opt_json["bilateral_grid_Y"] = bilateral_grid_Y;
-            opt_json["bilateral_grid_W"] = bilateral_grid_W;
-            opt_json["bilateral_grid_lr"] = bilateral_grid_lr;
-            opt_json["tv_loss_weight"] = tv_loss_weight;
-            opt_json["use_ppisp"] = use_ppisp;
-            opt_json["ppisp_lr"] = ppisp_lr;
-            opt_json["ppisp_reg_weight"] = ppisp_reg_weight;
-            opt_json["ppisp_warmup_steps"] = ppisp_warmup_steps;
-            opt_json["ppisp_freeze_from_sidecar"] = ppisp_freeze_from_sidecar;
-            opt_json["ppisp_sidecar_path"] = lfs::core::path_to_utf8(ppisp_sidecar_path);
-            opt_json["ppisp_use_controller"] = ppisp_use_controller;
-            opt_json["ppisp_freeze_gaussians_on_distill"] = ppisp_freeze_gaussians_on_distill;
-            opt_json["ppisp_controller_activation_step"] = ppisp_controller_activation_step;
-            opt_json["ppisp_controller_lr"] = ppisp_controller_lr;
-            opt_json["prune_opacity"] = prune_opacity;
-            opt_json["grow_scale3d"] = grow_scale3d;
-            opt_json["grow_scale2d"] = grow_scale2d;
-            opt_json["prune_scale3d"] = prune_scale3d;
-            opt_json["prune_scale2d"] = prune_scale2d;
-            opt_json["reset_every"] = reset_every;
-            opt_json["pause_refine_after_reset"] = pause_refine_after_reset;
-            opt_json["revised_opacity"] = revised_opacity;
-            opt_json["gut"] = gut;
-            opt_json["undistort"] = undistort;
-            opt_json["steps_scaler"] = steps_scaler;
-            opt_json["sh_degree_interval"] = sh_degree_interval;
-            opt_json["random"] = random;
-            opt_json["init_num_pts"] = init_num_pts;
-            opt_json["init_extent"] = init_extent;
-            opt_json["tile_mode"] = tile_mode;
-            opt_json["enable_sparsity"] = enable_sparsity;
-            opt_json["sparsify_steps"] = sparsify_steps;
-            opt_json["init_rho"] = init_rho;
-            opt_json["prune_ratio"] = prune_ratio;
-            opt_json["bg_modulation"] = bg_modulation;
 
-            static constexpr const char* BG_MODE_NAMES[] = {"solid_color", "modulation", "image", "random"};
-            opt_json["bg_mode"] = BG_MODE_NAMES[static_cast<int>(bg_mode)];
+            // Residue not represented by scalar registry properties.
+            opt_json["image_count_scaler"] = image_count_scaler;
+            opt_json["image_count_scaler_total"] = steps_scaler;
+            opt_json["eval_steps"] = eval_steps;
+            opt_json["save_steps"] = save_steps;
+            opt_json["enable_save_eval_images"] = enable_save_eval_images;
+            opt_json["ppisp_sidecar_path"] = path_to_utf8(ppisp_sidecar_path);
             opt_json["bg_color"] = {bg_color[0], bg_color[1], bg_color[2]};
-            if (!bg_image_path.empty()) {
+            if (!bg_image_path.empty())
                 opt_json["bg_image_path"] = path_to_utf8(bg_image_path);
-            }
-
-            // Mask parameters
-            static constexpr const char* MASK_MODE_NAMES[] = {"none", "segment", "ignore", "alpha_consistent"};
-            opt_json["mask_mode"] = MASK_MODE_NAMES[static_cast<int>(mask_mode)];
-            opt_json["invert_masks"] = invert_masks;
-            opt_json["mask_opacity_penalty_weight"] = mask_opacity_penalty_weight;
-            opt_json["mask_opacity_penalty_power"] = mask_opacity_penalty_power;
-            opt_json["mask_threshold"] = mask_threshold;
-            opt_json["use_alpha_as_mask"] = use_alpha_as_mask;
-
-            // MRNF strategy parameters
-            opt_json["growth_grad_threshold"] = growth_grad_threshold;
-            opt_json["grow_fraction"] = grow_fraction;
-            opt_json["grow_until_iter"] = grow_until_iter;
-            opt_json["opacity_decay"] = opacity_decay;
-            opt_json["scale_decay"] = scale_decay;
-            opt_json["means_noise_weight"] = means_noise_weight;
-            opt_json["bounds_percentile"] = bounds_percentile;
-            opt_json["use_error_map"] = use_error_map;
-            opt_json["use_edge_map"] = use_edge_map;
+            if (!eval_mask.empty())
+                opt_json["eval_mask"] = normalize_eval_mask(eval_mask);
 
             return opt_json;
         }
 
         std::string OptimizationParameters::validate() const {
+            const auto invalid_nonnegative = [](const float value, const std::string_view name) -> std::string {
+                if (!std::isfinite(value) || value < 0.0f)
+                    return std::format("{} must be finite and nonnegative (got {})", name, value);
+                return {};
+            };
+            const auto invalid_probability = [](const float value, const std::string_view name) -> std::string {
+                if (!std::isfinite(value) || value < 0.0f || value > 1.0f)
+                    return std::format("{} must be finite and within [0, 1] (got {})", name, value);
+                return {};
+            };
+            constexpr size_t MAX_ITERATION_VALUE = static_cast<size_t>(std::numeric_limits<int>::max());
+
+            if (!is_valid_strategy_name(strategy))
+                return std::format("strategy must be one of mcmc, mrnf, or igs+ (got '{}')", strategy);
+            if (const auto sets = parse_eval_pixel_sets(eval_mask_report); !sets)
+                return std::format("eval_mask_report must be a comma list of mask, unmasked and inverted ({}: '{}')",
+                                   sets.error().user_message(), eval_mask_report);
+            if (!(eval_mask_opacity > 0.0f && eval_mask_opacity <= 1.0f))
+                return std::format("eval_mask_opacity must be greater than 0 and at most 1 (got {})", eval_mask_opacity);
+            if (!eval_mask.empty() && !enable_eval)
+                return "eval_mask requires evaluation to be enabled";
+            // The mask file is checked where it is read, so settings stored in a project stay valid
+            // when the file moves.
+            if (is_eval_mask_box(eval_mask)) {
+                if (!parse_eval_mask_box(eval_mask))
+                    return std::format("eval_mask box must be bbox:x0,y0,z0,x1,y1,z1 with each minimum below its maximum (got '{}')", eval_mask);
+            } else if (const auto file = eval_mask_splat_file(eval_mask)) {
+                if (!utf8_to_path(std::string(*file)).is_absolute())
+                    return std::format("eval_mask splat file must be an absolute path (got '{}')", eval_mask);
+            } else if (const auto file = eval_mask_points_file(eval_mask)) {
+                if (!utf8_to_path(std::string(*file)).is_absolute())
+                    return std::format("eval_mask points file must be an absolute path (got '{}')", eval_mask);
+            } else if (is_eval_mask_points(eval_mask)) {
+                if (!parse_eval_mask_points(eval_mask))
+                    return std::format("eval_mask points must be points or points:radius,close with whole radius 0..32 and close 0..64 (got '{}')", eval_mask);
+            } else if (is_eval_mask_depth(eval_mask)) {
+                if (!parse_eval_mask_depth(eval_mask))
+                    return std::format("eval_mask depth range must be depth:near,far with 0 <= near < far (got '{}')", eval_mask);
+            } else if (is_eval_mask_folder(eval_mask)) {
+                if (!utf8_to_path(std::string(eval_mask_folder(eval_mask))).is_absolute())
+                    return std::format("eval_mask folder must be an absolute path: {}", eval_mask);
+            } else if (!eval_mask.empty() && !is_eval_mask_cropbox(eval_mask) && !utf8_to_path(eval_mask).is_absolute()) {
+                return "eval_mask must be an absolute path";
+            }
+            if (iterations == 0 || iterations > MAX_ITERATION_VALUE)
+                return std::format("iterations must be within [1, {}] (got {})", MAX_ITERATION_VALUE, iterations);
+            if (refine_every == 0 || refine_every > MAX_ITERATION_VALUE)
+                return std::format("refine_every must be within [1, {}] (got {})", MAX_ITERATION_VALUE, refine_every);
+            if (morton_reorder_interval > MAX_ITERATION_VALUE)
+                return std::format("morton_reorder_interval must be within [0, {}] (got {})",
+                                   MAX_ITERATION_VALUE, morton_reorder_interval);
+            if (reset_every == 0 || reset_every > MAX_ITERATION_VALUE)
+                return std::format("reset_every must be within [1, {}] (got {})", MAX_ITERATION_VALUE, reset_every);
+            if (sh_degree_interval == 0 || sh_degree_interval > MAX_ITERATION_VALUE)
+                return std::format("sh_degree_interval must be within [1, {}] (got {})", MAX_ITERATION_VALUE, sh_degree_interval);
+            if (start_refine > stop_refine)
+                return std::format("start_refine must not exceed stop_refine ({} > {})", start_refine, stop_refine);
+            if (start_refine > MAX_ITERATION_VALUE || stop_refine > MAX_ITERATION_VALUE ||
+                grow_until_iter > MAX_ITERATION_VALUE)
+                return "refinement iteration fields must fit in a signed int";
+            if (max_cap < 0)
+                return std::format("max_cap must be nonnegative (got {})", max_cap);
+            if (sh_degree < 0 || sh_degree > 3)
+                return std::format("sh_degree must be within [0, 3] (got {})", sh_degree);
+            {
+                if (popspa_target_count <= 0 || popspa_first_prune_count < 0 ||
+                    (popspa_first_prune_count != 0 && popspa_first_prune_count < popspa_target_count))
+                    return "POPSpa first prune count must be zero (auto) or at least the positive target count";
+                if (popspa_sparsify_steps < 0 || popspa_refine_steps < 0 || popspa_projection_interval <= 0 || popspa_seed < 0)
+                    return "POPSpa steps and seed must be nonnegative and projection interval positive";
+                if (enable_sparsity && uint64_t(iterations) + uint64_t(popspa_sparsify_steps) + uint64_t(popspa_refine_steps) > MAX_ITERATION_VALUE)
+                    return "iterations plus POPSpa steps must fit in a signed int";
+                if (const auto error = invalid_nonnegative(popspa_rho, "popspa_rho"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_erank_weight, "popspa_erank_weight"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_thin_scale_weight, "popspa_thin_scale_weight"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_erank_epsilon, "popspa_erank_epsilon"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_means_lr, "popspa_means_lr"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_scales_lr, "popspa_scales_lr"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_opacities_lr, "popspa_opacities_lr"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_quaternions_lr, "popspa_quaternions_lr"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_sh0_lr, "popspa_sh0_lr"); !error.empty())
+                    return error;
+                if (const auto error = invalid_nonnegative(popspa_shn_lr, "popspa_shn_lr"); !error.empty())
+                    return error;
+                if (const auto error = invalid_probability(popspa_ssim_weight, "popspa_ssim_weight"); !error.empty())
+                    return error;
+                if (popspa_rho == 0.0f || popspa_erank_epsilon == 0.0f)
+                    return "POPSpa rho and effective-rank epsilon must be positive";
+            }
+            if (init_num_pts <= 0)
+                return std::format("init_num_pts must be positive (got {})", init_num_pts);
+            if (!std::isfinite(init_extent) || init_extent <= 0.0f)
+                return std::format("init_extent must be finite and positive (got {})", init_extent);
+            if (init_mesh_resolution < Mesh2SplatOptions::kMinResolution ||
+                init_mesh_resolution > kMaxInitMeshResolution)
+                return std::format("init_mesh_resolution must be within [{}, {}] (got {})",
+                                   Mesh2SplatOptions::kMinResolution, kMaxInitMeshResolution, init_mesh_resolution);
+            if (!std::isfinite(init_scaling) || init_scaling <= 0.0f)
+                return std::format("init_scaling must be finite and positive (got {})", init_scaling);
+            if (!std::isfinite(init_opacity) || init_opacity <= 0.0f || init_opacity >= 1.0f)
+                return std::format("init_opacity must be finite and within (0, 1) (got {})", init_opacity);
+            if (!std::isfinite(mask_opacity_penalty_power) || mask_opacity_penalty_power <= 0.0f)
+                return std::format("mask_opacity_penalty_power must be finite and positive (got {})", mask_opacity_penalty_power);
+            if (!std::isfinite(image_count_scaler) || image_count_scaler <= 0.f)
+                return std::format("image_count_scaler must be finite and positive (got {})", image_count_scaler);
+            if (!std::isfinite(steps_scaler))
+                return std::format("steps_scaler must be finite (got {})", steps_scaler);
+            if (!std::isfinite(max_screen_share))
+                return std::format("max_screen_share must be finite (got {})", max_screen_share);
+            if (ppisp_holdout_appearance != PPISPHoldoutAppearance::Mean && ppisp_holdout_appearance != PPISPHoldoutAppearance::Nearest)
+                return "ppisp_holdout_appearance must be mean or nearest";
+            if (!std::isfinite(densify_structure_weight) || densify_structure_weight < 0.0f || densify_structure_weight > 4.0f)
+                return std::format("densify_structure_weight must be finite and within [0, 4] (got {})", densify_structure_weight);
+            if (!std::isfinite(gradient_loss_weight) || gradient_loss_weight < 0.0f || gradient_loss_weight > 8.0f)
+                return std::format("gradient_loss_weight must be finite and within [0, 8] (got {})", gradient_loss_weight);
+            if (!std::isfinite(thin_structure_weight) || thin_structure_weight < 0.0f || thin_structure_weight > 4.0f)
+                return std::format("thin_structure_weight must be finite and within [0, 4] (got {})", thin_structure_weight);
+            if (!std::isfinite(late_lr_anneal) || late_lr_anneal <= 0.0f || late_lr_anneal > 1.0f)
+                return std::format("late_lr_anneal must be finite and within (0, 1] (got {})", late_lr_anneal);
+            if (!std::isfinite(scale_reg_decay_power) || scale_reg_decay_power < -1.0f)
+                return std::format("scale_reg_decay_power must be finite and at least -1 (got {})", scale_reg_decay_power);
+            if (perf_bench_warmup < 0)
+                return std::format("perf_bench_warmup must be nonnegative (got {})", perf_bench_warmup);
+            if (ppisp_warmup_steps < 0)
+                return std::format("ppisp_warmup_steps must be nonnegative (got {})", ppisp_warmup_steps);
+            if (debug_python && (debug_python_port <= 0 || debug_python_port > 65535))
+                return std::format("debug_python_port must be within [1, 65535] (got {})", debug_python_port);
+
+            const std::array nonnegative_fields{
+                std::pair{"means_lr", means_lr},
+                std::pair{"means_lr_end", means_lr_end},
+                std::pair{"shs_lr", shs_lr},
+                std::pair{"opacity_lr", opacity_lr},
+                std::pair{"scaling_lr", scaling_lr},
+                std::pair{"scaling_lr_end", scaling_lr_end},
+                std::pair{"rotation_lr", rotation_lr},
+                std::pair{"opacity_reg", opacity_reg},
+                std::pair{"scale_reg", scale_reg},
+                std::pair{"erank_reg", erank_reg},
+                std::pair{"dc_reg", dc_reg},
+                std::pair{"sh_rest_reg", sh_rest_reg},
+                std::pair{"mask_opacity_penalty_weight", mask_opacity_penalty_weight},
+                std::pair{"depth_loss_weight", depth_loss_weight},
+                std::pair{"bilateral_grid_lr", bilateral_grid_lr},
+                std::pair{"tv_loss_weight", tv_loss_weight},
+                std::pair{"ppisp_lr", ppisp_lr},
+                std::pair{"ppisp_reg_weight", ppisp_reg_weight},
+                std::pair{"ppisp_controller_lr", ppisp_controller_lr},
+                std::pair{"growth_grad_threshold", growth_grad_threshold},
+                std::pair{"means_noise_weight", means_noise_weight},
+                std::pair{"screen_share_penalty", screen_share_penalty},
+            };
+            for (const auto& [name, value] : nonnegative_fields) {
+                const bool automatic_mrnf_value = is_mrnf_strategy(strategy) && value == -1.0f &&
+                                                  (std::string_view{name} == "shs_lr");
+                if (auto error = invalid_nonnegative(value, name);
+                    !error.empty() && !automatic_mrnf_value)
+                    return error;
+            }
+
+            const std::array probability_fields{
+                std::pair{"lambda_dssim", lambda_dssim},
+                std::pair{"min_opacity", min_opacity},
+                std::pair{"cropbox_lr_scale", cropbox_lr_scale},
+                std::pair{"cropbox_loss_weight", cropbox_loss_weight},
+                std::pair{"cropbox_growth_inside", cropbox_growth_inside},
+                std::pair{"mask_threshold", mask_threshold},
+                std::pair{"prune_opacity", prune_opacity},
+                std::pair{"grow_fraction", grow_fraction},
+                std::pair{"opacity_decay", opacity_decay},
+                std::pair{"scale_decay", scale_decay},
+                std::pair{"bounds_percentile", bounds_percentile},
+                std::pair{"normal_start_fraction", normal_start_fraction},
+                std::pair{"normal_end_fraction", normal_end_fraction},
+            };
+            for (const auto& [name, value] : probability_fields) {
+                const bool automatic_mrnf_value = is_mrnf_strategy(strategy) && value == -1.0f &&
+                                                  (std::string_view{name} == "grow_fraction");
+                if (auto error = invalid_probability(value, name);
+                    !error.empty() && !automatic_mrnf_value)
+                    return error;
+            }
+            for (size_t i = 0; i < bg_color.size(); ++i) {
+                if (auto error = invalid_probability(bg_color[i], std::format("bg_color[{}]", i)); !error.empty())
+                    return error;
+            }
+
+            if (bilateral_grid_X <= 0 || bilateral_grid_Y <= 0 || bilateral_grid_W <= 0)
+                return std::format("bilateral grid dimensions must be positive (got {}x{}x{})",
+                                   bilateral_grid_X, bilateral_grid_Y, bilateral_grid_W);
+            const uint64_t bilateral_xy = static_cast<uint64_t>(bilateral_grid_X) * bilateral_grid_Y;
+            if (bilateral_xy > static_cast<uint64_t>(std::numeric_limits<int>::max()) /
+                                   static_cast<uint64_t>(bilateral_grid_W))
+                return std::format("bilateral grid dimensions are too large ({}x{}x{})",
+                                   bilateral_grid_X, bilateral_grid_Y, bilateral_grid_W);
             if (gut && canonical_strategy_name(strategy) == kStrategyIGSPlus)
                 return "GUT and igs+ strategy cannot be used together";
+            if (use_exposure_correction &&
+                (use_bilateral_grid || use_ppisp || ppisp_use_controller || ppisp_freeze_from_sidecar)) {
+                return "use_exposure_correction cannot be combined with use_bilateral_grid, "
+                       "use_ppisp, ppisp_use_controller, or ppisp_freeze_from_sidecar; "
+                       "exposure correction replaces the standalone bilateral grid and PPISP options";
+            }
             if (ppisp_freeze_from_sidecar && !use_ppisp)
                 return "PPISP sidecar freeze requires PPISP enabled";
+            if (depth_loss_mode != "ssi" && depth_loss_mode != "ssi-disparity" && depth_loss_mode != "ssi-depth")
+                return "depth_loss_mode must be 'ssi', 'ssi-disparity', or 'ssi-depth'";
+            if (normal_loss_space != NormalLossSpace::Auto &&
+                normal_loss_space != NormalLossSpace::CameraOpenCV &&
+                normal_loss_space != NormalLossSpace::CameraOpenGL &&
+                normal_loss_space != NormalLossSpace::World)
+                return "normal_loss_space must be 'auto', 'camera-opencv', 'camera-opengl', or 'world'";
+            if (eval_space != EvalSpace::Distorted && eval_space != EvalSpace::Undistorted)
+                return "eval_space must be 'distorted' or 'undistorted'";
+            if (eval_bit_depth != EvalBitDepth::Auto && eval_bit_depth != EvalBitDepth::Eight &&
+                eval_bit_depth != EvalBitDepth::Sixteen && eval_bit_depth != EvalBitDepth::Float)
+                return "eval_bit_depth must be 'auto', '8', '16' or 'float'";
+            if (normal_start_fraction > normal_end_fraction)
+                return std::format(
+                    "normal_start_fraction must not exceed normal_end_fraction ({} > {})",
+                    normal_start_fraction, normal_end_fraction);
             return {};
         }
 
@@ -201,30 +1061,180 @@ namespace lfs::core {
             if (auto error = optimization.validate(); !error.empty()) {
                 return error;
             }
+            if (auto error = dataset.validate(); !error.empty()) {
+                return error;
+            }
+            const auto valid_port = [](const int port) { return port == -1 || (port > 0 && port <= 65535); };
+            if (!valid_port(server.tcp_server_connection_port))
+                return std::format("tcp_server_connection_port must be -1 or within [1, 65535] (got {})",
+                                   server.tcp_server_connection_port);
+            if (!valid_port(server.tcp_broadcast_connection_port))
+                return std::format("tcp_broadcast_connection_port must be -1 or within [1, 65535] (got {})",
+                                   server.tcp_broadcast_connection_port);
+            if (mcp_port && (*mcp_port < 1 || *mcp_port > 65535))
+                return std::format("mcp_port must be within [1, 65535] (got {})", *mcp_port);
+            if (render_path) {
+                if (render_path->width <= 0 || render_path->height <= 0 ||
+                    (render_path->width % 2) != 0 || (render_path->height % 2) != 0)
+                    return std::format("render dimensions must be positive and even (got {}x{})",
+                                       render_path->width, render_path->height);
+                if (render_path->width > std::numeric_limits<int>::max() / render_path->height)
+                    return std::format("render pixel count exceeds signed-int limits (got {}x{})",
+                                       render_path->width, render_path->height);
+                if (render_path->fps <= 0)
+                    return std::format("render fps must be positive (got {})", render_path->fps);
+                if (render_path->crf < 0 || render_path->crf > 51)
+                    return std::format("render crf must be within [0, 51] (got {})", render_path->crf);
+            }
+            if (!std::isfinite(freeze_lr_scale) || freeze_lr_scale < 0.0f || freeze_lr_scale > 1.0f) {
+                return std::format("freeze_lr_scale must be within [0, 1] (got {})", freeze_lr_scale);
+            }
             if (!add_splat_paths.empty()) {
-                if (resume_checkpoint.has_value()) {
+                if (!add_splats_applied &&
+                    (resume_checkpoint.has_value() ||
+                     resume_project.has_value() ||
+                     project_path.has_value())) {
                     return "--add-splat cannot be used together with --resume";
+                }
+                if (!add_splat_freeze.empty() && add_splat_freeze.size() != add_splat_paths.size()) {
+                    return "--add-splat freeze metadata is inconsistent";
                 }
                 for (const auto& path : add_splat_paths) {
                     if (path.empty()) {
                         return "--add-splat path cannot be empty";
                     }
-                    if (!std::filesystem::exists(path)) {
+                    if (!add_splats_applied && !lfs::core::native_fs::exists(path)) {
                         return std::format("Added splat does not exist: '{}'",
                                            lfs::core::path_to_utf8(path));
                     }
                 }
             }
-            if (optimization.ppisp_freeze_from_sidecar && !resume_checkpoint.has_value()) {
+            if (resume_checkpoint && resume_project) {
+                return "Only one resume source may be active";
+            }
+            if (project_path &&
+                (resume_checkpoint || resume_project)) {
+                return "A project path and --resume are mutually exclusive";
+            }
+            if (dataset_project &&
+                (resume_checkpoint || resume_project)) {
+                return "--data-path project.licht and --resume are mutually exclusive";
+            }
+            if (project_path) {
+                auto extension = lfs::core::path_to_utf8(project_path->extension());
+                std::ranges::transform(
+                    extension, extension.begin(),
+                    [](const unsigned char character) {
+                        return static_cast<char>(
+                            std::tolower(character));
+                    });
+                if (extension != ".licht") {
+                    return "The project path must reference a .licht file";
+                }
+                if (!lfs::io::project::isPublishedLichtPath(*project_path)) {
+                    return lfs::io::project::unpublishedLichtUserMessage(
+                        *project_path);
+                }
+            }
+            if (resume_project) {
+                auto resume_extension = lfs::core::path_to_utf8(resume_project->extension());
+                std::ranges::transform(
+                    resume_extension, resume_extension.begin(),
+                    [](const unsigned char character) {
+                        return static_cast<char>(
+                            std::tolower(character));
+                    });
+                if (resume_extension != ".licht") {
+                    return "The resume project must reference a .licht file";
+                }
+                if (!lfs::io::project::isPublishedLichtPath(*resume_project)) {
+                    return lfs::io::project::unpublishedLichtUserMessage(
+                        *resume_project);
+                }
+            }
+            if (save_project_at_iteration && *save_project_at_iteration == 0) {
+                return "--save-project-at-iter must be positive";
+            }
+            const auto project_snapshot_limit = optimization.enable_sparsity
+                                                    ? static_cast<size_t>(optimization.resolved_total_iterations())
+                                                    : optimization.iterations;
+            if (save_project_at_iteration && *save_project_at_iteration > project_snapshot_limit) {
+                return "--save-project-at-iter cannot exceed the training iteration limit";
+            }
+            if (!save_project_at_iteration &&
+                !save_project_path.empty()) {
+                return "--save-project-path requires --save-project-at-iter";
+            }
+            if (!save_project_path.empty() &&
+                save_project_path.extension() != ".licht") {
+                return "--save-project-path must end in .licht";
+            }
+            if (optimization.ppisp_freeze_from_sidecar &&
+                !resume_checkpoint.has_value() && !resume_project.has_value()) {
                 if (optimization.ppisp_sidecar_path.empty()) {
                     return "PPISP sidecar freeze requires a sidecar path";
                 }
-                if (!std::filesystem::exists(optimization.ppisp_sidecar_path)) {
+                if (!lfs::core::native_fs::exists(optimization.ppisp_sidecar_path)) {
                     return std::format("PPISP sidecar does not exist: '{}'",
                                        lfs::core::path_to_utf8(optimization.ppisp_sidecar_path));
                 }
             }
             return {};
+        }
+
+        std::string DatasetConfig::validate() const {
+            // Exports go to output_path / output_name, so the name must stay inside it.
+            if (const auto name = lfs::core::utf8_to_path(output_name);
+                output_name == "." || name.has_root_path() || name.has_root_name() ||
+                std::ranges::any_of(name, [](const auto& part) { return part == ".."; })) {
+                return "output-name must stay inside the output path (no absolute paths or '..')";
+            }
+            if (resize_factor != -1 && resize_factor < 1)
+                return std::format("resize_factor must be -1 or positive (got {})", resize_factor);
+            if (test_every <= 0)
+                return std::format("test_every must be positive (got {})", test_every);
+            if (timelapse_every <= 0)
+                return std::format("timelapse_every must be positive (got {})", timelapse_every);
+            if (max_width < 0)
+                return std::format("max_width must be nonnegative (got {})", max_width);
+            if (min_track_length < 0)
+                return std::format("min_track_length must be nonnegative (got {})", min_track_length);
+            if (!std::isfinite(mask_threshold) || mask_threshold < 0.0f || mask_threshold > 1.0f)
+                return std::format("dataset mask_threshold must be finite and within [0, 1] (got {})", mask_threshold);
+            if (!std::isfinite(loading_params.min_cpu_free_memory_ratio) ||
+                loading_params.min_cpu_free_memory_ratio < 0.0f ||
+                loading_params.min_cpu_free_memory_ratio > 1.0f)
+                return std::format("min_cpu_free_memory_ratio must be finite and within [0, 1] (got {})",
+                                   loading_params.min_cpu_free_memory_ratio);
+            if (!std::isfinite(loading_params.min_cpu_free_GB) || loading_params.min_cpu_free_GB < 0.0f)
+                return std::format("min_cpu_free_GB must be finite and nonnegative (got {})",
+                                   loading_params.min_cpu_free_GB);
+            if (loading_params.print_status_freq_num <= 0)
+                return std::format("print_status_freq_num must be positive (got {})",
+                                   loading_params.print_status_freq_num);
+            return {};
+        }
+
+        std::string DatasetConfig::output_stem() const {
+            constexpr std::array kNamedFormats{OutputFormat::PLY, OutputFormat::SOG, OutputFormat::SSOG,
+                                               OutputFormat::SPZ, OutputFormat::GLB, OutputFormat::HTML,
+                                               OutputFormat::USD, OutputFormat::USDA, OutputFormat::USDC,
+                                               OutputFormat::RAD};
+            const auto name = lfs::core::utf8_to_path(output_name);
+            const bool names_a_file_type =
+                lfs::core::has_extension(name, ".licht") ||
+                std::ranges::any_of(kNamedFormats, [&](const OutputFormat format) {
+                    return lfs::core::has_extension(name, output_format_extension(format));
+                });
+            if (!names_a_file_type)
+                return output_name;
+            return lfs::core::path_to_utf8(std::filesystem::path(name).replace_extension());
+        }
+
+        std::filesystem::path DatasetConfig::project_file() const {
+            const auto stem = output_stem();
+            return output_path / (stem.empty() ? std::filesystem::path("project.licht")
+                                               : lfs::core::utf8_to_path(stem + ".licht"));
         }
 
         OptimizationParameters OptimizationParameters::mcmc_defaults() {
@@ -236,23 +1246,36 @@ namespace lfs::core {
         OptimizationParameters OptimizationParameters::mrnf_defaults() {
             auto p = OptimizationParameters{};
             p.strategy = std::string(kStrategyMRNF);
+            p.use_exposure_correction = true;
             p.refine_every = 200;
             p.start_refine = 0;
             p.stop_refine = 28'500;
             p.max_cap = 5'000'000;
+            p.grow_fraction = -1.0f;
+            p.shs_lr = -1.0f;
+            p.thin_structure_weight = 0.5f;
+            p.gradient_loss_weight = 1.8f;
+            p.opacity_decay_rendered_only = true;
+            p.densify_structure_weight = 1.0f;
             p.min_opacity = 1.0f / 255.0f;
-            p.grad_threshold = 0.003f;
-            p.means_lr = 2e-5f;
             p.means_lr_end = 2e-7f;
             p.opacity_lr = 0.012f;
-            p.scaling_lr = 7e-3f;
             p.scaling_lr_end = 5e-3f;
-            p.rotation_lr = 2e-3f;
-            p.shs_lr = 2e-3f;
-            p.lambda_dssim = 0.2f;
-            p.revised_opacity = true;
+            p.late_lr_anneal = 0.3f;
+            p.lambda_dssim = 0.22f;
+            p.growth_grad_threshold = 0.00309693f;
+            p.max_screen_share = 0.586511f;
+            p.screen_share_penalty = 0.847085f;
+            p.means_lr = 2.17871e-5f;
+            p.refine_every = 163;
+            p.scaling_lr = 0.00828016f;
+            p.rotation_lr = 0.0015f;
             p.opacity_reg = 0.0f;
-            p.scale_reg = 0.0f;
+            p.scale_reg = 0.01f;
+            p.scale_reg_decay_power = 0.4f;
+            p.erank_reg = 0.001f;
+            p.dc_reg = 0.001f;
+            p.sh_rest_reg = 0.001f;
             p.use_error_map = true;
             p.use_edge_map = true;
             return p;
@@ -271,292 +1294,207 @@ namespace lfs::core {
             p.scale_reg = 0.0f;
             p.init_opacity = 0.1f;
             p.init_scaling = 0.1f;
-            p.revised_opacity = true;
             p.max_cap = 4'000'000;
             p.tv_loss_weight = 5.0f;
             return p;
         }
 
+        OptimizationParameters OptimizationParameters::defaults_for_strategy(const std::string_view strategy) {
+            const auto canonical_strategy = canonical_strategy_name(strategy);
+            if (canonical_strategy == kStrategyMCMC)
+                return mcmc_defaults();
+            if (canonical_strategy == kStrategyIGSPlus)
+                return igs_plus_defaults();
+            return mrnf_defaults();
+        }
+
         OptimizationParameters OptimizationParameters::from_json(const nlohmann::json& json) {
-
             OptimizationParameters params;
-            params.iterations = json["iterations"];
-            params.means_lr = json["means_lr"];
-            if (json.contains("means_lr_end")) {
-                params.means_lr_end = json["means_lr_end"];
-            }
-            params.shs_lr = json["shs_lr"];
-            params.opacity_lr = json["opacity_lr"];
-            params.scaling_lr = json["scaling_lr"];
-            if (json.contains("scaling_lr_end")) {
-                params.scaling_lr_end = json["scaling_lr_end"];
-            }
-            params.rotation_lr = json["rotation_lr"];
-            params.lambda_dssim = json["lambda_dssim"];
-            params.min_opacity = json["min_opacity"];
-            params.refine_every = json["refine_every"];
-            params.start_refine = json["start_refine"];
-            params.stop_refine = json["stop_refine"];
-            params.grad_threshold = json["grad_threshold"];
-            params.sh_degree = json["sh_degree"];
-
-            if (json.contains("opacity_reg")) {
-                params.opacity_reg = json["opacity_reg"];
-            }
-            if (json.contains("scale_reg")) {
-                params.scale_reg = json["scale_reg"];
-            }
-            if (json.contains("init_opacity")) {
-                params.init_opacity = json["init_opacity"];
-            }
-            if (json.contains("init_scaling")) {
-                params.init_scaling = json["init_scaling"];
-            }
-            if (json.contains("max_cap")) {
-                params.max_cap = json["max_cap"];
-            }
-
             if (json.contains("strategy")) {
-                const std::string strategy = json["strategy"];
-                if (const auto canonical_strategy = canonical_strategy_name(strategy); !canonical_strategy.empty()) {
-                    params.strategy = std::string(canonical_strategy);
+                const auto strategy = json.at("strategy").get<std::string>();
+                if (const auto canonical = canonical_strategy_name(strategy); !canonical.empty()) {
+                    params = defaults_for_strategy(canonical);
                 } else {
                     LOG_WARN("Invalid strategy '{}' in JSON, using default", strategy);
                 }
             }
-
-            if (json.contains("eval_steps")) {
-                params.eval_steps.clear();
-                for (const auto& step : json["eval_steps"]) {
-                    params.eval_steps.push_back(step.get<size_t>());
-                }
-            }
-
-            if (json.contains("save_steps")) {
-                params.save_steps.clear();
-                for (const auto& step : json["save_steps"]) {
-                    params.save_steps.push_back(step.get<size_t>());
-                }
-            }
-
-            if (json.contains("enable_eval")) {
-                params.enable_eval = json["enable_eval"];
-            }
-            if (json.contains("enable_save_eval_images")) {
-                params.enable_save_eval_images = json["enable_save_eval_images"];
-            }
-            if (json.contains("headless")) {
-                params.headless = json["headless"];
-            }
-            if (json.contains("mip_filter")) {
-                params.mip_filter = json["mip_filter"];
-            }
-            if (json.contains("use_bilateral_grid")) {
-                params.use_bilateral_grid = json["use_bilateral_grid"];
-            }
-            if (json.contains("bilateral_grid_X")) {
-                params.bilateral_grid_X = json["bilateral_grid_X"];
-            }
-            if (json.contains("bilateral_grid_Y")) {
-                params.bilateral_grid_Y = json["bilateral_grid_Y"];
-            }
-            if (json.contains("bilateral_grid_W")) {
-                params.bilateral_grid_W = json["bilateral_grid_W"];
-            }
-            if (json.contains("bilateral_grid_lr")) {
-                params.bilateral_grid_lr = json["bilateral_grid_lr"];
-            }
-            if (json.contains("tv_loss_weight")) {
-                params.tv_loss_weight = json["tv_loss_weight"];
-            }
-            if (json.contains("use_ppisp")) {
-                params.use_ppisp = json["use_ppisp"];
-            }
-            if (json.contains("ppisp_lr")) {
-                params.ppisp_lr = json["ppisp_lr"];
-            }
-            if (json.contains("ppisp_reg_weight")) {
-                params.ppisp_reg_weight = json["ppisp_reg_weight"];
-            }
-            if (json.contains("ppisp_warmup_steps")) {
-                params.ppisp_warmup_steps = json["ppisp_warmup_steps"];
-            }
-            if (json.contains("ppisp_freeze_from_sidecar")) {
-                params.ppisp_freeze_from_sidecar = json["ppisp_freeze_from_sidecar"];
-            }
-            if (json.contains("ppisp_sidecar_path")) {
-                params.ppisp_sidecar_path = utf8_to_path(json["ppisp_sidecar_path"].get<std::string>());
-            }
-            if (json.contains("ppisp_use_controller")) {
-                params.ppisp_use_controller = json["ppisp_use_controller"];
-            }
-            if (json.contains("ppisp_freeze_gaussians_on_distill")) {
-                params.ppisp_freeze_gaussians_on_distill = json["ppisp_freeze_gaussians_on_distill"];
-            }
-            if (json.contains("ppisp_controller_activation_step")) {
-                params.ppisp_controller_activation_step = json["ppisp_controller_activation_step"];
-            }
-            if (json.contains("ppisp_controller_lr")) {
-                params.ppisp_controller_lr = json["ppisp_controller_lr"];
-            }
-            if (json.contains("prune_opacity")) {
-                params.prune_opacity = json["prune_opacity"];
-            }
-            if (json.contains("grow_scale3d")) {
-                params.grow_scale3d = json["grow_scale3d"];
-            }
-            if (json.contains("grow_scale2d")) {
-                params.grow_scale2d = json["grow_scale2d"];
-            }
-            if (json.contains("prune_scale3d")) {
-                params.prune_scale3d = json["prune_scale3d"];
-            }
-            if (json.contains("prune_scale2d")) {
-                params.prune_scale2d = json["prune_scale2d"];
-            }
-            if (json.contains("reset_every")) {
-                params.reset_every = json["reset_every"];
-            }
-            if (json.contains("pause_refine_after_reset")) {
-                params.pause_refine_after_reset = json["pause_refine_after_reset"];
-            }
-            if (json.contains("revised_opacity")) {
-                params.revised_opacity = json["revised_opacity"];
-            }
-            if (json.contains("steps_scaler")) {
-                params.steps_scaler = json["steps_scaler"];
-            }
-            if (json.contains("sh_degree_interval")) {
-                params.sh_degree_interval = json["sh_degree_interval"];
-            }
-            if (json.contains("random")) {
-                params.random = json["random"];
-            }
-            if (json.contains("init_num_pts")) {
-                params.init_num_pts = json["init_num_pts"];
-            }
-            if (json.contains("init_extent")) {
-                params.init_extent = json["init_extent"];
-            }
-            if (json.contains("tile_mode")) {
-                params.tile_mode = json["tile_mode"];
-            }
-            if (json.contains("enable_sparsity")) {
-                params.enable_sparsity = json["enable_sparsity"];
-            }
-            if (json.contains("sparsify_steps")) {
-                params.sparsify_steps = json["sparsify_steps"];
-            }
-            if (json.contains("init_rho")) {
-                params.init_rho = json["init_rho"];
-            }
-            if (json.contains("prune_ratio")) {
-                params.prune_ratio = json["prune_ratio"];
-            }
-            if (json.contains("bg_modulation")) {
-                params.bg_modulation = json["bg_modulation"];
-            }
-            if (json.contains("gut")) {
-                params.gut = json["gut"];
-            }
-            if (json.contains("undistort")) {
-                params.undistort = json["undistort"];
-            }
-
-            if (json.contains("bg_mode")) {
-                const std::string mode = json["bg_mode"];
-                if (mode == "solid_color") {
-                    params.bg_mode = BackgroundMode::SolidColor;
-                } else if (mode == "modulation") {
-                    params.bg_mode = BackgroundMode::Modulation;
-                } else if (mode == "image") {
-                    params.bg_mode = BackgroundMode::Image;
-                } else if (mode == "random") {
-                    params.bg_mode = BackgroundMode::Random;
-                }
-            }
-            if (json.contains("bg_color") && json["bg_color"].is_array() && json["bg_color"].size() == 3) {
-                params.bg_color = {json["bg_color"][0], json["bg_color"][1], json["bg_color"][2]};
-            }
-            if (json.contains("bg_image_path")) {
-                params.bg_image_path = utf8_to_path(json["bg_image_path"].get<std::string>());
-            }
-
-            // Mask parameters
-            if (json.contains("mask_mode")) {
-                std::string mode = json["mask_mode"];
-                if (mode == "none") {
-                    params.mask_mode = MaskMode::None;
-                } else if (mode == "segment") {
-                    params.mask_mode = MaskMode::Segment;
-                } else if (mode == "ignore") {
-                    params.mask_mode = MaskMode::Ignore;
-                } else if (mode == "alpha_consistent") {
-                    params.mask_mode = MaskMode::AlphaConsistent;
-                }
-            }
-            if (json.contains("invert_masks")) {
-                params.invert_masks = json["invert_masks"];
-            }
-            if (json.contains("mask_opacity_penalty_weight")) {
-                params.mask_opacity_penalty_weight = json["mask_opacity_penalty_weight"];
-            }
-            if (json.contains("mask_opacity_penalty_power")) {
-                params.mask_opacity_penalty_power = json["mask_opacity_penalty_power"];
-            }
-            if (json.contains("mask_threshold")) {
-                params.mask_threshold = json["mask_threshold"];
-            }
-            if (json.contains("use_alpha_as_mask")) {
-                params.use_alpha_as_mask = json["use_alpha_as_mask"];
-            }
-
-            // MRNF strategy parameters
-            if (json.contains("growth_grad_threshold")) {
-                params.growth_grad_threshold = json["growth_grad_threshold"];
-            }
-            if (json.contains("grow_fraction")) {
-                params.grow_fraction = json["grow_fraction"];
-            }
-            if (json.contains("grow_until_iter")) {
-                params.grow_until_iter = json["grow_until_iter"];
-            }
-            if (json.contains("opacity_decay")) {
-                params.opacity_decay = json["opacity_decay"];
-            }
-            if (json.contains("scale_decay")) {
-                params.scale_decay = json["scale_decay"];
-            }
-            if (json.contains("means_noise_weight")) {
-                params.means_noise_weight = json["means_noise_weight"];
-            }
-            if (json.contains("bounds_percentile")) {
-                params.bounds_percentile = json["bounds_percentile"];
-            }
-            if (json.contains("use_error_map")) {
-                params.use_error_map = json["use_error_map"];
-            }
-            if (json.contains("use_edge_map")) {
-                params.use_edge_map = json["use_edge_map"];
-            }
-
+            apply_optimization_json_overlay(params, json, false);
+            params.eval_mask = normalize_eval_mask(params.eval_mask);
+            // Legacy GUI saves recorded the image factor in steps_scaler.
+            if (!stored_image_count_scaler(json, params.steps_scaler))
+                params.image_count_scaler = params.steps_scaler > 0.f ? params.steps_scaler : 1.f;
             return params;
         }
 
-        std::expected<OptimizationParameters, std::string> read_optim_params_from_json(const std::filesystem::path& path) {
+        bool ExplicitTrainingOverrides::has_optimization_key(const std::string_view key) const {
+            return overlay_has_key(optimization_json, key);
+        }
+
+        bool ExplicitTrainingOverrides::has_dataset_key(const std::string_view key) const {
+            return overlay_has_key(dataset_json, key);
+        }
+
+        void merge_explicit_json_overlay(std::string& dst_json, const std::string_view src_json) {
+            if (src_json.empty())
+                return;
+            auto src = parse_overlay_object(src_json);
+            if (src.empty())
+                return;
+            auto dst = parse_overlay_object(dst_json);
+            for (auto it = src.begin(); it != src.end(); ++it)
+                dst[it.key()] = it.value();
+            dst_json = dst.dump();
+        }
+
+        void apply_explicit_training_overrides(
+            TrainingParameters& target,
+            const ExplicitTrainingOverrides& overrides) {
+            if (!overrides.optimization_json.empty())
+                apply_optimization_json_overlay(
+                    target.optimization,
+                    parse_overlay_object(overrides.optimization_json),
+                    true);
+            if (!overrides.dataset_json.empty())
+                apply_dataset_json_overlay(
+                    target.dataset, parse_overlay_object(overrides.dataset_json));
+        }
+
+        std::expected<OptimizationParameters, std::string> read_optim_params_from_json(
+            const std::filesystem::path& path,
+            ExplicitTrainingOverrides& captured_overrides) {
             auto json_result = read_json_file(path);
             if (!json_result) {
                 return std::unexpected(json_result.error());
             }
 
             const auto& json = *json_result;
-            // Support both flat and nested {"optimization": {...}} formats
             const auto& opt_json = json.contains("optimization") ? json["optimization"] : json;
 
             try {
-                return OptimizationParameters::from_json(opt_json);
+                if (!opt_json.is_object())
+                    return std::unexpected("Optimization parameters must be a JSON object");
+                if (const auto error = validate_optimization_json_types(opt_json))
+                    return std::unexpected("Error parsing optimization parameters: " + *error);
+                if (const auto error = validate_registered_optimization_enums(opt_json))
+                    return std::unexpected("Error parsing optimization parameters: " + *error);
+                if (json.contains("dataset")) {
+                    if (!json["dataset"].is_object())
+                        return std::unexpected("Dataset parameters must be a JSON object");
+                    if (const auto error = validate_dataset_json_types(json["dataset"]))
+                        return std::unexpected(*error);
+                }
+                if (json.contains("server")) {
+                    if (!json["server"].is_object())
+                        return std::unexpected("Server parameters must be a JSON object");
+                    if (const auto error = validate_server_json_types(json["server"]))
+                        return std::unexpected(*error);
+                }
+
+                auto params = OptimizationParameters::from_json(opt_json);
+                if (auto error = params.validate(); !error.empty())
+                    return std::unexpected("Invalid optimization parameters: " + error);
+                if (opt_json.is_object() && !opt_json.empty())
+                    captured_overrides.optimization_json = opt_json.dump();
+                if (json.contains("dataset") && json["dataset"].is_object() &&
+                    !json["dataset"].empty()) {
+                    captured_overrides.dataset_json = json["dataset"].dump();
+                }
+                return params;
             } catch (const std::exception& e) {
                 return std::unexpected(std::format("Error parsing optimization parameters: {}", e.what()));
+            }
+        }
+
+        std::expected<OptimizationParameters, std::string> read_optim_params_from_json(const std::filesystem::path& path) {
+            ExplicitTrainingOverrides unused;
+            return read_optim_params_from_json(path, unused);
+        }
+
+        std::expected<TrainingParameters, lfs::Error> read_training_parameters_from_json(
+            const std::filesystem::path& path,
+            const TrainingParameters& defaults) {
+            auto json_result = read_json_file(path);
+            if (!json_result) {
+                return std::unexpected(config_import_error(std::move(json_result.error()), path));
+            }
+
+            const auto& json = *json_result;
+            const auto& opt_json = json.contains("optimization") ? json["optimization"] : json;
+            if (!opt_json.is_object()) {
+                return std::unexpected(config_import_error("Optimization parameters must be a JSON object", path));
+            }
+
+            try {
+                if (const auto error = validate_optimization_json_types(opt_json)) {
+                    return std::unexpected(config_import_error(*error, path));
+                }
+                if (const auto error = validate_registered_optimization_enums(opt_json)) {
+                    return std::unexpected(config_import_error(*error, path));
+                }
+
+                TrainingParameters params = defaults;
+                params.optimization = OptimizationParameters::mrnf_defaults();
+                if (opt_json.contains("strategy")) {
+                    const auto strategy = opt_json.at("strategy").get<std::string>();
+                    const auto canonical = canonical_strategy_name(strategy);
+                    if (!canonical.empty()) {
+                        params.optimization = OptimizationParameters::defaults_for_strategy(canonical);
+                    }
+                }
+                apply_optimization_json_overlay(params.optimization, opt_json, true);
+
+                if (json.contains("dataset")) {
+                    if (!json["dataset"].is_object()) {
+                        return std::unexpected(config_import_error("Dataset parameters must be a JSON object", path));
+                    }
+                    if (const auto error = validate_dataset_json_types(json["dataset"])) {
+                        return std::unexpected(config_import_error(*error, path));
+                    }
+                    apply_dataset_json_overlay(params.dataset, json["dataset"]);
+                }
+                if (json.contains("server")) {
+                    if (!json["server"].is_object()) {
+                        return std::unexpected(config_import_error("Server parameters must be a JSON object", path));
+                    }
+                    const auto& server_json = json["server"];
+                    if (server_json.contains("tcp_server_connection_port")) {
+                        if (!is_json_integer(server_json["tcp_server_connection_port"]) ||
+                            server_json["tcp_server_connection_port"].get<long double>() < std::numeric_limits<int>::min() ||
+                            server_json["tcp_server_connection_port"].get<long double>() > std::numeric_limits<int>::max()) {
+                            return std::unexpected(config_import_error(
+                                "Invalid type for server field 'tcp_server_connection_port'; expected integer", path));
+                        }
+                        params.server.tcp_server_connection_port =
+                            server_json["tcp_server_connection_port"].get<int>();
+                    }
+                    if (server_json.contains("tcp_broadcast_connection_port")) {
+                        if (!is_json_integer(server_json["tcp_broadcast_connection_port"]) ||
+                            server_json["tcp_broadcast_connection_port"].get<long double>() < std::numeric_limits<int>::min() ||
+                            server_json["tcp_broadcast_connection_port"].get<long double>() > std::numeric_limits<int>::max()) {
+                            return std::unexpected(config_import_error(
+                                "Invalid type for server field 'tcp_broadcast_connection_port'; expected integer", path));
+                        }
+                        params.server.tcp_broadcast_connection_port =
+                            server_json["tcp_broadcast_connection_port"].get<int>();
+                    }
+                    if (server_json.contains("tcp_connection")) {
+                        if (!server_json["tcp_connection"].is_boolean()) {
+                            return std::unexpected(config_import_error(
+                                "Invalid type for server field 'tcp_connection'; expected boolean", path));
+                        }
+                        params.server.tcp_connection = server_json["tcp_connection"].get<bool>();
+                    }
+                }
+
+                if (const auto error = params.optimization.validate(); !error.empty()) {
+                    return std::unexpected(config_import_error("Invalid optimization parameters: " + error, path));
+                }
+                if (const auto error = params.dataset.validate(); !error.empty()) {
+                    return std::unexpected(config_import_error("Invalid dataset parameters: " + error, path));
+                }
+                return params;
+            } catch (const std::exception& e) {
+                return std::unexpected(config_import_error(std::format("Error parsing training parameters: {}", e.what()), path));
             }
         }
 
@@ -573,9 +1511,15 @@ namespace lfs::core {
                 json["optimization"] = opt_copy.to_json();
 
                 const auto now = std::chrono::system_clock::now();
-                const auto time_t = std::chrono::system_clock::to_time_t(now);
+                const auto time_t_val = std::chrono::system_clock::to_time_t(now);
+                std::tm tm{};
+#ifdef _WIN32
+                localtime_s(&tm, &time_t_val);
+#else
+                localtime_r(&time_t_val, &tm);
+#endif
                 std::stringstream ss;
-                ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+                ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
                 json["timestamp"] = ss.str();
 
                 const std::filesystem::path filepath = (output_path.extension() == ".json")
@@ -606,14 +1550,16 @@ namespace lfs::core {
             if (j.contains("min_cpu_free_GB")) {
                 params.min_cpu_free_GB = j["min_cpu_free_GB"];
             }
-            if (j.contains("use_fs_cache")) {
-                params.use_fs_cache = j["use_fs_cache"];
-            }
             if (j.contains("print_cache_status")) {
                 params.print_cache_status = j["print_cache_status"];
             }
             if (j.contains("print_status_freq_num")) {
                 params.print_status_freq_num = j["print_status_freq_num"];
+            }
+            if (j.contains("use_16bit_color")) {
+                params.use_16bit_color = j["use_16bit_color"];
+            } else if (j.contains("use_8bit_color")) {
+                params.use_16bit_color = !j["use_8bit_color"].get<bool>();
             }
 
             return params;
@@ -624,9 +1570,9 @@ namespace lfs::core {
             loading_json["use_cpu_memory"] = use_cpu_memory;
             loading_json["min_cpu_free_memory_ratio"] = min_cpu_free_memory_ratio;
             loading_json["min_cpu_free_GB"] = min_cpu_free_GB;
-            loading_json["use_fs_cache"] = use_fs_cache;
             loading_json["print_cache_status"] = print_cache_status;
             loading_json["print_status_freq_num"] = print_status_freq_num;
+            loading_json["use_16bit_color"] = use_16bit_color;
 
             return loading_json;
         }
@@ -664,10 +1610,14 @@ namespace lfs::core {
             json["images"] = images;
             json["resize_factor"] = resize_factor;
             json["test_every"] = test_every;
+            json["timelapse_images"] = timelapse_images;
+            json["timelapse_every"] = timelapse_every;
             json["max_width"] = max_width;
+            json["min_track_length"] = min_track_length;
             json["loading_params"] = loading_params.to_json();
             json["invert_masks"] = invert_masks;
             json["mask_threshold"] = mask_threshold;
+            json["centralize_dataset"] = centralize_dataset;
             if (!output_name.empty())
                 json["output_name"] = output_name;
 
@@ -682,7 +1632,19 @@ namespace lfs::core {
             dataset.images = j["images"].get<std::string>();
             dataset.resize_factor = j["resize_factor"].get<int>();
             dataset.max_width = j["max_width"].get<int>();
+            if (j.contains("min_track_length")) {
+                dataset.min_track_length = j["min_track_length"].get<int>();
+            }
             dataset.test_every = j["test_every"].get<int>();
+            if (j.contains("timelapse_images")) {
+                dataset.timelapse_images =
+                    j["timelapse_images"]
+                        .get<std::vector<std::string>>();
+            }
+            if (j.contains("timelapse_every")) {
+                dataset.timelapse_every =
+                    j["timelapse_every"].get<int>();
+            }
             dataset.output_path = utf8_to_path(j["output_folder"].get<std::string>());
 
             if (j.contains("output_name")) {
@@ -696,6 +1658,9 @@ namespace lfs::core {
             }
             if (j.contains("mask_threshold")) {
                 dataset.mask_threshold = j["mask_threshold"].get<float>();
+            }
+            if (j.contains("centralize_dataset")) {
+                dataset.centralize_dataset = j["centralize_dataset"].get<std::string>();
             }
 
             return dataset;

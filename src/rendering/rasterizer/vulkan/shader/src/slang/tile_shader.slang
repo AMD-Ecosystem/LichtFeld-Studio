@@ -13,11 +13,13 @@
 // limitations under the License.
 
 #include "config.slang"
+#include "indirect_layout.inc"
 
 import utils;
 
 #define _ENTRY_generate_keys 1
 #define _ENTRY_compute_tile_ranges 2
+#define _ENTRY_compute_tile_ranges_and_batch_counts 3
 
 #ifndef ENTRY
 #define ENTRY 0
@@ -52,6 +54,7 @@ layout(binding=4) StructuredBuffer<int32_t> primitive_sort_indices;
 
 layout(binding=5) RWStructuredBuffer<sortingKey_t> out_unsorted_keys;
 layout(binding=6) RWStructuredBuffer<int32_t> out_unsorted_gauss_idx;
+layout(binding=7) StructuredBuffer<uint32_t> depth_wave_dispatch;
 
 #define BLOCK_SIZE 64
 #define NUM_SUBGROUPS (BLOCK_SIZE / SUBGROUP_SIZE)
@@ -69,19 +72,27 @@ void main(
     const uint grid_width = uniforms.grid_width;
     const bool wrap_x = base_camera_model(uniforms.camera_model) == uint(CameraModel::EQUIRECTANGULAR);
 
-    int32_t depth_rank = dispatchThreadID.x;
+    const uint record = (1u + uniforms.depth_wave) * LFS_VK_DEPTH_WAVE_RECORD_STRIDE_WORDS;
+    const uint local_rank = dispatchThreadID.x;
+    const uint rank_count = depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_RANK_COUNT_WORD];
+    if (local_rank >= rank_count)
+        return;
+    int32_t depth_rank = int32_t(
+        depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_RANK_BASE_WORD] + local_rank);
 
     if (depth_rank >= uniforms.num_splats)
         return;
 
     // index_buffer_offset is cumsum'd over the depth-ordered tiles_touched
     // array, so the offset interval for this depth_rank is contiguous.
-    int offset = depth_rank == 0 ? 0 : index_buffer_offset[depth_rank-1];
-    int offset_max = index_buffer_offset[depth_rank];
+    const int instance_base =
+        int(depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_INSTANCE_BASE_WORD]);
+    int offset = (depth_rank == 0 ? 0 : index_buffer_offset[depth_rank-1]) - instance_base;
+    int offset_max = index_buffer_offset[depth_rank] - instance_base;
     const int sort_capacity = int(uniforms.sort_capacity);
-    if (sort_capacity <= 0 || offset >= sort_capacity || offset >= offset_max)
+    if (sort_capacity <= 0 || offset < 0 || offset_max < 0 ||
+        offset >= sort_capacity || offset >= offset_max || offset_max > sort_capacity)
         return;
-    offset_max = min(offset_max, sort_capacity);
 
     int32_t primitive_idx = primitive_sort_indices[depth_rank];
 
@@ -89,7 +100,20 @@ void main(
     float2 xy = read_t2_float2(primitive_idx, xy_vs);
     float4 inv_cov_opac = read_t4_float4(primitive_idx, inv_cov_vs_opacity);
 
-    float extend = extend_from_opacity(inv_cov_opac.w);
+    if (uniforms.splat_render_profile == 1u &&
+        is_gut_projection_mode(uniforms.camera_model) && (uniforms.lod_enabled & 4u) == 0u) {
+        // The vertex pass counts tiles using an ellipse enclosing the capped
+        // portal quad. Emit that same ellipse; the stored inverse covariance
+        // remains uncapped for the fragment shader's ray and quad evaluation.
+        const uint camera_height = uniforms.camera_height == 0 ? image_height : uniforms.camera_height;
+        const uint camera_width = uniforms.camera_width == 0 ? image_width : uniforms.camera_width;
+        inv_cov_opac.xyz = portal_gut_bin_inverse(inv_cov_opac.xyz, camera_width, camera_height);
+    }
+
+    // Match GUT projection's expanded support for high-density RAD parents.
+    float extend = is_gut_projection_mode(uniforms.camera_model) && (uniforms.lod_enabled & 4u) != 0u
+        ? sqrt(2.0f * power_threshold_for_spark_rad_opacity(inv_cov_opac.w))
+        : extend_from_opacity(inv_cov_opac.w);
     float3 inv_cov = inv_cov_opac.xyz / (extend*extend);
 #endif  // TILE_CULLING_MODE > 0
 
@@ -103,6 +127,15 @@ void main(
     rectangle rect = reinterpret<rectangle>(rect_tile_space[primitive_idx]);
   #endif
 
+    // Preserve the full image's ellipse scan direction. Clipping the rectangle
+    // first can switch axes and change which boundary tiles survive rounding.
+    const bool scan_rows = rect.max_y - rect.min_y <= rect.max_x - rect.min_x;
+    const uint2 tile_origin = full_frame_binning(uniforms)
+        ? uint2(uniforms.render_origin_x / TILE_WIDTH, uniforms.render_origin_y / TILE_HEIGHT)
+        : uint2(0u);
+    if (full_frame_binning(uniforms))
+        rect = clip_to_render_grid(rect, uniforms);
+
 #if TILE_CULLING_MODE == 0 || TILE_CULLING_MODE == 1
 
     for (uint16_t y = rect.min_y; y < rect.max_y; y++) {
@@ -110,7 +143,7 @@ void main(
             if (offset >= offset_max)
                 return;
             uint32_t key_x = wrap_x ? uint32_t(x) % grid_width : uint32_t(x);
-            uint32_t key = uint32_t(y) * grid_width + key_x;
+            uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width + key_x - tile_origin.x;
             out_unsorted_keys[offset] = sortingKey_t(key);
             out_unsorted_gauss_idx[offset] = primitive_idx;
             offset++;
@@ -124,7 +157,8 @@ void main(
     if (wrap_x) {
         for (uint16_t y = rect.min_y; y < rect.max_y; y++) {
             for (uint16_t x = rect.min_x; x < rect.max_x && offset < offset_max; x++) {
-                uint32_t key = uint32_t(y) * grid_width + (uint32_t(x) % grid_width);
+                uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width +
+                    (uint32_t(x) % grid_width) - tile_origin.x;
                 out_unsorted_keys[offset] = sortingKey_t(key);
                 out_unsorted_gauss_idx[offset] = primitive_idx;
                 offset++;
@@ -133,7 +167,7 @@ void main(
         return;
     }
 
-    if (rect.max_y-rect.min_y <= rect.max_x-rect.min_x) {
+    if (scan_rows) {
         for (uint16_t y = rect.min_y; y < rect.max_y; y++) {
             float y0 = y * TILE_HEIGHT - xy.y;
             float y1 = y0 + TILE_HEIGHT;
@@ -148,7 +182,7 @@ void main(
                 rect.min_x, rect.max_x
             ));
             for (uint16_t x = min_x; x < max_x && offset < offset_max; x++) {
-                uint32_t key = uint32_t(y) * grid_width + uint32_t(x);
+                uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width + uint32_t(x) - tile_origin.x;
                 out_unsorted_keys[offset] = sortingKey_t(key);
                 out_unsorted_gauss_idx[offset] = primitive_idx;
                 offset++;
@@ -170,7 +204,7 @@ void main(
                 rect.min_y, rect.max_y
             ));
             for (uint16_t y = min_y; y < max_y && offset < offset_max; y++) {
-                uint32_t key = uint32_t(y) * grid_width + uint32_t(x);
+                uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width + uint32_t(x) - tile_origin.x;
                 out_unsorted_keys[offset] = sortingKey_t(key);
                 out_unsorted_gauss_idx[offset] = primitive_idx;
                 offset++;
@@ -196,7 +230,7 @@ void main(
 
 layout(binding=0) StructuredBuffer<sortingKey_t> sorted_keys;
 layout(binding=1) RWStructuredBuffer<int32_t> out_tile_ranges;
-layout(binding=2) StructuredBuffer<int32_t> index_buffer_offset_in;
+layout(binding=2) StructuredBuffer<uint32_t> tile_instance_count;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -210,21 +244,10 @@ void main(
     const uint grid_width = uniforms.grid_width;
     const uint32_t num_tiles = grid_height*grid_width;
 
-    // num_isects (= num_indices) is read directly from the GPU-resident cumsum
-    // tail, then clamped to the CPU-chosen sort capacity so stale estimates from
-    // resize/camera jumps cannot read past the sorted buffers.
-    uint32_t num_isects =
-        uniforms.num_splats == 0u
-            ? 0u
-            : (uint32_t)index_buffer_offset_in[uniforms.num_splats - 1u];
-    num_isects = min(num_isects, uniforms.sort_capacity);
+    const uint32_t num_isects = tile_instance_count[0];
     if (globalIdx > num_isects)
         return;
 
-    // Two-stage sort: keys are tile-id-only (no depth packed), so the tile
-    // id is the key value clamped to [0, num_tiles]. The sentinel invocation
-    // at globalIdx == num_isects must not read sorted_keys[num_isects], which
-    // is out of bounds when num_isects is clamped to sort_capacity.
     uint32_t currtile = num_tiles;
     if (globalIdx < num_isects) {
         currtile = min((uint32_t)sorted_keys[globalIdx], num_tiles);
@@ -237,3 +260,54 @@ void main(
 }
 
 #endif  // ENTRY == _ENTRY_compute_tile_ranges
+
+
+#if ENTRY == _ENTRY_compute_tile_ranges_and_batch_counts
+
+layout(binding=0) StructuredBuffer<sortingKey_t> sorted_keys;
+layout(binding=1) RWStructuredBuffer<int32_t> out_tile_ranges;
+layout(binding=2) StructuredBuffer<uint32_t> tile_instance_count;
+layout(binding=3) RWStructuredBuffer<int32_t> out_tile_batch_counts;
+
+// One thread owns both boundaries and the derived count for a tile. Binary
+// searches avoid a cross-workgroup ranges->counts dependency and its barrier.
+[ForceInline]
+uint lower_bound_tile(uint target, uint count) {
+    uint low = 0u;
+    uint high = count;
+    while (low < high) {
+        const uint mid = low + (high - low) / 2u;
+        if (uint(sorted_keys[mid]) < target)
+            low = mid + 1u;
+        else
+            high = mid;
+    }
+    return low;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void main(
+    uint3 dispatchThreadID : SV_DispatchThreadID,
+    uniform Uniforms uniforms
+) {
+    const uint tile_idx = dispatchThreadID.x;
+    const uint num_tiles = uniforms.grid_height * uniforms.grid_width;
+    if (tile_idx >= num_tiles)
+        return;
+
+    const uint num_isects = tile_instance_count[0];
+    const uint range_start = lower_bound_tile(tile_idx, num_isects);
+    const uint range_end = lower_bound_tile(tile_idx + 1u, num_isects);
+    out_tile_ranges[tile_idx] = int32_t(range_start);
+    if (tile_idx + 1u == num_tiles)
+        out_tile_ranges[num_tiles] = int32_t(range_end);
+
+    const uint tile_count = range_end - range_start;
+    out_tile_batch_counts[tile_idx] =
+        tile_count > RASTER_DENSE_TILE_THRESHOLD
+            ? int32_t((tile_count + RASTER_BATCH_SIZE - 1u) / RASTER_BATCH_SIZE)
+            : 0;
+}
+
+#endif  // ENTRY == _ENTRY_compute_tile_ranges_and_batch_counts

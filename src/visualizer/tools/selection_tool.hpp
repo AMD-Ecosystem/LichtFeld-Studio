@@ -11,7 +11,7 @@
 
 namespace lfs::vis::tools {
 
-    class SelectionTool : public ToolBase {
+    class LFS_VIS_API SelectionTool : public ToolBase {
     public:
         SelectionTool();
         ~SelectionTool() override = default;
@@ -35,15 +35,40 @@ namespace lfs::vis::tools {
         [[nodiscard]] float getDepthFar() const { return depth_far_; }
         [[nodiscard]] float getDepthFrustumHalfWidth() const { return frustum_half_width_; }
         void setDepthFilterEnabled(bool enabled);
-        LFS_VIS_API void setDepthFilterRange(bool enabled, float depth_near, float depth_far, float frustum_half_width);
+        void setDepthFilterRange(bool enabled, float depth_near, float depth_far, float frustum_half_width);
+        // Inverse of the box applySelectionFilterSettings writes; a box saved in split view is narrowed in x.
+        void restoreDepthFilterBox(const glm::vec3& box_min, const glm::vec3& box_max, bool saved_in_split_view);
         void toggleDepthFilter() { setDepthFilterEnabled(!depth_filter_enabled_); }
         void adjustDepthFar(float scale);
         void syncDepthFilterToCamera(const Viewport& viewport);
+        // The split panel the user selects in owns the depth box; camera navigation in the other panel does not.
+        void setFilterPanel(SplitViewPanelId panel);
 
         // Crop filter (use scene crop box/ellipsoid as selection filter)
         [[nodiscard]] bool isCropFilterEnabled() const { return crop_filter_enabled_; }
         void setCropFilterEnabled(bool enabled);
         void toggleCropFilter() { setCropFilterEnabled(!crop_filter_enabled_); }
+        [[nodiscard]] bool restrictToSelectedNodes() const {
+            return restrict_to_selected_nodes_;
+        }
+        // Project restore runs after VIEW render state has been staged. Set
+        // preference owners without recomputing the saved depth transform from
+        // the current camera or emitting an in-progress tool gesture.
+        void restoreProjectPreferences(
+            float brush_radius,
+            bool crop_filter,
+            bool depth_filter,
+            bool restrict_to_selected_nodes) {
+            setBrushRadius(brush_radius);
+            crop_filter_enabled_ = crop_filter;
+            depth_filter_enabled_ = depth_filter;
+            restrict_to_selected_nodes_ =
+                restrict_to_selected_nodes;
+            armPreserveRestoredRenderState();
+        }
+        void armPreserveRestoredRenderState() {
+            preserve_restored_render_state_ = true;
+        }
 
     protected:
         void onEnabledChanged(bool enabled) override;
@@ -58,13 +83,16 @@ namespace lfs::vis::tools {
         float depth_near_ = 0.0f;
         float depth_far_ = DEFAULT_DEPTH_FAR;
         float frustum_half_width_ = DEFAULT_FRUSTUM_HALF_WIDTH;
+        SplitViewPanelId filter_panel_ = SplitViewPanelId::Left;
 
         // Crop filter
         bool crop_filter_enabled_ = false;
+        bool restrict_to_selected_nodes_ = true;
+        bool preserve_restored_render_state_ = false;
 
         static constexpr float DEPTH_MIN = 0.01f;
         static constexpr float DEPTH_MAX = 1000.0f;
-        static constexpr float DEFAULT_DEPTH_FAR = 5.3f;
+        static constexpr float DEFAULT_DEPTH_FAR = 6.0f;
         static constexpr float DEFAULT_FRUSTUM_HALF_WIDTH = 1.35f;
 
         void applySelectionFilterSettings(const ToolContext& ctx) const;

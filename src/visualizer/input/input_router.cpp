@@ -44,6 +44,15 @@ namespace lfs::vis::input {
         ++pressed_mouse_buttons_;
 
         if (state_.pointer_capture == InputTarget::None) {
+            if (auto* gui = services().guiOrNull()) {
+                const auto hit = gui->hitTestPointer(x, y);
+                if (hit.blocks_pointer || hit.blocks_mouse_button) {
+                    state_.pointer_capture = InputTarget::Gui;
+                    if (hit.takes_keyboard_focus)
+                        state_.keyboard_focus = InputTarget::Gui;
+                    return;
+                }
+            }
             state_.pointer_capture = hoverTarget(x, y);
         }
 
@@ -63,14 +72,22 @@ namespace lfs::vis::input {
     }
 
     void InputRouter::endMouseButton(const int action) {
+        endMouseButton(action, -1.0, -1.0);
+    }
+
+    void InputRouter::endMouseButton(const int action, const double x, const double y) {
         if (action != ACTION_RELEASE) {
             return;
         }
 
+        const bool unmatched_release = pressed_mouse_buttons_ == 0;
         pressed_mouse_buttons_ = std::max(pressed_mouse_buttons_ - 1, 0);
         if (pressed_mouse_buttons_ == 0) {
             state_.pointer_capture = InputTarget::None;
         }
+        if (unmatched_release && keyboardFocus() == InputTarget::None &&
+            x >= 0.0 && y >= 0.0 && hoverTarget(x, y) == InputTarget::Viewport)
+            focusViewportKeyboard();
     }
 
     void InputRouter::syncPressedMouseButtons(const bool any_buttons_pressed) {
@@ -133,10 +150,6 @@ namespace lfs::vis::input {
 
     bool InputRouter::isViewportKeyboardFocused() const {
         return keyboardFocus() == InputTarget::Viewport;
-    }
-
-    bool InputRouter::isGuiKeyboardFocused() const {
-        return keyboardFocus() == InputTarget::Gui;
     }
 
     bool InputRouter::isTextInputActive() const {

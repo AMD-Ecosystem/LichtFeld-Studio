@@ -2,8 +2,16 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/assert.hpp"
+#include "core/cuda_error.hpp"
 #include "densification_kernels.hpp"
+#include "lfs/cuda_scratch.hpp"
+#include "lfs/training/screen_share.cuh"
+#include <algorithm>
 #include <cub/cub.cuh>
+#include <limits>
+
+#include "kernel_stream.hpp"
 
 namespace lfs::training::kernels {
 
@@ -30,6 +38,11 @@ namespace lfs::training::kernels {
      */
     __device__ inline void quat_to_rotmat(const float* q, float* R) {
         float w = q[0], x = q[1], y = q[2], z = q[3];
+        const float inverse_norm = fminf(rsqrtf(w * w + x * x + y * y + z * z), 1e12f);
+        w *= inverse_norm;
+        x *= inverse_norm;
+        y *= inverse_norm;
+        z *= inverse_norm;
 
         // R = [[1-2(y²+z²), 2(xy-wz), 2(xz+wy)],
         //      [2(xy+wz), 1-2(x²+z²), 2(yz-wx)],
@@ -61,591 +74,9 @@ namespace lfs::training::kernels {
     // Duplicate Gaussians Kernels (Split into two to avoid warp divergence)
     // ============================================================================
 
-    // Kernel 1: Copy all N Gaussians (fully coalesced, no divergence)
-    __global__ void duplicate_copy_kernel(
-        const float* __restrict__ positions_in,
-        const float* __restrict__ rotations_in,
-        const float* __restrict__ scales_in,
-        const float* __restrict__ sh0_in,
-        const float* __restrict__ shN_in,
-        const float* __restrict__ opacities_in,
-        float* __restrict__ positions_out,
-        float* __restrict__ rotations_out,
-        float* __restrict__ scales_out,
-        float* __restrict__ sh0_out,
-        float* __restrict__ shN_out,
-        float* __restrict__ opacities_out,
-        int N,
-        int shN_dim) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= N)
-            return;
-
-        // Sequential copy (src_idx == dst_idx)
-        // Use vectorized loads for positions (float3)
-        const float3 pos = make_float3(
-            positions_in[idx * 3 + 0],
-            positions_in[idx * 3 + 1],
-            positions_in[idx * 3 + 2]);
-        positions_out[idx * 3 + 0] = pos.x;
-        positions_out[idx * 3 + 1] = pos.y;
-        positions_out[idx * 3 + 2] = pos.z;
-
-        // Use vectorized loads for rotations (float4)
-        const float4 rot = make_float4(
-            rotations_in[idx * 4 + 0],
-            rotations_in[idx * 4 + 1],
-            rotations_in[idx * 4 + 2],
-            rotations_in[idx * 4 + 3]);
-        rotations_out[idx * 4 + 0] = rot.x;
-        rotations_out[idx * 4 + 1] = rot.y;
-        rotations_out[idx * 4 + 2] = rot.z;
-        rotations_out[idx * 4 + 3] = rot.w;
-
-        // Use vectorized loads for scales (float3)
-        const float3 scale = make_float3(
-            scales_in[idx * 3 + 0],
-            scales_in[idx * 3 + 1],
-            scales_in[idx * 3 + 2]);
-        scales_out[idx * 3 + 0] = scale.x;
-        scales_out[idx * 3 + 1] = scale.y;
-        scales_out[idx * 3 + 2] = scale.z;
-
-        // Copy sh0 (3 elements) - use float3
-        const float3 sh0 = make_float3(
-            sh0_in[idx * 3 + 0],
-            sh0_in[idx * 3 + 1],
-            sh0_in[idx * 3 + 2]);
-        sh0_out[idx * 3 + 0] = sh0.x;
-        sh0_out[idx * 3 + 1] = sh0.y;
-        sh0_out[idx * 3 + 2] = sh0.z;
-
-        // Copy shN coefficients with vectorized loads (float4)
-        const float* shN_src = shN_in + idx * shN_dim;
-        float* shN_dst = shN_out + idx * shN_dim;
-
-        // Process in chunks of 4 (most efficient for SH degree 3: 45 elements)
-        int i = 0;
-        for (; i + 4 <= shN_dim; i += 4) {
-            float4 sh_val = *reinterpret_cast<const float4*>(shN_src + i);
-            *reinterpret_cast<float4*>(shN_dst + i) = sh_val;
-        }
-        // Handle remainder
-        for (; i < shN_dim; ++i) {
-            shN_dst[i] = shN_src[i];
-        }
-
-        // Copy opacity (1 element)
-        opacities_out[idx] = opacities_in[idx];
-    }
-
-    // Kernel 2: Gather from selected indices (scattered reads, but no divergence)
-    __global__ void duplicate_gather_kernel(
-        const float* __restrict__ positions_in,
-        const float* __restrict__ rotations_in,
-        const float* __restrict__ scales_in,
-        const float* __restrict__ sh0_in,
-        const float* __restrict__ shN_in,
-        const float* __restrict__ opacities_in,
-        float* __restrict__ positions_out,
-        float* __restrict__ rotations_out,
-        float* __restrict__ scales_out,
-        float* __restrict__ sh0_out,
-        float* __restrict__ shN_out,
-        float* __restrict__ opacities_out,
-        const int64_t* __restrict__ selected_indices,
-        int N,
-        int num_selected,
-        int shN_dim) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= num_selected)
-            return;
-
-        // Gather from selected indices
-        int src_idx = selected_indices[idx];
-        int dst_idx = N + idx; // Append after first N elements
-
-        // Use vectorized loads for positions (float3)
-        const float3 pos = make_float3(
-            positions_in[src_idx * 3 + 0],
-            positions_in[src_idx * 3 + 1],
-            positions_in[src_idx * 3 + 2]);
-        positions_out[dst_idx * 3 + 0] = pos.x;
-        positions_out[dst_idx * 3 + 1] = pos.y;
-        positions_out[dst_idx * 3 + 2] = pos.z;
-
-        // Use vectorized loads for rotations (float4)
-        const float4 rot = make_float4(
-            rotations_in[src_idx * 4 + 0],
-            rotations_in[src_idx * 4 + 1],
-            rotations_in[src_idx * 4 + 2],
-            rotations_in[src_idx * 4 + 3]);
-        rotations_out[dst_idx * 4 + 0] = rot.x;
-        rotations_out[dst_idx * 4 + 1] = rot.y;
-        rotations_out[dst_idx * 4 + 2] = rot.z;
-        rotations_out[dst_idx * 4 + 3] = rot.w;
-
-        // Use vectorized loads for scales (float3)
-        const float3 scale = make_float3(
-            scales_in[src_idx * 3 + 0],
-            scales_in[src_idx * 3 + 1],
-            scales_in[src_idx * 3 + 2]);
-        scales_out[dst_idx * 3 + 0] = scale.x;
-        scales_out[dst_idx * 3 + 1] = scale.y;
-        scales_out[dst_idx * 3 + 2] = scale.z;
-
-        // Copy sh0 (3 elements) - use float3
-        const float3 sh0 = make_float3(
-            sh0_in[src_idx * 3 + 0],
-            sh0_in[src_idx * 3 + 1],
-            sh0_in[src_idx * 3 + 2]);
-        sh0_out[dst_idx * 3 + 0] = sh0.x;
-        sh0_out[dst_idx * 3 + 1] = sh0.y;
-        sh0_out[dst_idx * 3 + 2] = sh0.z;
-
-        // Copy shN coefficients with vectorized loads (float4)
-        const float* shN_src = shN_in + src_idx * shN_dim;
-        float* shN_dst = shN_out + dst_idx * shN_dim;
-
-        // Process in chunks of 4 (most efficient for SH degree 3: 45 elements)
-        int i = 0;
-        for (; i + 4 <= shN_dim; i += 4) {
-            float4 sh_val = *reinterpret_cast<const float4*>(shN_src + i);
-            *reinterpret_cast<float4*>(shN_dst + i) = sh_val;
-        }
-        // Handle remainder
-        for (; i < shN_dim; ++i) {
-            shN_dst[i] = shN_src[i];
-        }
-
-        // Copy opacity (1 element)
-        opacities_out[dst_idx] = opacities_in[src_idx];
-    }
-
-    // ============================================================================
-    // Split Gaussians Kernel
-    // ============================================================================
-
-    __global__ void split_gaussians_keep_kernel(
-        const float* __restrict__ positions_in,
-        const float* __restrict__ rotations_in,
-        const float* __restrict__ scales_in,
-        const float* __restrict__ sh0_in,
-        const float* __restrict__ shN_in,
-        const float* __restrict__ opacities_in,
-        float* __restrict__ positions_out,
-        float* __restrict__ rotations_out,
-        float* __restrict__ scales_out,
-        float* __restrict__ sh0_out,
-        float* __restrict__ shN_out,
-        float* __restrict__ opacities_out,
-        const int64_t* __restrict__ keep_indices,
-        int num_keep,
-        int shN_dim) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if (idx >= num_keep)
-            return;
-
-        int src_idx = keep_indices[idx];
-
-        // Copy all parameters for kept Gaussians
-        positions_out[idx * 3 + 0] = positions_in[src_idx * 3 + 0];
-        positions_out[idx * 3 + 1] = positions_in[src_idx * 3 + 1];
-        positions_out[idx * 3 + 2] = positions_in[src_idx * 3 + 2];
-
-        rotations_out[idx * 4 + 0] = rotations_in[src_idx * 4 + 0];
-        rotations_out[idx * 4 + 1] = rotations_in[src_idx * 4 + 1];
-        rotations_out[idx * 4 + 2] = rotations_in[src_idx * 4 + 2];
-        rotations_out[idx * 4 + 3] = rotations_in[src_idx * 4 + 3];
-
-        scales_out[idx * 3 + 0] = scales_in[src_idx * 3 + 0];
-        scales_out[idx * 3 + 1] = scales_in[src_idx * 3 + 1];
-        scales_out[idx * 3 + 2] = scales_in[src_idx * 3 + 2];
-
-        // Copy sh0 (3 dims) and shN (shN_dim dims) separately
-        sh0_out[idx * 3 + 0] = sh0_in[src_idx * 3 + 0];
-        sh0_out[idx * 3 + 1] = sh0_in[src_idx * 3 + 1];
-        sh0_out[idx * 3 + 2] = sh0_in[src_idx * 3 + 2];
-
-        for (int i = 0; i < shN_dim; ++i) {
-            shN_out[idx * shN_dim + i] = shN_in[src_idx * shN_dim + i];
-        }
-
-        opacities_out[idx] = opacities_in[src_idx];
-    }
-
-    __global__ void split_gaussians_split_kernel(
-        const float* __restrict__ positions_in,
-        const float* __restrict__ rotations_in,
-        const float* __restrict__ scales_in,
-        const float* __restrict__ sh0_in,
-        const float* __restrict__ shN_in,
-        const float* __restrict__ opacities_in,
-        float* __restrict__ positions_out,
-        float* __restrict__ rotations_out,
-        float* __restrict__ scales_out,
-        float* __restrict__ sh0_out,
-        float* __restrict__ shN_out,
-        float* __restrict__ opacities_out,
-        const int64_t* __restrict__ split_indices,
-        const float* __restrict__ random_noise, // Shape: [2, num_split, 3]
-        int num_keep,
-        int num_split,
-        int shN_dim,
-        bool revised_opacity) {
-        int split_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if (split_idx >= num_split)
-            return;
-
-        int src_idx = split_indices[split_idx];
-
-        // Load input data
-        float pos[3], quat[4], scale[3], opacity;
-        pos[0] = positions_in[src_idx * 3 + 0];
-        pos[1] = positions_in[src_idx * 3 + 1];
-        pos[2] = positions_in[src_idx * 3 + 2];
-
-        quat[0] = rotations_in[src_idx * 4 + 0];
-        quat[1] = rotations_in[src_idx * 4 + 1];
-        quat[2] = rotations_in[src_idx * 4 + 2];
-        quat[3] = rotations_in[src_idx * 4 + 3];
-
-        scale[0] = scales_in[src_idx * 3 + 0];
-        scale[1] = scales_in[src_idx * 3 + 1];
-        scale[2] = scales_in[src_idx * 3 + 2];
-
-        opacity = opacities_in[src_idx];
-
-        // Convert quaternion to rotation matrix
-        float R[9];
-        quat_to_rotmat(quat, R);
-
-        // New scale = log(exp(old_scale) / 1.6)
-        float new_scale[3];
-        new_scale[0] = scale[0] - logf(1.6f);
-        new_scale[1] = scale[1] - logf(1.6f);
-        new_scale[2] = scale[2] - logf(1.6f);
-
-        // Adjust opacity if revised formula
-        float new_opacity = opacity;
-        if (revised_opacity) {
-            float sig = sigmoid(opacity);
-            float one_minus_sig = 1.0f - sig;
-            float adjusted = 1.0f - sqrtf(one_minus_sig);
-            new_opacity = inverse_sigmoid(adjusted);
-        }
-
-        // Process both copies with DIFFERENT random noise
-        // Output ordering: [all_copy0, all_copy1] to match CPU implementation
-        for (int split_copy = 0; split_copy < 2; ++split_copy) {
-            // Output index: first all copy0, then all copy1
-            int out_idx = num_keep + split_copy * num_split + split_idx;
-
-            // Get random noise for this copy: random_noise[split_copy, split_idx, :]
-            // Shape is [2, num_split, 3], so index is split_copy * num_split * 3 + split_idx * 3
-            float noise[3];
-            int noise_offset = split_copy * num_split * 3 + split_idx * 3;
-            noise[0] = random_noise[noise_offset + 0];
-            noise[1] = random_noise[noise_offset + 1];
-            noise[2] = random_noise[noise_offset + 2];
-
-            // Compute offset = R * (exp(S) * noise)
-            float scaled_noise[3];
-            scaled_noise[0] = expf(scale[0]) * noise[0];
-            scaled_noise[1] = expf(scale[1]) * noise[1];
-            scaled_noise[2] = expf(scale[2]) * noise[2];
-
-            float offset[3];
-            matvec_3x3(R, scaled_noise, offset);
-
-            // Position: original + offset (each copy has different offset due to different noise)
-            positions_out[out_idx * 3 + 0] = pos[0] + offset[0];
-            positions_out[out_idx * 3 + 1] = pos[1] + offset[1];
-            positions_out[out_idx * 3 + 2] = pos[2] + offset[2];
-
-            // Rotation: unchanged
-            rotations_out[out_idx * 4 + 0] = quat[0];
-            rotations_out[out_idx * 4 + 1] = quat[1];
-            rotations_out[out_idx * 4 + 2] = quat[2];
-            rotations_out[out_idx * 4 + 3] = quat[3];
-
-            // Scale: divided by 1.6
-            scales_out[out_idx * 3 + 0] = new_scale[0];
-            scales_out[out_idx * 3 + 1] = new_scale[1];
-            scales_out[out_idx * 3 + 2] = new_scale[2];
-
-            // SH: copy sh0 (3 dims) and shN (shN_dim dims) separately
-            sh0_out[out_idx * 3 + 0] = sh0_in[src_idx * 3 + 0];
-            sh0_out[out_idx * 3 + 1] = sh0_in[src_idx * 3 + 1];
-            sh0_out[out_idx * 3 + 2] = sh0_in[src_idx * 3 + 2];
-
-            for (int i = 0; i < shN_dim; ++i) {
-                shN_out[out_idx * shN_dim + i] = shN_in[src_idx * shN_dim + i];
-            }
-
-            // Opacity: adjusted if revised
-            opacities_out[out_idx] = new_opacity;
-        }
-    }
-
     // ============================================================================
     // Launch functions
     // ============================================================================
-
-    void launch_duplicate_gaussians(
-        const float* positions_in,
-        const float* rotations_in,
-        const float* scales_in,
-        const float* sh0_in,
-        const float* shN_in,
-        const float* opacities_in,
-        float* positions_out,
-        float* rotations_out,
-        float* scales_out,
-        float* sh0_out,
-        float* shN_out,
-        float* opacities_out,
-        const int64_t* selected_indices,
-        int N,
-        int num_selected,
-        int shN_dim,
-        cudaStream_t stream) {
-        // Step 1: Copy all N Gaussians using cudaMemcpyAsync (DMA-accelerated, like LibTorch's cat)
-        if (N > 0) {
-            cudaMemcpyAsync(positions_out, positions_in, N * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(rotations_out, rotations_in, N * 4 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(scales_out, scales_in, N * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(sh0_out, sh0_in, N * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(shN_out, shN_in, N * shN_dim * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(opacities_out, opacities_in, N * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-        }
-
-        // Step 2: Gather from selected indices using kernel (scattered reads)
-        if (num_selected > 0) {
-            const int block_size = 256;
-            const int num_blocks_gather = (num_selected + block_size - 1) / block_size;
-            duplicate_gather_kernel<<<num_blocks_gather, block_size, 0, stream>>>(
-                positions_in, rotations_in, scales_in, sh0_in, shN_in, opacities_in,
-                positions_out, rotations_out, scales_out, sh0_out, shN_out, opacities_out,
-                selected_indices, N, num_selected, shN_dim);
-        }
-    }
-
-    void launch_split_gaussians(
-        const float* positions_in,
-        const float* rotations_in,
-        const float* scales_in,
-        const float* sh0_in,
-        const float* shN_in,
-        const float* opacities_in,
-        float* positions_out,
-        float* rotations_out,
-        float* scales_out,
-        float* sh0_out,
-        float* shN_out,
-        float* opacities_out,
-        const int64_t* split_indices,
-        const int64_t* keep_indices,
-        const float* random_noise,
-        int N,
-        int num_split,
-        int num_keep,
-        int shN_dim,
-        bool revised_opacity,
-        cudaStream_t stream) {
-        const int block_size = 256;
-
-        // Kernel 1: Copy kept Gaussians
-        if (num_keep > 0) {
-            const int num_blocks_keep = (num_keep + block_size - 1) / block_size;
-            split_gaussians_keep_kernel<<<num_blocks_keep, block_size, 0, stream>>>(
-                positions_in, rotations_in, scales_in, sh0_in, shN_in, opacities_in,
-                positions_out, rotations_out, scales_out, sh0_out, shN_out, opacities_out,
-                keep_indices, num_keep, shN_dim);
-        }
-
-        // Kernel 2: Split selected Gaussians
-        if (num_split > 0) {
-            const int num_blocks_split = (num_split + block_size - 1) / block_size;
-            split_gaussians_split_kernel<<<num_blocks_split, block_size, 0, stream>>>(
-                positions_in, rotations_in, scales_in, sh0_in, shN_in, opacities_in,
-                positions_out, rotations_out, scales_out, sh0_out, shN_out, opacities_out,
-                split_indices, random_noise,
-                num_keep, num_split, shN_dim, revised_opacity);
-        }
-    }
-
-    // ============================================================================
-    // In-place Split Kernel
-    // ============================================================================
-
-    /**
-     * In-place split kernel: modifies original positions for first split,
-     * writes second split to separate output arrays.
-     */
-    __global__ void split_gaussians_inplace_kernel(
-        float* __restrict__ positions,        // [N, 3] - modified in-place
-        float* __restrict__ rotations,        // [N, 4] - unchanged
-        float* __restrict__ scales,           // [N, 3] - modified in-place
-        const float* __restrict__ sh0,        // [N, 3] - read only
-        const float* __restrict__ shN,        // [N, shN_dim] - read only
-        float* __restrict__ opacities,        // [N, 1] - modified if revised
-        float* __restrict__ second_positions, // [num_split, 3]
-        float* __restrict__ second_rotations, // [num_split, 4]
-        float* __restrict__ second_scales,    // [num_split, 3]
-        float* __restrict__ second_sh0,       // [num_split, 3]
-        float* __restrict__ second_shN,       // [num_split, shN_dim]
-        float* __restrict__ second_opacities, // [num_split, 1]
-        const int64_t* __restrict__ split_indices,
-        const float* __restrict__ random_noise, // [2, num_split, 3]
-        int num_split,
-        int shN_dim,
-        bool revised_opacity) {
-        int split_idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (split_idx >= num_split)
-            return;
-
-        int src_idx = split_indices[split_idx];
-
-        // Load original data
-        float pos[3], quat[4], scale[3], opacity;
-        pos[0] = positions[src_idx * 3 + 0];
-        pos[1] = positions[src_idx * 3 + 1];
-        pos[2] = positions[src_idx * 3 + 2];
-
-        quat[0] = rotations[src_idx * 4 + 0];
-        quat[1] = rotations[src_idx * 4 + 1];
-        quat[2] = rotations[src_idx * 4 + 2];
-        quat[3] = rotations[src_idx * 4 + 3];
-
-        scale[0] = scales[src_idx * 3 + 0];
-        scale[1] = scales[src_idx * 3 + 1];
-        scale[2] = scales[src_idx * 3 + 2];
-
-        opacity = opacities[src_idx];
-
-        // Convert quaternion to rotation matrix
-        float R[9];
-        quat_to_rotmat(quat, R);
-
-        // New scale = log(exp(old_scale) / 1.6)
-        float new_scale[3];
-        new_scale[0] = scale[0] - logf(1.6f);
-        new_scale[1] = scale[1] - logf(1.6f);
-        new_scale[2] = scale[2] - logf(1.6f);
-
-        // Adjust opacity if revised formula
-        float new_opacity = opacity;
-        if (revised_opacity) {
-            float sig = sigmoid(opacity);
-            float one_minus_sig = 1.0f - sig;
-            float adjusted = 1.0f - sqrtf(one_minus_sig);
-            new_opacity = inverse_sigmoid(adjusted);
-        }
-
-        // Compute offset for first split (copy 0)
-        float noise0[3];
-        int noise_offset0 = 0 * num_split * 3 + split_idx * 3; // copy 0
-        noise0[0] = random_noise[noise_offset0 + 0];
-        noise0[1] = random_noise[noise_offset0 + 1];
-        noise0[2] = random_noise[noise_offset0 + 2];
-
-        float scaled_noise0[3];
-        scaled_noise0[0] = expf(scale[0]) * noise0[0];
-        scaled_noise0[1] = expf(scale[1]) * noise0[1];
-        scaled_noise0[2] = expf(scale[2]) * noise0[2];
-
-        float offset0[3];
-        matvec_3x3(R, scaled_noise0, offset0);
-
-        // Write first split result back to original position (in-place)
-        positions[src_idx * 3 + 0] = pos[0] + offset0[0];
-        positions[src_idx * 3 + 1] = pos[1] + offset0[1];
-        positions[src_idx * 3 + 2] = pos[2] + offset0[2];
-
-        scales[src_idx * 3 + 0] = new_scale[0];
-        scales[src_idx * 3 + 1] = new_scale[1];
-        scales[src_idx * 3 + 2] = new_scale[2];
-
-        if (revised_opacity) {
-            opacities[src_idx] = new_opacity;
-        }
-
-        // Compute offset for second split (copy 1)
-        float noise1[3];
-        int noise_offset1 = 1 * num_split * 3 + split_idx * 3; // copy 1
-        noise1[0] = random_noise[noise_offset1 + 0];
-        noise1[1] = random_noise[noise_offset1 + 1];
-        noise1[2] = random_noise[noise_offset1 + 2];
-
-        float scaled_noise1[3];
-        scaled_noise1[0] = expf(scale[0]) * noise1[0];
-        scaled_noise1[1] = expf(scale[1]) * noise1[1];
-        scaled_noise1[2] = expf(scale[2]) * noise1[2];
-
-        float offset1[3];
-        matvec_3x3(R, scaled_noise1, offset1);
-
-        // Write second split result to output arrays
-        second_positions[split_idx * 3 + 0] = pos[0] + offset1[0];
-        second_positions[split_idx * 3 + 1] = pos[1] + offset1[1];
-        second_positions[split_idx * 3 + 2] = pos[2] + offset1[2];
-
-        second_rotations[split_idx * 4 + 0] = quat[0];
-        second_rotations[split_idx * 4 + 1] = quat[1];
-        second_rotations[split_idx * 4 + 2] = quat[2];
-        second_rotations[split_idx * 4 + 3] = quat[3];
-
-        second_scales[split_idx * 3 + 0] = new_scale[0];
-        second_scales[split_idx * 3 + 1] = new_scale[1];
-        second_scales[split_idx * 3 + 2] = new_scale[2];
-
-        // Copy SH coefficients
-        second_sh0[split_idx * 3 + 0] = sh0[src_idx * 3 + 0];
-        second_sh0[split_idx * 3 + 1] = sh0[src_idx * 3 + 1];
-        second_sh0[split_idx * 3 + 2] = sh0[src_idx * 3 + 2];
-
-        for (int i = 0; i < shN_dim; ++i) {
-            second_shN[split_idx * shN_dim + i] = shN[src_idx * shN_dim + i];
-        }
-
-        second_opacities[split_idx] = new_opacity;
-    }
-
-    void launch_split_gaussians_inplace(
-        float* positions,
-        float* rotations,
-        float* scales,
-        const float* sh0,
-        const float* shN,
-        float* opacities,
-        float* second_positions,
-        float* second_rotations,
-        float* second_scales,
-        float* second_sh0,
-        float* second_shN,
-        float* second_opacities,
-        const int64_t* split_indices,
-        const float* random_noise,
-        int num_split,
-        int shN_dim,
-        bool revised_opacity,
-        cudaStream_t stream) {
-        if (num_split == 0)
-            return;
-
-        const int block_size = 256;
-        const int num_blocks = (num_split + block_size - 1) / block_size;
-
-        split_gaussians_inplace_kernel<<<num_blocks, block_size, 0, stream>>>(
-            positions, rotations, scales, sh0, shN, opacities,
-            second_positions, second_rotations, second_scales,
-            second_sh0, second_shN, second_opacities,
-            split_indices, random_noise,
-            num_split, shN_dim, revised_opacity);
-    }
 
     // ============================================================================
     // In-place Long-Axis-Split Kernel
@@ -672,7 +103,7 @@ namespace lfs::training::kernels {
         float* __restrict__ scales,           // [N, 3] - modified in-place
         const float* __restrict__ sh0,        // [N, 3] - read only
         const float* __restrict__ shN,        // [N, shN_dim] - read only
-        float* __restrict__ opacities,        // [N, 1] - modified if revised
+        float* __restrict__ opacities,        // [N, 1] - modified in-place
         float* __restrict__ second_positions, // [num_split, 3]
         float* __restrict__ second_rotations, // [num_split, 4]
         float* __restrict__ second_scales,    // [num_split, 3]
@@ -786,6 +217,7 @@ namespace lfs::training::kernels {
         int num_split,
         int shN_dim,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         if (num_split == 0)
             return;
 
@@ -797,6 +229,541 @@ namespace lfs::training::kernels {
             second_positions, second_rotations, second_scales,
             second_sh0, second_shN, second_opacities,
             split_indices, num_split, shN_dim);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.long_axis_split_inplace");
+    }
+
+    __global__ void fill_free_slots_fused_kernel(
+        const int64_t* __restrict__ target_indices,
+        size_t n_fill,
+        const float* __restrict__ src_means,
+        const float* __restrict__ src_rotations,
+        const float* __restrict__ src_scales,
+        const float* __restrict__ src_sh0,
+        const float* __restrict__ src_opacities,
+        float* __restrict__ dst_means,
+        float* __restrict__ dst_rotations,
+        float* __restrict__ dst_scales,
+        float* __restrict__ dst_sh0,
+        float* __restrict__ dst_opacities,
+        int opacity_dim,
+        float* const* __restrict__ adam_scale_ptrs,
+        int n_adam_scales,
+        bool* __restrict__ free_mask,
+        size_t N) {
+
+        const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= n_fill)
+            return;
+
+        const int64_t t = target_indices[i];
+        if (t < 0 || static_cast<size_t>(t) >= N)
+            return;
+        const size_t dst = static_cast<size_t>(t);
+
+        dst_means[dst * 3 + 0] = src_means[i * 3 + 0];
+        dst_means[dst * 3 + 1] = src_means[i * 3 + 1];
+        dst_means[dst * 3 + 2] = src_means[i * 3 + 2];
+
+        dst_rotations[dst * 4 + 0] = src_rotations[i * 4 + 0];
+        dst_rotations[dst * 4 + 1] = src_rotations[i * 4 + 1];
+        dst_rotations[dst * 4 + 2] = src_rotations[i * 4 + 2];
+        dst_rotations[dst * 4 + 3] = src_rotations[i * 4 + 3];
+
+        dst_scales[dst * 3 + 0] = src_scales[i * 3 + 0];
+        dst_scales[dst * 3 + 1] = src_scales[i * 3 + 1];
+        dst_scales[dst * 3 + 2] = src_scales[i * 3 + 2];
+
+        // sh0 is 3 floats/row whether layout is [N,3] or [N,1,3]
+        dst_sh0[dst * 3 + 0] = src_sh0[i * 3 + 0];
+        dst_sh0[dst * 3 + 1] = src_sh0[i * 3 + 1];
+        dst_sh0[dst * 3 + 2] = src_sh0[i * 3 + 2];
+
+        if (opacity_dim == 1) {
+            dst_opacities[dst] = src_opacities[i]; // [N,1] still one float per row when col=1
+        } else {
+            dst_opacities[dst] = src_opacities[i];
+        }
+
+        for (int a = 0; a < n_adam_scales; ++a) {
+            float* scales = adam_scale_ptrs[a];
+            if (scales != nullptr) {
+                scales[dst] = 0.0f;
+            }
+        }
+
+        if (free_mask != nullptr) {
+            free_mask[dst] = false;
+        }
+    }
+
+    void launch_fill_free_slots_fused(
+        const int64_t* target_indices,
+        size_t n_fill,
+        const float* src_means,
+        const float* src_rotations,
+        const float* src_scales,
+        const float* src_sh0,
+        const float* src_opacities,
+        float* dst_means,
+        float* dst_rotations,
+        float* dst_scales,
+        float* dst_sh0,
+        float* dst_opacities,
+        int opacity_dim,
+        float* const* adam_scale_ptrs,
+        int n_adam_scales,
+        bool* free_mask,
+        size_t N,
+        cudaStream_t stream) {
+
+        stream = resolve_stream(stream);
+        if (n_fill == 0)
+            return;
+
+        // Copy pointer table to device (tiny; stack H2D once per launch).
+        float** d_adam = nullptr;
+        if (n_adam_scales > 0 && adam_scale_ptrs != nullptr) {
+            LFS_CUDA_CHECK_MSG(
+                cudaMallocAsync(reinterpret_cast<void**>(&d_adam),
+                                sizeof(float*) * static_cast<size_t>(n_adam_scales), stream),
+                "fill_free_slots adam ptr table");
+            LFS_CUDA_CHECK_MSG(
+                cudaMemcpyAsync(d_adam, adam_scale_ptrs,
+                                sizeof(float*) * static_cast<size_t>(n_adam_scales),
+                                cudaMemcpyHostToDevice, stream),
+                "fill_free_slots adam ptr H2D");
+        }
+
+        const int block = 256;
+        const int grid = static_cast<int>((n_fill + block - 1) / block);
+        fill_free_slots_fused_kernel<<<grid, block, 0, stream>>>(
+            target_indices, n_fill,
+            src_means, src_rotations, src_scales, src_sh0, src_opacities,
+            dst_means, dst_rotations, dst_scales, dst_sh0, dst_opacities,
+            opacity_dim, d_adam, n_adam_scales, free_mask, N);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.fill_free_slots_fused");
+
+        if (d_adam != nullptr) {
+            LFS_CUDA_CHECK_MSG(cudaFreeAsync(d_adam, stream), "fill_free_slots free adam ptrs");
+        }
+    }
+
+    __global__ void zero_adam_scales_kernel(
+        const int64_t* __restrict__ indices,
+        size_t n_indices,
+        float* const* __restrict__ adam_scale_ptrs,
+        int n_adam_scales,
+        size_t N) {
+
+        const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= n_indices)
+            return;
+        const int64_t t = indices[i];
+        if (t < 0 || static_cast<size_t>(t) >= N)
+            return;
+        const size_t dst = static_cast<size_t>(t);
+        for (int a = 0; a < n_adam_scales; ++a) {
+            float* scales = adam_scale_ptrs[a];
+            if (scales != nullptr) {
+                scales[dst] = 0.0f;
+            }
+        }
+    }
+
+    void launch_zero_adam_scales_at_indices(
+        const int64_t* indices,
+        size_t n_indices,
+        float* const* adam_scale_ptrs,
+        int n_adam_scales,
+        size_t N,
+        cudaStream_t stream) {
+
+        stream = resolve_stream(stream);
+        if (n_indices == 0 || n_adam_scales <= 0)
+            return;
+
+        float** d_adam = nullptr;
+        LFS_CUDA_CHECK_MSG(
+            cudaMallocAsync(reinterpret_cast<void**>(&d_adam),
+                            sizeof(float*) * static_cast<size_t>(n_adam_scales), stream),
+            "zero_adam adam ptr table");
+        LFS_CUDA_CHECK_MSG(
+            cudaMemcpyAsync(d_adam, adam_scale_ptrs,
+                            sizeof(float*) * static_cast<size_t>(n_adam_scales),
+                            cudaMemcpyHostToDevice, stream),
+            "zero_adam adam ptr H2D");
+
+        const int block = 256;
+        const int grid = static_cast<int>((n_indices + block - 1) / block);
+        zero_adam_scales_kernel<<<grid, block, 0, stream>>>(
+            indices, n_indices, d_adam, n_adam_scales, N);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.zero_adam_scales");
+        LFS_CUDA_CHECK_MSG(cudaFreeAsync(d_adam, stream), "zero_adam free ptrs");
+    }
+
+    __global__ void packed_refine_counts_kernel(
+        const bool* __restrict__ bool0,
+        size_t n_bool0,
+        const bool* __restrict__ bool1,
+        size_t n_bool1,
+        const float* __restrict__ float0,
+        size_t n_float0,
+        const float* __restrict__ float1,
+        size_t n_float1,
+        int64_t* __restrict__ out_counts4) {
+
+        // One block does all four reductions via shared atomics / CUB block reduce.
+        typedef cub::BlockReduce<int64_t, 256> BlockReduce;
+        __shared__ typename BlockReduce::TempStorage temp;
+
+        const int tid = threadIdx.x;
+        int64_t local0 = 0, local1 = 0, local2 = 0, local3 = 0;
+
+        if (bool0 != nullptr) {
+            for (size_t i = tid; i < n_bool0; i += blockDim.x)
+                local0 += bool0[i] ? 1 : 0;
+        }
+        if (bool1 != nullptr) {
+            for (size_t i = tid; i < n_bool1; i += blockDim.x)
+                local1 += bool1[i] ? 1 : 0;
+        }
+        if (float0 != nullptr) {
+            for (size_t i = tid; i < n_float0; i += blockDim.x)
+                local2 += (float0[i] > 0.0f) ? 1 : 0;
+        }
+        if (float1 != nullptr) {
+            for (size_t i = tid; i < n_float1; i += blockDim.x)
+                local3 += (float1[i] > 0.0f) ? 1 : 0;
+        }
+
+        const int64_t sum0 = BlockReduce(temp).Sum(local0);
+        __syncthreads();
+        const int64_t sum1 = BlockReduce(temp).Sum(local1);
+        __syncthreads();
+        const int64_t sum2 = BlockReduce(temp).Sum(local2);
+        __syncthreads();
+        const int64_t sum3 = BlockReduce(temp).Sum(local3);
+
+        if (tid == 0) {
+            out_counts4[0] = (bool0 != nullptr) ? sum0 : 0;
+            out_counts4[1] = (bool1 != nullptr) ? sum1 : 0;
+            out_counts4[2] = (float0 != nullptr) ? sum2 : 0;
+            out_counts4[3] = (float1 != nullptr) ? sum3 : 0;
+        }
+    }
+
+    void launch_packed_refine_counts(
+        const bool* bool0,
+        size_t n_bool0,
+        const bool* bool1,
+        size_t n_bool1,
+        const float* float0,
+        size_t n_float0,
+        const float* float1,
+        size_t n_float1,
+        int64_t* out_counts4,
+        cudaStream_t stream) {
+
+        stream = resolve_stream(stream);
+        packed_refine_counts_kernel<<<1, 256, 0, stream>>>(
+            bool0, n_bool0, bool1, n_bool1,
+            float0, n_float0, float1, n_float1,
+            out_counts4);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.packed_refine_counts");
+    }
+
+    __global__ void zero_nan_kernel(float* data, size_t n) {
+        const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i < n && isnan(data[i]))
+            data[i] = 0.0f;
+    }
+
+    // Exact order statistic without sorting: three radix passes (11/11/10 bits)
+    // over the float keys, each building a histogram of one digit among the
+    // values that share the digits already fixed. Keys use the same bit
+    // transform as cub::DeviceRadixSort on floats, so the selected element is
+    // the one sorted[k] would return, including NaN and signed-zero ordering.
+    namespace radix_select {
+        constexpr int kBins = 2048;
+        constexpr int kThreads = 256;
+        __host__ __device__ constexpr int digit_shift(const int pass) { return pass == 0 ? 21 : (pass == 1 ? 10 : 0); }
+        __host__ __device__ constexpr int digit_bits(const int pass) { return pass == 2 ? 10 : 11; }
+
+        struct State {
+            unsigned int total;
+            unsigned int rank;
+            unsigned int prefix;
+            float value;
+        };
+
+        __device__ __forceinline__ unsigned int ordered_key(const float v) {
+            const unsigned int bits = __float_as_uint(v);
+            return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        }
+
+        __device__ __forceinline__ float key_value(const unsigned int key) {
+            return __uint_as_float((key & 0x80000000u) ? (key & 0x7fffffffu) : ~key);
+        }
+
+        template <bool kPositiveOnly, int kPass>
+        __global__ void histogram_kernel(const float* __restrict__ values,
+                                         const size_t n,
+                                         State* __restrict__ state,
+                                         unsigned int* __restrict__ hist) {
+            __shared__ unsigned int shared_hist[kBins];
+            for (int b = threadIdx.x; b < kBins; b += blockDim.x) {
+                shared_hist[b] = 0u;
+            }
+            __syncthreads();
+
+            constexpr int shift = digit_shift(kPass);
+            constexpr unsigned int digit_mask = (1u << digit_bits(kPass)) - 1u;
+            constexpr int fixed_shift = shift + digit_bits(kPass);
+            const unsigned int fixed = kPass == 0 ? 0u : state->prefix >> fixed_shift;
+            unsigned int counted = 0u;
+            const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+            for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
+                const float v = values[i];
+                if (kPositiveOnly && !(v > 0.0f)) {
+                    continue;
+                }
+                const unsigned int key = ordered_key(v);
+                if constexpr (kPass > 0) {
+                    if ((key >> fixed_shift) != fixed) {
+                        continue;
+                    }
+                }
+                ++counted;
+                atomicAdd(&shared_hist[(key >> shift) & digit_mask], 1u);
+            }
+            if constexpr (kPass == 0 && kPositiveOnly) {
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    counted += __shfl_down_sync(0xffffffffu, counted, offset);
+                }
+                if ((threadIdx.x & 31) == 0 && counted != 0u) {
+                    atomicAdd(&state->total, counted);
+                }
+            }
+            __syncthreads();
+            for (int b = threadIdx.x; b < kBins; b += blockDim.x) {
+                if (shared_hist[b] != 0u) {
+                    atomicAdd(&hist[b], shared_hist[b]);
+                }
+            }
+        }
+
+        // Scan contiguous groups of bins in parallel. Integer prefix sums keep
+        // the exact rank/tie ordering without any input-sized scratch storage.
+        template <int kPass>
+        __global__ void pick_kernel(const bool positive_only,
+                                    const size_t n,
+                                    State* __restrict__ state,
+                                    unsigned int* __restrict__ hist) {
+            constexpr int bins = 1 << digit_bits(kPass);
+            constexpr int items = bins / kThreads;
+            using Scan = cub::BlockScan<unsigned int, kThreads>;
+            __shared__ typename Scan::TempStorage scan_storage;
+            // Publish an immutable snapshot: the winning thread writes the
+            // global state for the next pass, never the rank being scanned.
+            __shared__ unsigned int rank, prefix;
+            if (threadIdx.x == 0) {
+                if constexpr (kPass == 0) {
+                    if (!positive_only) {
+                        state->total = static_cast<unsigned int>(n);
+                    }
+                    rank = state->total / 2u;
+                    prefix = 0u;
+                } else {
+                    rank = state->rank;
+                    prefix = state->prefix;
+                }
+            }
+            __syncthreads();
+            unsigned int counts[items], below[items];
+#pragma unroll
+            for (int i = 0; i < items; ++i) {
+                counts[i] = hist[threadIdx.x * items + i];
+            }
+            Scan(scan_storage).ExclusiveSum(counts, below);
+            // All histogram loads and state reads must finish before either
+            // buffer is overwritten by the selected lane.
+            __syncthreads();
+            for (int b = threadIdx.x; b < kBins; b += kThreads) {
+                hist[b] = 0u;
+            }
+#pragma unroll
+            for (int i = 0; i < items; ++i) {
+                if (rank >= below[i] && rank - below[i] < counts[i]) {
+                    const unsigned int digit = threadIdx.x * items + i;
+                    const unsigned int selected = prefix | (digit << digit_shift(kPass));
+                    state->prefix = selected;
+                    state->rank = rank - below[i];
+                    if constexpr (kPass == 2) {
+                        state->value = key_value(selected);
+                    }
+                }
+            }
+            if constexpr (kPass == 2) {
+                if (threadIdx.x == 0 && state->total == 0u) {
+                    state->value = 0.0f;
+                }
+            }
+        }
+
+        template <bool kPositiveOnly>
+        void run(const float* values, const size_t n, State* state, unsigned int* hist, cudaStream_t stream) {
+            const int blocks = static_cast<int>(std::clamp<size_t>(
+                (n + static_cast<size_t>(kThreads) * 16 - 1) / (static_cast<size_t>(kThreads) * 16), 1, 512));
+            histogram_kernel<kPositiveOnly, 0><<<blocks, kThreads, 0, stream>>>(values, n, state, hist);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.radix_select.histogram0");
+            pick_kernel<0><<<1, kThreads, 0, stream>>>(kPositiveOnly, n, state, hist);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.radix_select.pick0");
+            histogram_kernel<kPositiveOnly, 1><<<blocks, kThreads, 0, stream>>>(values, n, state, hist);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.radix_select.histogram1");
+            pick_kernel<1><<<1, kThreads, 0, stream>>>(kPositiveOnly, n, state, hist);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.radix_select.pick1");
+            histogram_kernel<kPositiveOnly, 2><<<blocks, kThreads, 0, stream>>>(values, n, state, hist);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.radix_select.histogram2");
+            pick_kernel<2><<<1, kThreads, 0, stream>>>(kPositiveOnly, n, state, hist);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.radix_select.pick2");
+        }
+
+        struct Workspace {
+            cuda_scratch::DeviceBuffer buffer;
+            State* state = nullptr;
+            unsigned int* hist = nullptr;
+
+            explicit Workspace(cudaStream_t stream)
+                : buffer(sizeof(State) + sizeof(unsigned int) * kBins, stream,
+                         "training.radix_select.workspace") {
+                state = buffer.as<State>();
+                hist = reinterpret_cast<unsigned int*>(buffer.as<char>() + sizeof(State));
+                LFS_CUDA_CHECK_MSG(
+                    cudaMemsetAsync(buffer.get(), 0, sizeof(State) + sizeof(unsigned int) * kBins, stream),
+                    "radix select workspace clear");
+            }
+        };
+    } // namespace radix_select
+
+    __global__ void div_by_positive_median_or_zero_kernel(
+        float* data, size_t n, const radix_select::State* median) {
+        const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= n)
+            return;
+        if (median->total == 0u) {
+            data[i] = 0.0f;
+            return;
+        }
+        data[i] /= fmaxf(median->value, 1e-9f);
+    }
+
+    float launch_select_median(const float* values, const size_t n, cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        if (n == 0 || values == nullptr) {
+            return 0.0f;
+        }
+        LFS_ASSERT_MSG(n <= static_cast<size_t>(std::numeric_limits<unsigned int>::max()),
+                       "median selection input exceeds the 32-bit count limit");
+        radix_select::Workspace workspace(stream);
+        radix_select::run<false>(values, n, workspace.state, workspace.hist, stream);
+        radix_select::State result{};
+        LFS_CUDA_CHECK_MSG(
+            cudaMemcpyAsync(&result, workspace.state, sizeof(result), cudaMemcpyDeviceToHost, stream),
+            "median selection readback");
+        LFS_CUDA_CHECK_MSG(cudaStreamSynchronize(stream), "median selection sync");
+        return result.value;
+    }
+
+    void launch_normalize_by_positive_median(float* data, size_t n, cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        if (n == 0 || data == nullptr)
+            return;
+        LFS_ASSERT_MSG(n <= static_cast<size_t>(std::numeric_limits<unsigned int>::max()),
+                       "positive-median input exceeds the 32-bit count limit");
+
+        const int block = 256;
+        const int grid = static_cast<int>((n + block - 1) / block);
+        zero_nan_kernel<<<grid, block, 0, stream>>>(data, n);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.zero_nan");
+
+        radix_select::Workspace workspace(stream);
+        radix_select::run<true>(data, n, workspace.state, workspace.hist, stream);
+        div_by_positive_median_or_zero_kernel<<<grid, block, 0, stream>>>(data, n, workspace.state);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.div_by_median");
+    }
+
+    namespace {
+        __global__ void accumulate_projected_screen_share_kernel(
+            const int32_t* __restrict__ radii, const float* __restrict__ means2d,
+            float* shares, size_t n, uint32_t width, uint32_t height) {
+            const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+            if (i >= n || radii[2 * i] <= 0 || radii[2 * i + 1] <= 0)
+                return;
+            const float x = means2d[2 * i], y = means2d[2 * i + 1];
+            const float rx = radii[2 * i], ry = radii[2 * i + 1];
+            const float dx = fmaxf(0.f, fminf(float(width), x + rx) - fmaxf(0.f, x - rx));
+            const float dy = fmaxf(0.f, fminf(float(height), y + ry) - fmaxf(0.f, y - ry));
+            const float share = (dx / float(width)) * (dy / float(height));
+            // One writer per splat, once per frame on the training stream.
+            // Retain the maximum across views until the strategy resets it.
+            shares[i] = fmaxf(shares[i], share);
+        }
+    } // namespace
+
+    void launch_accumulate_projected_screen_share(
+        const int32_t* radii, const float* means2d,
+        float* shares, size_t n, uint32_t width, uint32_t height, cudaStream_t stream) {
+        if (n == 0 || width == 0 || height == 0)
+            return;
+        accumulate_projected_screen_share_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+            radii, means2d, shares, n, width, height);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.accumulate_projected_screen_share");
+    }
+
+    namespace {
+        __global__ void clip_log_scale_by_screen_share_kernel(
+            float* __restrict__ log_scales,
+            const float* __restrict__ max_share,
+            const bool* __restrict__ frozen_mask,
+            size_t frozen_n,
+            float limit,
+            size_t n) {
+            const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+            if (i >= n)
+                return;
+            if (frozen_mask != nullptr && i < frozen_n && frozen_mask[i])
+                return;
+            const float share = max_share[i];
+            if (!(share > limit))
+                return;
+            const float delta = fminf(logf(share / limit), logf(1.5f));
+            float scale[3] = {
+                log_scales[i * 3 + 0],
+                log_scales[i * 3 + 1],
+                log_scales[i * 3 + 2]};
+            const unsigned int axis = get_max_value_index(scale).x;
+            log_scales[i * 3 + axis] -= delta;
+        }
+    } // namespace
+
+    void launch_clip_log_scale_by_screen_share(
+        float* log_scales,
+        const float* max_share,
+        const bool* frozen_mask,
+        size_t frozen_n,
+        float limit,
+        size_t n,
+        cudaStream_t stream) {
+        LFS_ASSERT_MSG(log_scales != nullptr && max_share != nullptr,
+                       "screen-share clip requires log_scales and max_share");
+        if (n == 0 || !(limit > 0.0f) || !(limit < 1.0f))
+            return;
+        stream = lfs::resolve_stream(stream);
+        constexpr int kBlock = 256;
+        const int blocks = static_cast<int>((n + kBlock - 1) / kBlock);
+        clip_log_scale_by_screen_share_kernel<<<blocks, kBlock, 0, stream>>>(
+            log_scales, max_share, frozen_mask, frozen_n, limit, n);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.clip_screen_share");
     }
 
 } // namespace lfs::training::kernels

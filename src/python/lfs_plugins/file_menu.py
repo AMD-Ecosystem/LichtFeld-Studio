@@ -2,21 +2,305 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """File menu implementation using Blender-style operators."""
 
+from collections.abc import Callable
+from _lfs_path_io import Path
+from pathlib import PureWindowsPath
+import threading
+import uuid
+
 import lichtfeld as lf
-from .asset_manager_integration import register_catalog_asset_path
+from .asset_index import display_name
+from .tools_menu import _open_gallery_scope, _open_projects_scope
 from .types import Operator
-from .layouts.menus import register_menu, menu_operator, menu_separator
-from .import_panels import open_dataset_import_panel, open_resume_checkpoint_panel
+from .layouts.menus import (
+    menu_action,
+    menu_operator,
+    menu_separator,
+    menu_submenu,
+    register_menu,
+)
+from .training_confirm import _project_has_path, confirm_discard_work_then
+from .project_thumbnail import active_project_path, has_renderable_project_viewport
 
 __lfs_menu_classes__ = ["FileMenu"]
+
+class _ImportRejected(RuntimeError):
+    def __init__(self, reason: str, message_key: str):
+        super().__init__(reason)
+        self.message_key = message_key
+
+
+def _warn_import_failure(path: str, reason: str) -> None:
+    message = f"Import rejected: path='{path}', reason='{reason}'"
+    lf.log.warn(message)
+
+
+def _show_import_failure(path: str, reason: str, message_key: str) -> None:
+    _warn_import_failure(path, reason)
+    message = lf.ui.tr(message_key).format(path=path, reason=reason)
+    lf.ui.message_dialog(
+        lf.ui.tr("menu.file.import_failed"), message, "error"
+    )
+
+
+def _file_menu_publish_action(primary, link):
+    """Resolve the explicit File menu action for a linked publication."""
+    if primary:
+        return primary["id"]
+    # Live snapshots have no saved commit to compare with, so they expose no
+    # Projects-card action. File > Publish can still open a save-first update.
+    return "update" if link and link.get("liveSnapshot") else None
+
+
+def _run_import(path: str, callback) -> bool:
+    try:
+        callback()
+        return True
+    except Exception as exc:
+        reason = str(exc).strip() or exc.__class__.__name__
+        _show_import_failure(
+            path,
+            reason,
+            getattr(
+                exc,
+                "message_key",
+                "menu.file.import_failed_message",
+            ),
+        )
+        return False
+
+
+def _open_dataset_import_checked(path: str) -> None:
+    from .import_panels import open_new_project_panel
+
+    if not lf.is_dataset_path(path):
+        raise _ImportRejected(
+            "dataset format was not recognized",
+            "menu.file.dataset_not_recognized",
+        )
+    if not open_new_project_panel(path):
+        raise RuntimeError("dataset import dialog is unavailable")
+
+
+def _open_checkpoint_import_checked(path: str) -> None:
+    from .import_panels import open_resume_checkpoint_panel
+
+    if not lf.read_checkpoint_header(path):
+        raise _ImportRejected(
+            "checkpoint format was not recognized",
+            "menu.file.checkpoint_not_recognized",
+        )
+    if not open_resume_checkpoint_panel(path):
+        raise RuntimeError("checkpoint import dialog is unavailable")
+
+
+def _offer_remove_missing_recent(path: str) -> None:
+    tr = lf.ui.tr
+    remove_label = tr("menu.file.remove_from_recent")
+
+    def _on_result(button):
+        if button == remove_label:
+            lf.project_remove_recent_file(path)
+
+    lf.ui.confirm_dialog(
+        tr("menu.file.recent_missing_title"),
+        tr("menu.file.recent_missing_message").format(path=path),
+        [remove_label, tr("common.cancel")],
+        _on_result,
+    )
+
+
+def _open_project(
+    path: str,
+    discard_changes: bool,
+    stop_training: bool = False,
+    keep_asset_manager_open: bool = False,
+):
+    if keep_asset_manager_open:
+        return lf.project_open(
+            path, discard_changes, stop_training, True
+        )
+    if stop_training:
+        return lf.project_open(path, discard_changes, True)
+    return lf.project_open(path, discard_changes)
+
+
+def open_project_with_confirmation(
+    path: str,
+    *,
+    keep_asset_manager_open: bool = False,
+    then: Callable[[], None] | None = None,
+) -> None:
+    """Open a known project path through the standard project-switch flow.
+
+    then runs after the project opened; it does not run when the user cancels or the open fails.
+    """
+    title = lf.ui.tr("menu.file.open_project")
+
+    def _open_checked(stop_training: bool) -> None:
+        try:
+            _open_project(
+                path,
+                True,
+                stop_training,
+                keep_asset_manager_open=keep_asset_manager_open,
+            )
+        except Exception as exc:
+            message = str(exc).strip() or title
+            lf.ui.message_dialog(title, message, "error")
+            return
+        if then is not None:
+            then()
+
+    confirm_discard_work_then(title, _open_checked)
+
+
+def _new_project(discard_changes: bool, stop_training: bool = False):
+    if stop_training:
+        return lf.new_project(discard_changes, True)
+    return lf.new_project(discard_changes)
+
+
+def _open_recent_checked(
+    path: str,
+    stop_training: bool = False,
+    keep_asset_manager_open: bool = False,
+) -> None:
+    try:
+        _open_project(
+            path,
+            True,
+            stop_training,
+            keep_asset_manager_open=keep_asset_manager_open,
+        )
+    except FileNotFoundError:
+        # NotFoundError subclasses FileNotFoundError (see startup_recent_panel).
+        _offer_remove_missing_recent(path)
+    except Exception as exc:
+        message = str(exc).strip() or lf.ui.tr(
+            "menu.file.recent_missing_message"
+        ).format(path=path)
+        lf.ui.message_dialog(
+            lf.ui.tr("menu.file.open_project"), message, "error"
+        )
+
+
+def open_recent_project_with_confirmation(
+    path: str,
+    *,
+    keep_asset_manager_open: bool = False,
+) -> None:
+    path = str(path)
+    if not Path(path).is_file():
+        _offer_remove_missing_recent(path)
+        return
+    confirm_discard_work_then(
+        lf.ui.tr("menu.file.open_project"),
+        lambda stop_training: _open_recent_checked(
+            path, stop_training, keep_asset_manager_open
+        ),
+    )
+
+
+def _open_recent_project(path: str) -> None:
+    open_recent_project_with_confirmation(path)
+
+
+def format_recent_project_entry(path: str, tr) -> tuple[str, str]:
+    """Return the compact recent-project label and full-path tooltip."""
+    windows_path = PureWindowsPath(path)
+    display_path = windows_path if windows_path.drive or "\\" in path else Path(path)
+    name = display_name({"path": display_path.as_posix(), "name": "", "name_origin": "stem"}) or path
+    anchor = display_path.anchor
+    parent_parts = [
+        part
+        for part in display_path.parent.parts
+        if part and part not in {anchor, "/", "\\"}
+    ]
+    parent = "/".join(parent_parts[-2:])
+    if not parent:
+        return name, path
+    template = tr("menu.file.recent_entry")
+    if chr(0x2014) in template or chr(0x2013) in template:
+        template = "{name} ({parent})"
+    return template.format(name=name, parent=parent), path
 
 
 class NewProjectOperator(Operator):
     label = "menu.file.new_project"
-    description = "Clear the scene to start a new project"
+    description = "Start a blank, unsaved project"
 
     def execute(self, context) -> set:
-        lf.new_project()
+        confirm_discard_work_then(
+            lf.ui.tr("menu.file.new_project"),
+            lambda stop_training: _new_project(True, stop_training),
+        )
+        return {"FINISHED"}
+
+
+class OpenProjectOperator(Operator):
+    label = "menu.file.open_project"
+    description = "Open a LichtFeld project"
+
+    def execute(self, context) -> set:
+        confirm_discard_work_then(
+            lf.ui.tr("menu.file.open_project"),
+            lambda stop_training: _open_project("", True, stop_training),
+        )
+        return {"FINISHED"}
+
+
+class SaveProjectOperator(Operator):
+    label = "menu.file.save_project"
+    description = "Save the active LichtFeld project"
+
+    def execute(self, context) -> set:
+        lf.project_save()
+        return {"FINISHED"}
+
+
+class SaveProjectAsOperator(Operator):
+    label = "menu.file.save_project_as"
+    description = "Save the active project to a new path"
+
+    def execute(self, context) -> set:
+        lf.project_save_as("")
+        return {"FINISHED"}
+
+
+class CleanProjectOperator(Operator):
+    label = "project_cleanup.title"
+    description = "Remove older saves and checkpoints while keeping the current project"
+
+    def execute(self, context) -> set:
+        from .project_cleanup import open_project_cleanup
+        open_project_cleanup()
+        return {"FINISHED"}
+
+
+class CompactProjectOperator(Operator):
+    label = "menu.file.compact_project"
+    description = "Reclaim dead bytes in the active LichtFeld project"
+
+    def execute(self, context) -> set:
+        if lf.is_training_active():
+            lf.ui.message_dialog(lf.ui.tr("menu.file.compact_project"),
+                                 lf.ui.tr("menu.file.compact_stop_training"), "error")
+            return {"CANCELLED"}
+        lf.project_compact()
+        return {"FINISHED"}
+
+
+class EmbedDatasetOperator(Operator):
+    label = "menu.file.embed_dataset"
+    description = "Copy the external dataset into the project"
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        return bool(getattr(lf, "project_can_embed_dataset", lambda: False)())
+
+    def execute(self, context) -> set:
+        lf.project_embed_dataset()
         return {"FINISHED"}
 
 
@@ -26,8 +310,10 @@ class ImportDatasetOperator(Operator):
 
     def execute(self, context) -> set:
         path = lf.ui.open_dataset_folder_dialog()
-        if path:
-            open_dataset_import_panel(path)
+        if path and not _run_import(
+            path, lambda: _open_dataset_import_checked(path)
+        ):
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -38,8 +324,24 @@ class ImportPlyOperator(Operator):
     def execute(self, context) -> set:
         path = lf.ui.open_ply_file_dialog("")
         if path:
-            register_catalog_asset_path(path, select=True)
-            lf.load_file(path, is_dataset=False)
+            def _load() -> None:
+                lf.load_file(path, is_dataset=False)
+
+            if not _run_import(path, _load):
+                return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class ImportSsogOperator(Operator):
+    label = "menu.file.import_ssog"
+    description = "Import a SSOG folder containing lod-meta.json"
+
+    def execute(self, context) -> set:
+        path = lf.ui.open_folder_dialog()
+        if not path:
+            return {"CANCELLED"}
+        if not _run_import(path, lambda: lf.load_file(path, is_dataset=False)):
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -50,13 +352,11 @@ class ImportMeshOperator(Operator):
     def execute(self, context) -> set:
         path = lf.ui.open_mesh_file_dialog("")
         if path:
-            register_catalog_asset_path(
-                path,
-                asset_type="mesh",
-                role="reference",
-                select=True,
-            )
-            lf.load_file(path, is_dataset=False)
+            def _load() -> None:
+                lf.load_file(path, is_dataset=False)
+
+            if not _run_import(path, _load):
+                return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -66,8 +366,10 @@ class ImportCheckpointOperator(Operator):
 
     def execute(self, context) -> set:
         path = lf.ui.open_checkpoint_file_dialog()
-        if path:
-            open_resume_checkpoint_panel(path)
+        if path and not _run_import(
+            path, lambda: _open_checkpoint_import_checked(path)
+        ):
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -77,8 +379,8 @@ class ImportConfigOperator(Operator):
 
     def execute(self, context) -> set:
         path = lf.ui.open_json_file_dialog()
-        if path:
-            lf.load_config_file(path)
+        if path and not _run_import(path, lambda: lf.load_config_file(path)):
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -125,29 +427,455 @@ class ExitOperator(Operator):
     description = "Exit the application"
 
     def execute(self, context) -> set:
-        tr = lf.ui.tr
-        lf.ui.set_exit_popup_open(True)
-
-        def _on_result(button):
-            lf.ui.set_exit_popup_open(False)
-            if button == tr("exit_popup.exit"):
-                lf.force_exit()
-
-        lf.ui.confirm_dialog(
-            tr("exit_popup.title"),
-            tr("exit_popup.message") + "\n" + tr("exit_popup.unsaved_warning"),
-            [tr("common.cancel"), tr("exit_popup.exit")],
-            _on_result,
-        )
+        lf.request_exit()
         return {"FINISHED"}
 
 
-def _on_show_dataset_load_popup(path: str):
-    open_dataset_import_panel(path)
+def _show_exit_confirmation(training_in_progress: bool = False) -> None:
+    tr = lf.ui.tr
+    cancel_label = tr("common.cancel")
+    lf.ui.set_exit_popup_open(True)
+
+    if training_in_progress:
+        stop_save_label = tr("exit_popup.stop_and_save")
+        discard_label = tr("exit_popup.discard_and_exit")
+
+        def _on_training_result(button):
+            lf.ui.set_exit_popup_open(False)
+            if button == stop_save_label:
+                lf.stop_save_and_exit()
+            elif button == discard_label:
+                lf.force_exit()
+            else:
+                lf.cancel_exit()
+
+        lf.ui.confirm_dialog(
+            tr("exit_popup.training_title"),
+            tr("exit_popup.training_message"),
+            [stop_save_label, discard_label, cancel_label],
+            _on_training_result,
+        )
+        return
+
+    has_path = _project_has_path()
+    save_label = (
+        tr("common.save")
+        if has_path
+        else tr("menu.file.save_project_as")
+    )
+    discard_label = tr("exit_popup.discard")
+
+    def _on_result(button):
+        lf.ui.set_exit_popup_open(False)
+        if button == save_label:
+            if has_path:
+                lf.save_and_exit()
+            else:
+                lf.save_as_and_exit()
+        elif button == discard_label:
+            lf.force_exit()
+        else:
+            lf.cancel_exit()
+
+    lf.ui.confirm_dialog(
+        tr("exit_popup.title"),
+        tr("exit_popup.message") + "\n" + tr("exit_popup.unsaved_warning"),
+        [save_label, discard_label, cancel_label],
+        _on_result,
+    )
+
+
+def _show_project_switch_confirmation(
+    new_project: bool,
+    path: str,
+    keep_asset_manager_open: bool = False,
+    create_path: str = "",
+    overwrite: bool = False,
+    stop_training: bool = False,
+) -> None:
+    prior_stop_approval = stop_training
+    if new_project:
+        title = lf.ui.tr("menu.file.new_project")
+        if create_path:
+            callback = lambda confirmed_stop: lf.project_create(
+                create_path,
+                discard_changes=True,
+                stop_training=prior_stop_approval or confirmed_stop,
+                overwrite=overwrite,
+            )
+        else:
+            callback = lambda approved_stop: _new_project(
+                True, prior_stop_approval or approved_stop
+            )
+    else:
+        title = lf.ui.tr("menu.file.open_project")
+        callback = lambda confirmed_stop: _open_project(
+            path, True, prior_stop_approval or confirmed_stop,
+            keep_asset_manager_open
+        )
+    confirm_discard_work_then(
+        title, callback, ask_stop_training=not prior_stop_approval
+    )
+
+
+def _show_stop_training_confirmation(
+    new_project: bool,
+    path: str,
+    discard_changes: bool = False,
+    keep_asset_manager_open: bool = False,
+    create_path: str = "",
+    overwrite: bool = False,
+) -> None:
+    tr = lf.ui.tr
+    yes_label = tr("common.yes")
+    no_label = tr("common.no")
+
+    def _on_result(button):
+        if button != yes_label:
+            return
+        if new_project and create_path:
+            lf.project_create(
+                create_path,
+                discard_changes=True,
+                stop_training=True,
+                overwrite=overwrite,
+            )
+        elif new_project:
+            _new_project(discard_changes, True)
+        else:
+            _open_project(
+                path,
+                discard_changes,
+                True,
+                keep_asset_manager_open,
+            )
+
+    lf.ui.confirm_dialog(
+        tr("project_switch.stop_training_title"),
+        tr("project_switch.stop_training_message"),
+        [yes_label, no_label],
+        _on_result,
+    )
+
+
+def _show_load_file_confirmation(paths, is_dataset: bool, replace: bool, user_batch: bool = False) -> None:
+    title = lf.ui.tr(
+        "load_dataset_popup.save_title" if is_dataset else "unsaved_work.title"
+    )
+
+    def _proceed(stop_training: bool) -> None:
+        if not is_dataset:
+            lf.load_files(paths, discard_changes=True, replace=replace,
+                          stop_training=stop_training, _user_batch=user_batch)
+            return
+        for i, path in enumerate(paths):
+            lf.load_file(
+                path,
+                is_dataset=is_dataset,
+                discard_changes=True,
+                replace=(replace and i == 0),
+                stop_training=stop_training,
+            )
+
+    confirm_discard_work_then(title, _proceed)
+
+
+def _on_show_new_project_dialog(path: str):
+    from .import_panels import open_new_project_panel
+
+    open_new_project_panel(path)
 
 
 def _on_show_resume_checkpoint_popup(path: str):
+    from .import_panels import open_resume_checkpoint_panel
+
     open_resume_checkpoint_panel(path)
+
+
+def _can_compact_project() -> bool:
+    return _project_has_path()
+
+
+def _can_publish_scene() -> bool:
+    return _project_has_path() or bool(getattr(lf, "has_scene", lambda: False)())
+
+
+def _visible_splats() -> list:
+    scene = lf.get_scene()
+    return [node for node in scene.get_nodes()
+            if node.type == lf.scene.NodeType.SPLAT and scene.is_node_effectively_visible(node.id)]
+
+
+def _splat_publication(nodes) -> dict:
+    """What the gallery review estimates from; the SH degree is unknown without materializing geometry."""
+    return {"estimatedPoints": sum(node.gaussian_count for node in nodes)}
+
+
+def _open_unlinked_gallery_review() -> None:
+    from .gallery_controller import get_gallery_controller
+    from .gallery_file_panel import open_gallery_file_panel
+    from .gallery_storage import quota_message
+    from .gallery_messages import tr as gallery_tr
+
+    nodes = _visible_splats()
+    name = nodes[0].name if len(nodes) == 1 else lf.ui.tr("menu.file.untitled_scene")
+    controller = get_gallery_controller()
+    state = controller.snapshot()
+    quota = quota_message(state)
+    asset = {"id": str(uuid.uuid4()), "path": "", "name": name, "exists": True,
+             "status": "AVAILABLE",
+             "publication": dict(_splat_publication(nodes), visibleSplats=len(nodes))}
+    open_gallery_file_panel(controller=controller, asset=asset, scene=None, action="publish",
+                            fields={"title": name, "description": "", "visibility": "private",
+                                    "upload_format": controller.upload_format},
+                            quota=quota, unlinked=True)
+
+
+def _save_then_publish() -> None:
+    if not lf.project_save_as(""):
+        return
+
+    def poll():
+        state = lf.project_poll_write()
+        if state.get("running"):
+            timer = threading.Timer(0.1, lambda: lf.ui.schedule_on_ui_thread(poll))
+            timer.daemon = True
+            timer.start()
+        elif state.get("path") and not state.get("error"):
+            _publish_current_project_to_gallery()
+
+    poll()
+
+
+def _can_update_thumbnail_from_view() -> bool:
+    if not _project_has_path():
+        return False
+    path = active_project_path()
+    return bool(path and Path(path).is_file()
+                and has_renderable_project_viewport(path))
+
+
+def _update_thumbnail_from_view() -> None:
+    from .asset_manager_panel import AssetManagerPanel
+
+    title = lf.ui.tr("menu.file.update_thumbnail_from_view")
+    if not _can_update_thumbnail_from_view():
+        return
+    path = active_project_path()
+
+    def worker():
+        try:
+            card = lf.io.inspect_project_card(path)
+            project_id = str(card.project_uuid)
+            if not project_id:
+                raise RuntimeError("The saved project has no identity")
+            AssetManagerPanel._capture_viewport_preview(path, project_id)
+            error = None
+        except Exception as exc:
+            error = AssetManagerPanel._thumbnail_error_message(exc)
+
+        def complete():
+            if error:
+                lf.ui.message_dialog(title, error, "error")
+            else:
+                panel = lf.ui.get_panel_object("lfs.asset_manager")
+                if panel is not None:
+                    panel.refresh_after_thumbnail_write(path)
+                lf.ui.message_dialog(title, lf.ui.tr("menu.file.thumbnail_updated"))
+
+        lf.ui.schedule_on_ui_thread(complete)
+
+    threading.Thread(target=worker, daemon=True, name="ProjectThumbnail").start()
+
+
+def _publish_current_project_to_gallery(*, refresh_once: bool = True) -> None:
+    """Open the shared gallery review for the active scene."""
+    from .gallery_messages import tr as gallery_tr
+
+    title = lf.ui.tr("menu.file.publish_to_gallery")
+    try:
+        if not _project_has_path():
+            if not _can_publish_scene():
+                return
+            save_label = lf.ui.tr("menu.file.save_and_publish")
+            unlinked_label = lf.ui.tr("menu.file.publish_without_saving")
+
+            def choose(button):
+                if button == save_label:
+                    _save_then_publish()
+                elif button == unlinked_label:
+                    _open_unlinked_gallery_review()
+
+            lf.ui.confirm_dialog(title, lf.ui.tr("menu.file.publish_unsaved_message"),
+                                 [save_label, unlinked_label, lf.ui.tr("common.cancel")], choose)
+            return
+        poll = lf.project_poll_write()
+        raw_path = str(poll.get("path") or "")
+        if not raw_path:
+            raise ValueError(gallery_tr("error.save_first"))
+        path = str(Path(raw_path).resolve())
+        project_path = Path(path)
+        if not project_path.is_file():
+            raise FileNotFoundError(f"The saved project file was not found: {path}")
+
+        card = lf.io.inspect_project_card(path)
+        project_id = str(card.project_uuid)
+        if not project_id:
+            raise ValueError(gallery_tr("error.project_changed"))
+        get_panel = getattr(lf.ui, "get_panel_object", None)
+        panel = get_panel("lfs.asset_manager") if callable(get_panel) else None
+        catalog_entry = getattr(panel, "catalog_entry_for_path", None)
+        path_entry = catalog_entry(path) if callable(catalog_entry) else None
+        if path_entry and path_entry.get("copy_of"):
+            raise ValueError(gallery_tr("eligibility.copy"))
+
+        from .gallery_controller import get_gallery_controller
+        from .gallery_file_panel import open_gallery_file_panel
+
+        controller = get_gallery_controller()
+        state = controller.snapshot()
+        from .portal_connection_ui import connection_state
+        account = getattr(getattr(controller, "service", None), "account", None)
+        gallery_connection_state = connection_state(account.snapshot() if account else None)
+        if account is not None and gallery_connection_state != "connected":
+            def continue_after_connection():
+                if connection_state(account.snapshot()) != "connected":
+                    return
+                current = str(lf.project_poll_write().get("path") or "")
+                if not current or Path(current).resolve() != project_path:
+                    return
+                controller.refresh(force=True)
+                expected_identity = controller.service.identity()
+
+                def continue_after_refresh():
+                    state = controller.snapshot()
+                    if (controller.service.identity() == expected_identity
+                            and state.get("checkedAt") and not state.get("offline")
+                            and Path(str(lf.project_poll_write().get("path") or "")).resolve() == project_path):
+                        _publish_current_project_to_gallery(refresh_once=False)
+
+                controller._after_service = continue_after_refresh
+
+            account.run_after_connection(continue_after_connection)
+            return
+        link = state.get("links", {}).get(project_id)
+        scene = None
+        if link:
+            scene = next((row for row in state.get("scenes", [])
+                          if row.get("id") == link.get("sceneId")), None)
+        linked_fields = ((link or {}).get("localFields") or (link or {}).get("sharedFields")
+                         or scene or {})
+        project_name = str(getattr(card, "title", None) or project_path.stem)
+        if not link:
+            if panel is not None:
+                entry = panel._asset_dict(project_id)
+                if entry and Path(entry["path"]).resolve() == project_path:
+                    draft = entry.get("gallery_details_draft")
+                    if isinstance(draft, dict):
+                        linked_fields = draft
+        asset = {
+            "id": project_id,
+            "path": path,
+            "name": project_name,
+            "commit_uuid": str(card.commit_uuid),
+            "file_uuid": str(card.file_uuid),
+            "file_size_bytes": int(card.physical_file_size),
+            "has_preview": bool(card.has_preview),
+            "exists": True,
+            "status": "AVAILABLE",
+            "publication": _splat_publication(_visible_splats()),
+        }
+        fields = {
+            "title": str(linked_fields.get("title") or project_name),
+            "description": str(linked_fields.get("description") or ""),
+            "visibility": linked_fields.get("visibility", "private"),
+            "upload_format": controller.upload_format,
+        }
+        from .gallery_actions import gallery_quota
+        _, _, remaining_bytes = gallery_quota(state)
+        from .gallery_storage import quota_message
+        quota = quota_message(state)
+        warning = (gallery_tr("quota.warning")
+                   if remaining_bytes is not None and asset["file_size_bytes"] > remaining_bytes
+                   else "")
+
+        # Use the same primary verb as Asset Manager. A linked project may be
+        # locally newer, remotely newer, divergent, or not checked; treating
+        # every link as an update can bypass the corresponding Gallery action.
+        publish_new = False
+        action = "publish"
+        if link:
+            from .gallery_actions import gallery_actions
+            from .gallery_controller import asset_sync_state
+
+            facts = asset_sync_state(
+                asset,
+                link,
+                scene,
+                state.get("jobs", ()),
+                checked=bool(state.get("checkedAt")),
+                established=state.get("established", state.get("connected", True)),
+            )
+            for key in ("signed_in", "busy", "relink_required", "unsupported", "source_formats",
+                        "quotaBytes", "usedBytes", "reservedBytes", "hdrBackgrounds"):
+                if key in state:
+                    facts[key] = state[key]
+            facts["connection_state"] = gallery_connection_state
+            primary = next((item for item in gallery_actions(asset, facts) if item["primary"]), None)
+            action = _file_menu_publish_action(primary, link)
+            if action is None:
+                raise ValueError(gallery_tr("error.refresh"))
+            if primary and not primary["enabled"]:
+                raise ValueError(primary["reason"] or gallery_tr("error.refresh"))
+            details = {key: fields[key] for key in ("title", "description", "visibility")}
+            if action == "check":
+                if not refresh_once:
+                    return
+                expected_identity = controller.service.identity()
+
+                def continue_after_refresh():
+                    if controller.service.identity() != expected_identity:
+                        return
+                    current = str(lf.project_poll_write().get("path") or "")
+                    if current and Path(current).resolve() == project_path:
+                        _publish_current_project_to_gallery(refresh_once=False)
+
+                controller._after_service = continue_after_refresh
+                controller.refresh()
+                return
+            if action in ("resolve", "apply"):
+                controller.resolve_asset(asset, details, apply_only=action == "apply")
+                return
+            if action in ("open", "copy"):
+                # File → Publish remains a publishing workflow when the link
+                # is already current: the review can still update its metadata.
+                action = "update"
+            if action == "publish_again":
+                publish_new = True
+                action = "publish"
+            elif action not in ("publish", "update"):
+                raise ValueError(gallery_tr("error.refresh"))
+
+        open_gallery_file_panel(
+            controller=controller,
+            asset=asset,
+            scene=scene,
+            action=action,
+            fields=fields,
+            quota=quota,
+            warning=warning,
+            publish_new=publish_new,
+            expected_project_path=path,
+        )
+    except Exception as exc:
+        message = str(exc).strip() or title
+        lf.ui.message_dialog(title, message, "error")
+
+
+
+def _open_gallery_transfers():
+    from .overlays import show_gallery_transfers
+    show_gallery_transfers()
 
 
 @register_menu
@@ -159,20 +887,96 @@ class FileMenu:
     order = 10
 
     def menu_items(self):
+        recent_items = []
+        for recent_path in lf.project_recent_files():
+            path = str(recent_path)
+            label, tooltip = format_recent_project_entry(path, lf.ui.tr)
+            recent_items.append(
+                menu_action(
+                    label,
+                    lambda selected=path: _open_recent_project(selected),
+                    tooltip=tooltip,
+                )
+            )
+        if not recent_items:
+            recent_items.append(
+                {
+                    "type": "item",
+                    "label": lf.ui.tr("menu.file.no_recent_projects"),
+                    "callback": lambda: None,
+                    "enabled": False,
+                }
+            )
+        else:
+            recent_items.append(menu_separator())
+            recent_items.append(
+                menu_action(
+                    lf.ui.tr("menu.file.clear_recent_projects"),
+                    lf.project_clear_recent_files,
+                )
+            )
+
         return [
             menu_operator(NewProjectOperator),
+            menu_operator(OpenProjectOperator),
+            menu_submenu(
+                lf.ui.tr("menu.file.open_recent"),
+                recent_items,
+            ),
+            menu_action(lf.ui.tr("menu.file.browse_projects"), _open_projects_scope),
             menu_separator(),
-            menu_operator(ImportDatasetOperator),
-            menu_operator(ImportPlyOperator),
-            menu_operator(ImportMeshOperator),
-            menu_operator(ImportCheckpointOperator),
-            menu_operator(ImportConfigOperator),
+            menu_operator(
+                SaveProjectOperator,
+                shortcut="Ctrl+S",
+            ),
+            menu_operator(SaveProjectAsOperator),
             menu_separator(),
-            menu_operator(ExportOperator),
-            menu_operator(ExportConfigOperator),
+            menu_submenu(
+                lf.ui.tr("menu.file.import"),
+                [
+                    menu_operator(ImportDatasetOperator, label=lf.ui.tr("menu.file.dataset")),
+                    menu_operator(ImportPlyOperator, label=lf.ui.tr("menu.file.splat_file")),
+                    menu_operator(ImportSsogOperator, label=lf.ui.tr("menu.file.ssog_folder")),
+                    menu_operator(ImportMeshOperator, label=lf.ui.tr("menu.file.mesh")),
+                    menu_operator(ImportCheckpointOperator, label=lf.ui.tr("menu.file.checkpoint")),
+                    menu_separator(),
+                    menu_operator(ImportConfigOperator, label=lf.ui.tr("menu.file.configuration")),
+                ],
+            ),
+            menu_submenu(lf.ui.tr("menu.file.export_menu"), [
+                menu_operator(ExportOperator, label=lf.ui.tr("menu.file.export_scene")),
+                menu_operator(ExportConfigOperator, label=lf.ui.tr("menu.file.configuration")),
+            ]),
+            menu_submenu(
+                lf.ui.tr("menu.tools.gallery"),
+                [
+                    menu_action(lf.ui.tr("menu.file.open_gallery"), _open_gallery_scope),
+                    menu_action(
+                        lf.ui.tr("menu.file.publish_to_gallery"),
+                        _publish_current_project_to_gallery,
+                        enabled=_can_publish_scene(),
+                    ),
+                    menu_action(lf.ui.tr("menu.tools.gallery_transfers"), _open_gallery_transfers),
+                ],
+            ),
             menu_separator(),
-            menu_operator(Mesh2SplatOperator),
-            menu_operator(ExtractVideoFramesOperator),
+            menu_submenu(
+                lf.ui.tr("menu.file.project_maintenance"),
+                [
+                    menu_action(
+                        lf.ui.tr("menu.file.update_thumbnail_from_view"),
+                        _update_thumbnail_from_view,
+                        enabled=_can_update_thumbnail_from_view(),
+                    ),
+                    menu_operator(
+                        EmbedDatasetOperator,
+                        enabled=bool(getattr(lf, "project_can_embed_dataset", lambda: False)()),
+                    ),
+                    menu_separator(),
+                    menu_operator(CleanProjectOperator, enabled=_can_compact_project()),
+                    menu_operator(CompactProjectOperator, enabled=_can_compact_project()),
+                ],
+            ),
             menu_separator(),
             menu_operator(ExitOperator),
         ]
@@ -180,8 +984,15 @@ class FileMenu:
 
 _operator_classes = [
     NewProjectOperator,
+    OpenProjectOperator,
+    SaveProjectOperator,
+    SaveProjectAsOperator,
+    EmbedDatasetOperator,
+    CleanProjectOperator,
+    CompactProjectOperator,
     ImportDatasetOperator,
     ImportPlyOperator,
+    ImportSsogOperator,
     ImportMeshOperator,
     ImportCheckpointOperator,
     ImportConfigOperator,
@@ -197,9 +1008,18 @@ def register():
     for cls in _operator_classes:
         lf.register_class(cls)
 
-    lf.ui.on_show_dataset_load_popup(_on_show_dataset_load_popup)
+    lf.ui.on_show_new_project_dialog(_on_show_new_project_dialog)
     lf.ui.on_show_resume_checkpoint_popup(_on_show_resume_checkpoint_popup)
-    lf.ui.on_request_exit(lambda: lf.ui.execute_operator(ExitOperator._class_id()))
+    lf.ui.on_request_exit(_show_exit_confirmation)
+    lf.ui.on_project_switch_confirmation(
+        _show_project_switch_confirmation
+    )
+    lf.ui.on_show_load_file_confirmation_with_batch(
+        _show_load_file_confirmation
+    )
+    lf.ui.on_stop_training_confirmation(
+        _show_stop_training_confirmation
+    )
 
 
 def unregister():

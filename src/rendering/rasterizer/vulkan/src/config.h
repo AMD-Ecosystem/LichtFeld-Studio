@@ -1,9 +1,7 @@
 #pragma once
 
-#include <cstdint>
-
-#define ENABLE_VULKAN_VALIDATION_LAYER 0
-#define ENABLE_ASSERTION               0
+#include "core/assert.hpp"
+#include "rendering/vulkan_result.hpp"
 
 #ifndef SUBGROUP_SIZE
 #define SUBGROUP_SIZE 32
@@ -12,42 +10,64 @@
 #define TILE_HEIGHT 16
 #define TILE_WIDTH  16
 
+#define RASTER_BATCH_SIZE           1024
+#define RASTER_DENSE_TILE_THRESHOLD RASTER_BATCH_SIZE
+
+// HiGS macro-tile inference pipeline (viewer forward only).
+// Macro tile = 8x4 render tiles of 8x8 px = 64x32 px. The tile count per
+// macro tile must equal SUBGROUP_SIZE: the raster kernel's ballot transpose
+// carries one tile per lane.
+#define HIGS_MACRO_TILE_WIDTH_TILES  8
+#define HIGS_MACRO_TILE_HEIGHT_TILES 4
+#define HIGS_MACRO_TILE_SIZE_TILES   (HIGS_MACRO_TILE_WIDTH_TILES * HIGS_MACRO_TILE_HEIGHT_TILES)
+#define HIGS_TILE_WIDTH              8
+#define HIGS_TILE_HEIGHT             8
+#define HIGS_TILE_SIZE               (HIGS_TILE_WIDTH * HIGS_TILE_HEIGHT)
+// One coverage bit per 4x4 output region.
+#define HIGS_DEPTH_SAMPLE_TILE_SIZE 4
+// One 32-splat membership ballot per render tile and mini-batch, retained
+// only when compose needs exact median depth.
+#define HIGS_REPLAY_MASK_WORDS_PER_BATCH ((RASTER_BATCH_SIZE / SUBGROUP_SIZE) * HIGS_MACRO_TILE_SIZE_TILES)
+// Macro-tile extent in legacy 16px-tile units (projection rects use that grid).
+#define HIGS_MACRO_T16_W ((HIGS_MACRO_TILE_WIDTH_TILES * HIGS_TILE_WIDTH) / TILE_WIDTH)
+#define HIGS_MACRO_T16_H ((HIGS_MACRO_TILE_HEIGHT_TILES * HIGS_TILE_HEIGHT) / TILE_HEIGHT)
+
+// Raster/compose run in waves of this many 1024-splat batches so the half4
+// partials pool stays bounded (16384 batches x 32 tiles x 256 px x 8 B = 1 GiB).
+#define HIGS_RASTER_WAVE_BATCHES 16384
+// A full 32K square macro grid needs 33 waves; pixel storage may be banded.
+#define HIGS_RASTER_MAX_WAVES 64
+
+// Fixed per-depth-wave tile-instance budget. Interactive recording arms the
+// capability-selected number of slots; exports record an exact upper bound.
+#define HIGS_DEPTH_WAVE_INSTANCES     4194304
+#define HIGS_DEPTH_MAX_WAVES          64
+#define HIGS_DEPTH_MAX_WAVES_FALLBACK 16
+
 // reordering for better memory colaescing
 // see config.slang for details
 #define SH_REORDER_SIZE SUBGROUP_SIZE
-// #define SH_REORDER_SIZE 1
 
 typedef int32_t sortingKey_t;
-// typedef int64_t sortingKey_t;
 
-#define RASTERIZE_BACKWARD_USE_SCHEDULING 1
-
-#include <cstdio>
-#define _DEBUG_PRINT                           \
-    do {                                       \
-        printf("%s %d\n", __FILE__, __LINE__); \
-        fflush(stdout);                        \
-    } while (0)
-// #define _DEBUG_PRINT ;
-#include <cassert>
-
-#include <stdexcept>
-
-#define _THROW_ERROR_ALWAYS(message)                                                          \
-    do {                                                                                      \
-        std::string msg = std::string(message) +                                              \
-                          ". From file `" + __FILE__ + "`, line " + std::to_string(__LINE__); \
-        printf("\033[91m%s\033[m\n", msg.c_str());                                            \
-        fflush(stdout);                                                                       \
-        throw std::runtime_error(msg);                                                        \
-    } while (0)
-
-#if ENABLE_ASSERTION
-#define _THROW_ERROR(...) _THROW_ERROR_ALWAYS(__VA_ARGS__)
+// Vulkan keeps its call-site idiom while sharing the core debug primitive.
+// In Release, neither the condition nor the formatting arguments are evaluated.
+#ifndef LFS_VK_DEBUG_ASSERT
+#if defined(NDEBUG)
+#define LFS_VK_DEBUG_ASSERT(condition, ...) ((void)0)
+#elif defined(__CUDA_ARCH__)
+#define LFS_VK_DEBUG_ASSERT(condition, ...) assert(condition)
 #else
-#define _THROW_ERROR(...) \
-    do {                  \
-    } while (0)
+#define LFS_VK_DEBUG_ASSERT(condition, ...)                            \
+    do {                                                               \
+        if (!(condition)) [[unlikely]] {                               \
+            ::lfs::core::detail::assertion_failed(                     \
+                "LFS debug invariant", #condition,                     \
+                ::lfs::rendering::formatVulkanDiagnostic(__VA_ARGS__), \
+                LFS_SOURCE_SITE_CURRENT());                            \
+        }                                                              \
+    } while (false)
+#endif
 #endif
 
 #define _CEIL_DIV(x, m)   (((x) + (m) - 1) / (m))

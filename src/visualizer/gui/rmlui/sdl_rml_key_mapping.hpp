@@ -56,6 +56,7 @@ namespace lfs::vis::gui {
         case SDLK_SEMICOLON:    return Rml::Input::KI_OEM_1;
         case SDLK_EQUALS:       return Rml::Input::KI_OEM_PLUS;
         case SDLK_PLUS:         return Rml::Input::KI_OEM_PLUS;
+        case SDLK_APOSTROPHE:   return Rml::Input::KI_OEM_7;
         case SDLK_COMMA:        return Rml::Input::KI_OEM_COMMA;
         case SDLK_MINUS:        return Rml::Input::KI_OEM_MINUS;
         case SDLK_PERIOD:       return Rml::Input::KI_OEM_PERIOD;
@@ -131,9 +132,10 @@ namespace lfs::vis::gui {
 
     inline Rml::Input::KeyIdentifier sdlScancodeToRml(SDL_Scancode sc) {
         // Shortcut and navigation keys should be layout-independent. Text entry
-        // still comes from SDL text events through text_codepoints.
+        // still comes from SDL text events through the ordered input stream.
         // clang-format off
         switch (sc) {
+        case SDL_SCANCODE_ESCAPE:          return Rml::Input::KI_ESCAPE;
         case SDL_SCANCODE_SPACE:          return Rml::Input::KI_SPACE;
         case SDL_SCANCODE_APOSTROPHE:     return Rml::Input::KI_OEM_7;
         case SDL_SCANCODE_COMMA:          return Rml::Input::KI_OEM_COMMA;
@@ -222,6 +224,14 @@ namespace lfs::vis::gui {
                 Rml::Input::KI_1 + (sc - SDL_SCANCODE_1));
 
         return Rml::Input::KI_UNKNOWN;
+    }
+
+    inline Rml::Input::KeyIdentifier sdlTextShortcutToRml(SDL_Scancode sc, SDL_Keycode keycode,
+                                                          SDL_Keymod modifiers) {
+        if ((modifiers & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) && !(modifiers & SDL_KMOD_ALT) &&
+            keycode >= SDLK_A && keycode <= SDLK_Z)
+            return sdlKeycodeToRml(keycode);
+        return sdlScancodeToRml(sc);
     }
 
     inline int sdlModsToRml(const SDL_Keymod sdl_mods) {

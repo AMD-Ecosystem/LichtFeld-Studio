@@ -32,7 +32,7 @@ namespace lfs::core {
         Tensor normals;   // [V, 3] Float32
         Tensor tangents;  // [V, 4] Float32 (xyz + handedness w)
         Tensor texcoords; // [V, 2] Float32
-        Tensor colors;    // [V, 4] Float32
+        Tensor colors;    // [V, 4] Float32, linear RGB
         Tensor indices;   // [F, 3] Int32
 
         std::vector<Material> materials;
@@ -42,14 +42,7 @@ namespace lfs::core {
 
         MeshData() = default;
 
-        MeshData(Tensor verts, Tensor idx)
-            : vertices(std::move(verts)),
-              indices(std::move(idx)) {
-            assert(vertices.ndim() == 2 && vertices.shape()[1] == 3);
-            assert(vertices.dtype() == DataType::Float32);
-            assert(indices.ndim() == 2 && indices.shape()[1] == 3);
-            assert(indices.dtype() == DataType::Int32);
-        }
+        MeshData(Tensor verts, Tensor idx);
 
         MeshData(const MeshData&) = delete;
         MeshData& operator=(const MeshData&) = delete;
@@ -78,6 +71,7 @@ namespace lfs::core {
                 submeshes = std::move(o.submeshes);
                 texture_images = std::move(o.texture_images);
                 generation_.store(o.generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                id_ = next_id();
             }
             return *this;
         }
@@ -98,6 +92,11 @@ namespace lfs::core {
         uint32_t generation() const { return generation_.load(std::memory_order_relaxed); }
         void mark_dirty() { generation_.fetch_add(1, std::memory_order_relaxed); }
 
+        // Process-unique and never reused, so renderer-side GPU caches cannot mistake a
+        // freshly allocated mesh for a destroyed one that happened to land on the same
+        // heap address. generation() only tracks in-place edits of one mesh.
+        uint64_t id() const { return id_; }
+
         MeshData to(Device device) const {
             MeshData m;
             m.vertices = vertices.is_valid() ? vertices.to(device) : vertices;
@@ -114,6 +113,12 @@ namespace lfs::core {
         }
 
         void compute_normals();
+        void validate_indices() const;
+
+    private:
+        static uint64_t next_id();
+
+        uint64_t id_ = next_id();
     };
 
 } // namespace lfs::core

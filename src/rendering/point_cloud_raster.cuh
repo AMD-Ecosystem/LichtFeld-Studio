@@ -18,21 +18,42 @@ namespace lfs::rendering::pcraster {
         bool desaturate;
     };
 
+    struct CropEllipsoid {
+        float to_local[16];
+        float radii[3];
+        bool inverse;
+        bool desaturate;
+    };
+
     struct LaunchParams {
         const float* positions;
         const float* colors;
         const float* transforms; // [n_transforms, 16] column-major or null
         const std::int32_t* transform_indices;
         const std::uint8_t* visibility_mask;
+        const bool* deleted_mask;
+        const std::uint8_t* selection_mask;
+        const std::uint8_t* preview_mask;
+        const float* selection_colors; // [258, 4], matches PointCloudOverlayState
+        bool preview_additive;
         std::size_t n_points;
         int n_transforms;
         int n_visibility;
         bool has_crop;
         CropBox crop;
+        bool has_crop_ellipsoid;
+        CropEllipsoid crop_ellipsoid;
         float view[16];
         float view_proj[16];
         int width;
         int height;
+        // A clipped target keeps the full camera: points project into
+        // camera_width x camera_height and land at pixel - origin in the target.
+        // A zero camera size means the target is the whole camera.
+        int camera_width;
+        int camera_height;
+        int origin_x;
+        int origin_y;
         int channels;
         bool equirectangular;
         bool orthographic;

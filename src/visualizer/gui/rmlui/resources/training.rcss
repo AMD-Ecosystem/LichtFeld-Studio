@@ -10,15 +10,131 @@ body {
 
 #content-wrap {
     min-width: 0;
-    height: 0;
-    flex-grow: 1;
+    min-height: 0;
+    flex: 1;
     padding: 6dp;
     overflow-x: hidden;
-    overflow-y: auto;
+    overflow-y: hidden;
 }
 
 #content {
     min-width: 0;
+    min-height: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+.training-panel-layout {
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+#controls {
+    flex-shrink: 0;
+}
+
+.training-preparation-status {
+    display: flex;
+    align-items: center;
+    padding: 10dp 8dp;
+    margin-bottom: 6dp;
+    border-radius: 4dp;
+    background-color: #89b4fa14;
+}
+
+.training-preparation-label {
+    display: block;
+    flex: 1;
+    min-width: 0;
+    white-space: normal;
+    text-align: left;
+    color: #cdd6f4;
+    font-size: 12dp;
+}
+
+.training-preparation-indicator {
+    width: 8dp;
+    height: 8dp;
+    flex-shrink: 0;
+    margin-right: 8dp;
+    border-radius: 4dp;
+    background-color: #89b4fa;
+}
+
+.training-preparation-indicator.is-active {
+    animation: training-preparation-pulse 0.8s quadratic-in-out infinite alternate;
+}
+
+@keyframes training-preparation-pulse {
+    from { opacity: 1; }
+    to { opacity: 0.35; }
+}
+
+#training-search-container {
+    display: flex;
+    align-items: center;
+    box-sizing: border-box;
+    padding: 4dp 6dp;
+    margin: 6dp 0 4dp;
+    border-width: 1dp;
+    flex-shrink: 0;
+}
+
+.training-scroll-region {
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding-bottom: 6dp;
+    padding-right: 4dp;
+}
+
+.training-telemetry {
+    min-width: 0;
+    flex-shrink: 0;
+}
+
+#training-search-input {
+    flex-grow: 1;
+    min-width: 0;
+    background-color: transparent;
+    border-width: 0;
+    padding: 0;
+}
+
+#training-search-input:focus,
+#training-search-input:focus-visible {
+    background-color: transparent;
+    border-width: 0;
+    box-shadow: none;
+}
+
+#training-search-icon {
+    width: 13dp;
+    height: 13dp;
+    margin-right: 4dp;
+    flex-shrink: 0;
+}
+
+#training-search-clear {
+    width: 12dp;
+    height: 12dp;
+    margin-left: 4dp;
+    padding: 0;
+    background-color: transparent;
+    border-width: 0;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+#training-search-clear img {
+    width: 12dp;
+    height: 12dp;
 }
 
 .training-panel-title {
@@ -50,21 +166,8 @@ body {
     margin-top: 0;
 }
 
-.training-subsection-title {
-    padding-top: 6dp;
-    border-top-width: 1dp;
-    margin-bottom: 4dp;
-    font-size: 12dp;
-    font-weight: bold;
-}
-
 .training-panel-block > .training-subsection:first-child {
     margin-top: 0;
-}
-
-.training-panel-block > .training-subsection:first-child > .training-subsection-title {
-    padding-top: 0;
-    border-top-width: 0;
 }
 
 .training-subsection > .section-header {
@@ -72,6 +175,49 @@ body {
 }
 
 .training-panel-block > .training-subsection:first-child > .section-header {
+}
+
+/* The lock belongs to the iterations label, so the field keeps the width of every other number field. */
+.prop-label--with-action {
+    display: flex;
+    align-items: center;
+}
+
+.prop-label__text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Translations exceed the shared 120dp column. Wrap inside that column. */
+.training-scroll-region .prop-label,
+.training-scroll-region .prop-label__text {
+    height: auto;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    word-break: break-word;
+}
+
+.prop-label--with-action > .steps-scale-lock-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18dp;
+    height: 18dp;
+    margin-left: 4dp;
+    padding: 0;
+    flex-shrink: 0;
+    box-sizing: border-box;
+    line-height: 0;
+}
+
+.prop-label--with-action > .steps-scale-lock-btn img {
+    display: block;
+    width: 12dp;
+    height: 12dp;
 }
 
 .loss-graph-wrap {
@@ -93,7 +239,6 @@ body {
 }
 
 .loss-tick {
-    font-family: "JetBrains Mono";
     font-size: 12dp;
     text-align: right;
     white-space: nowrap;

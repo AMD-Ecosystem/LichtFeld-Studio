@@ -30,10 +30,21 @@
 #endif
 
 
+// CUMSUM_INDIRECT=1: the element count is GPU-resident (per-level counts
+// written by prepare_visible_chain) and the dispatch is indirect, so the host
+// never needs to know the visible count. numElements carries the
+// level index instead of the count.
+#ifndef CUMSUM_INDIRECT
+#define CUMSUM_INDIRECT 0
+#endif
+
 layout(binding=0) StructuredBuffer<int32_t> g_input;
 
 layout(binding=1) RWStructuredBuffer<int32_t> g_output;
 layout(binding=2) RWStructuredBuffer<int32_t> g_blockSums;
+#if CUMSUM_INDIRECT
+layout(binding=3) StructuredBuffer<int32_t> g_counts;
+#endif
 
 
 groupshared int32_t s_data[BLOCK_SIZE_0];
@@ -44,6 +55,18 @@ struct Uniforms {
     // uint32_t stride;
 };
 
+[ForceInline]
+int32_t sat_add(int32_t a, int32_t b) {
+    const uint32_t sum = uint32_t(a) + uint32_t(b);
+    return int32_t(min(sum, 0x7fffffffu));
+}
+
+#if CUMSUM_INDIRECT
+#define RESOLVE_NUM_ELEMENTS(u) uint32_t(max(g_counts[(u).numElements], 0))
+#else
+#define RESOLVE_NUM_ELEMENTS(u) (u).numElements
+#endif
+
 
 
 // Utility function for subgroup-level scan
@@ -53,10 +76,9 @@ int32_t subgroupScan(int32_t val, uint laneId) {
         // int32_t temp = WaveReadLaneAt(val, (laneId - offset) & (SUBGROUP_SIZE - 1));
         int32_t temp = WaveReadLaneAt(val, laneId - offset);
         if (laneId >= offset)
-            val += temp;
+            val = sat_add(val, temp);
     }
     return val;
-    // return val + WavePrefixSum(val);
 }
 
 
@@ -67,46 +89,55 @@ void blockScan(
     uint3 localId : SV_GroupThreadID,
     uniform Uniforms uniforms
 ) {
+    const uint32_t numElements = RESOLVE_NUM_ELEMENTS(uniforms);
     uint tid = localId.x;
-    if (tid >= BLOCK_SIZE)
-        return;
+    // The workgroup always launches BLOCK_SIZE_0 threads (numthreads is compile-time),
+    // but only BLOCK_SIZE of them do work. Every launched thread must reach each
+    // GroupMemoryBarrierWithGroupSync — a barrier hit by only a subset of the workgroup
+    // is undefined behavior. So gate the shared-memory/wave work with `active` instead of
+    // returning early. BLOCK_SIZE is always a whole multiple of SUBGROUP_SIZE, so each
+    // subgroup is uniformly active or inactive and the wave ops keep their semantics.
+    const bool active = (tid < BLOCK_SIZE);
     uint blockId = groupId.x;
     uint gid = blockId * BLOCK_SIZE + tid;
 
     // Load data into shared memory
-    s_data[tid] = (gid < uniforms.numElements) ? g_input[gid] : 0;
+    if (active)
+        s_data[tid] = (gid < numElements) ? g_input[gid] : 0;
     GroupMemoryBarrierWithGroupSync();
 
     // Subgroup-level scan
     uint subgroupId = tid / SUBGROUP_SIZE;
     uint laneId = tid % SUBGROUP_SIZE;
 
-    int32_t subgroupSum = subgroupScan(s_data[tid], laneId);
-    s_data[tid] = subgroupSum;
+    if (active) {
+        int32_t subgroupSum = subgroupScan(s_data[tid], laneId);
+        s_data[tid] = subgroupSum;
+    }
     GroupMemoryBarrierWithGroupSync();
 
     // Block-level scan of subgroup sums
-    if (tid < (BLOCK_SIZE / SUBGROUP_SIZE)) {
+    if (active && tid < (BLOCK_SIZE / SUBGROUP_SIZE)) {
         int32_t subgroupSumVal = s_data[tid * SUBGROUP_SIZE + SUBGROUP_SIZE - 1];
-        int32_t blockScanResult = subgroupSumVal + WavePrefixSum(subgroupSumVal);
+        int32_t blockScanResult = subgroupScan(subgroupSumVal, laneId);
         s_data[tid * SUBGROUP_SIZE + SUBGROUP_SIZE - 1] = blockScanResult;
     }
     GroupMemoryBarrierWithGroupSync();
 
     // Distribute block scan results back to subgroups
-    if (subgroupId > 0 && laneId != SUBGROUP_SIZE - 1) {
+    if (active && subgroupId > 0 && laneId != SUBGROUP_SIZE - 1) {
         int32_t subgroupOffset = s_data[subgroupId * SUBGROUP_SIZE - 1];
-        s_data[tid] += subgroupOffset;
+        s_data[tid] = sat_add(s_data[tid], subgroupOffset);
     }
     GroupMemoryBarrierWithGroupSync();
 
     // Write results and block sum
-    if (gid < uniforms.numElements) {
+    if (active && gid < numElements) {
         g_output[gid] = s_data[tid];
     }
 
     // Store block sum for next phase
-    if (tid == BLOCK_SIZE - 1) {
+    if (active && tid == BLOCK_SIZE - 1) {
         g_blockSums[blockId] = s_data[tid];
     }
 }
@@ -119,39 +150,43 @@ void scanBlockSums(
     uint3 localId : SV_GroupThreadID,
     uniform Uniforms uniforms
 ) {
+    const uint32_t numElements = RESOLVE_NUM_ELEMENTS(uniforms);
     uint tid = localId.x;
-    if (tid >= BLOCK_SIZE)
-        return;
+    // See blockScan: gate work with `active` so all launched threads reach every barrier.
+    const bool active = (tid < BLOCK_SIZE);
     uint blockId = groupId.x;
     uint gid = blockId * BLOCK_SIZE + tid;
 
     // Load block sums
-    s_data[tid] = (gid < uniforms.numElements) ? g_blockSums[gid] : 0;
+    if (active)
+        s_data[tid] = (gid < numElements) ? g_blockSums[gid] : 0;
     GroupMemoryBarrierWithGroupSync();
 
     // Perform scan similar to blockScan
     uint subgroupId = tid / SUBGROUP_SIZE;
     uint laneId = tid % SUBGROUP_SIZE;
 
-    int32_t subgroupSum = subgroupScan(s_data[tid], laneId);
-    s_data[tid] = subgroupSum;
+    if (active) {
+        int32_t subgroupSum = subgroupScan(s_data[tid], laneId);
+        s_data[tid] = subgroupSum;
+    }
     GroupMemoryBarrierWithGroupSync();
 
-    if (tid < (BLOCK_SIZE / SUBGROUP_SIZE)) {
+    if (active && tid < (BLOCK_SIZE / SUBGROUP_SIZE)) {
         int32_t subgroupSumVal = s_data[tid * SUBGROUP_SIZE + SUBGROUP_SIZE - 1];
-        int32_t blockScanResult = subgroupSumVal + WavePrefixSum(subgroupSumVal);
+        int32_t blockScanResult = subgroupScan(subgroupSumVal, laneId);
         s_data[tid * SUBGROUP_SIZE + SUBGROUP_SIZE - 1] = blockScanResult;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    if (subgroupId > 0 && laneId != SUBGROUP_SIZE-1) {
+    if (active && subgroupId > 0 && laneId != SUBGROUP_SIZE-1) {
         int32_t subgroupOffset = s_data[subgroupId * SUBGROUP_SIZE - 1];
-        s_data[tid] += subgroupOffset;
+        s_data[tid] = sat_add(s_data[tid], subgroupOffset);
     }
     GroupMemoryBarrierWithGroupSync();
 
     // Write scanned block sums back
-    if (gid < uniforms.numElements) {
+    if (active && gid < numElements) {
         g_blockSums[gid] = s_data[tid];
     }
 }
@@ -164,14 +199,15 @@ void addBlockOffsets(
     uint3 localId : SV_GroupThreadID,
     uniform Uniforms uniforms
 ) {
+    const uint32_t numElements = RESOLVE_NUM_ELEMENTS(uniforms);
     uint tid = localId.x;
     if (tid >= BLOCK_SIZE)
         return;
     uint blockId = groupId.x;
     uint gid = blockId * BLOCK_SIZE + tid;
 
-    if (gid < uniforms.numElements && blockId > 0) {
-        g_output[gid] += g_blockSums[blockId-1];
+    if (gid < numElements && blockId > 0) {
+        g_output[gid] = sat_add(g_output[gid], g_blockSums[blockId-1]);
     }
 }
 
@@ -183,18 +219,20 @@ void singlePassPrefixSum(
     uint3 globalId : SV_DispatchThreadID,
     uniform Uniforms uniforms
 ) {
+    const uint32_t numElements = RESOLVE_NUM_ELEMENTS(uniforms);
     uint tid = localId.x;
     uint gid = globalId.x;
 
     // Load data
-    int32_t v_in = (gid < uniforms.numElements) ? g_input[gid] : 0;
+    int32_t v_in = (gid < numElements) ? g_input[gid] : 0;
     s_data[tid] = v_in;
     GroupMemoryBarrierWithGroupSync();
 
     // Up-sweep (reduction) phase
     for (uint stride = 1; stride < BLOCK_SIZE_0; stride <<= 1) {
         if (tid % (stride * 2) == 0) {
-            s_data[tid + stride * 2 - 1] += s_data[tid + stride - 1];
+            s_data[tid + stride * 2 - 1] = sat_add(
+                s_data[tid + stride * 2 - 1], s_data[tid + stride - 1]);
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -210,13 +248,13 @@ void singlePassPrefixSum(
         if (tid % (stride * 2) == 0) {
             int32_t temp = s_data[tid + stride - 1];
             s_data[tid + stride - 1] = s_data[tid + stride * 2 - 1];
-            s_data[tid + stride * 2 - 1] += temp;
+            s_data[tid + stride * 2 - 1] = sat_add(s_data[tid + stride * 2 - 1], temp);
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
     // Write exclusive prefix sum result
-    if (gid < uniforms.numElements) {
-        g_output[gid] = s_data[tid] + v_in;
+    if (gid < numElements) {
+        g_output[gid] = sat_add(s_data[tid], v_in);
     }
 }

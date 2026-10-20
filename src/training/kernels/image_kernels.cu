@@ -2,30 +2,33 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/assert.hpp"
+#include "core/cuda_error.hpp"
+#include "densification_kernels.hpp"
 #include "image_kernels.hpp"
 
 #include "cuda.h"
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <type_traits>
 
+#include "kernel_stream.hpp"
+
 namespace lfs::filters {
 
-    // Adapted from spirulae-splat Densify.cu canny_edge_filter_kernel
-    // (Apache-2.0, commit 8f2ecddc76e6de2e04f88ba8ee5f03b2439766d4):
-    // https://github.com/harry7557558/spirulae-splat/blob/8f2ecddc76e6de2e04f88ba8ee5f03b2439766d4/spirulae_splat/splat/cuda/csrc/Densify.cu#L663
-    // Changes here: raw CHW input/output pointers instead of Spirulae's batched HWC TensorView.
-    __constant__ float SPIRULAE_BLUR_5x5[25] = {
+    // Adapted from a reference Canny edge filter implementation (Apache-2.0); raw CHW input/output pointers instead of batched HWC.
+    __constant__ float CANNY_GAUSSIAN_BLUR_5x5[25] = {
         2.f / 159.f, 4.f / 159.f, 5.f / 159.f, 4.f / 159.f, 2.f / 159.f,
         4.f / 159.f, 9.f / 159.f, 12.f / 159.f, 9.f / 159.f, 4.f / 159.f,
         5.f / 159.f, 12.f / 159.f, 15.f / 159.f, 12.f / 159.f, 5.f / 159.f,
         4.f / 159.f, 9.f / 159.f, 12.f / 159.f, 9.f / 159.f, 4.f / 159.f,
         2.f / 159.f, 4.f / 159.f, 5.f / 159.f, 4.f / 159.f, 2.f / 159.f};
 
-    __constant__ float SPIRULAE_CANNY_3x3[9] = {
+    __constant__ float CANNY_SOBEL_3x3[9] = {
         -1.0f, 0.0f, 1.0f,
         -2.0f, 0.0f, 2.0f,
         -1.0f, 0.0f, 1.0f};
@@ -42,12 +45,24 @@ namespace lfs::training::kernels {
         }
     }
 
-    template <typename InputT>
+    template <typename MaskT>
+    __device__ __forceinline__ bool canny_keeps(const MaskT value, const MaskPhotoMode mode) {
+        if (mode == MaskPhotoMode::BinaryGt0)
+            return value > 0;
+        if constexpr (std::is_same_v<MaskT, uint8_t>)
+            return value > 250;
+        else
+            return value > kMaskKeepMin;
+    }
+
+    template <typename InputT, typename MaskT>
     __global__ void fused_canny_edge_filter_chw_kernel(
         const InputT* __restrict__ input,
+        const MaskT* __restrict__ mask,
         float* __restrict__ output,
         const int height,
-        const int width) {
+        const int width,
+        const MaskPhotoMode mode) {
         constexpr int BLOCK = 32;
         constexpr int HALO = 4;
         constexpr int HALO1 = 2;
@@ -61,6 +76,7 @@ namespace lfs::training::kernels {
         const int plane_size = height * width;
 
         __shared__ float shared_pixels[PIXELS_SHARED][PIXELS_SHARED];
+        __shared__ uint8_t shared_valid[PIXELS_SHARED][PIXELS_SHARED];
 #pragma unroll
         for (int batch = 0; batch < PIXELS_SHARED * PIXELS_SHARED; batch += BLOCK * BLOCK) {
             const int tid = batch + threadIdx.y * BLOCK + threadIdx.x;
@@ -70,10 +86,16 @@ namespace lfs::training::kernels {
                 const int yi = min(max(static_cast<int>(blockIdx.y * BLOCK) + y - HALO, 0), height - 1);
                 const int xi = min(max(static_cast<int>(blockIdx.x * BLOCK) + x - HALO, 0), width - 1);
                 const int idx = yi * width + xi;
-                shared_pixels[y][x] =
-                    0.299f * canny_input_value(input, idx) +
-                    0.587f * canny_input_value(input, idx + plane_size) +
-                    0.114f * canny_input_value(input, idx + 2 * plane_size);
+                bool keep = true;
+                if constexpr (!std::is_void_v<MaskT>) {
+                    keep = canny_keeps(mask[idx], mode);
+                    shared_valid[y][x] = keep;
+                }
+                shared_pixels[y][x] = keep
+                                          ? 0.299f * canny_input_value(input, idx) +
+                                                0.587f * canny_input_value(input, idx + plane_size) +
+                                                0.114f * canny_input_value(input, idx + 2 * plane_size)
+                                          : 0.0f;
             }
         }
         __syncthreads();
@@ -93,7 +115,7 @@ namespace lfs::training::kernels {
             for (int cy = -2; cy <= 2; ++cy) {
 #pragma unroll
                 for (int cx = -2; cx <= 2; ++cx) {
-                    const float conv_weight = lfs::filters::SPIRULAE_BLUR_5x5[(cy + 2) * 5 + (cx + 2)];
+                    const float conv_weight = lfs::filters::CANNY_GAUSSIAN_BLUR_5x5[(cy + 2) * 5 + (cx + 2)];
                     const int yi = y - HALO1 + cy;
                     const int xi = x - HALO1 + cx;
                     total += conv_weight * shared_pixels[yi + HALO][xi + HALO];
@@ -119,8 +141,8 @@ namespace lfs::training::kernels {
             for (int cy = -1; cy <= 1; ++cy) {
 #pragma unroll
                 for (int cx = -1; cx <= 1; ++cx) {
-                    const float conv_weight_1 = lfs::filters::SPIRULAE_CANNY_3x3[(cy + 1) * 3 + (cx + 1)];
-                    const float conv_weight_2 = lfs::filters::SPIRULAE_CANNY_3x3[(cx + 1) * 3 + (cy + 1)];
+                    const float conv_weight_1 = lfs::filters::CANNY_SOBEL_3x3[(cy + 1) * 3 + (cx + 1)];
+                    const float conv_weight_2 = lfs::filters::CANNY_SOBEL_3x3[(cx + 1) * 3 + (cy + 1)];
                     const int yi = y - HALO2 + cy;
                     const int xi = x - HALO2 + cx;
                     const float value = shared_blurred[yi + HALO1][xi + HALO1];
@@ -132,6 +154,16 @@ namespace lfs::training::kernels {
         }
         __syncthreads();
 
+        if (yid >= height || xid >= width)
+            return;
+        if constexpr (!std::is_void_v<MaskT>) {
+            for (int dy = -HALO; dy <= HALO; ++dy)
+                for (int dx = -HALO; dx <= HALO; ++dx)
+                    if (!shared_valid[threadIdx.y + HALO + dy][threadIdx.x + HALO + dx]) {
+                        output[yid * width + xid] = 0.0f;
+                        return;
+                    }
+        }
         float2 gradient = shared_filtered[threadIdx.y + HALO2][threadIdx.x + HALO2];
         float mag = hypotf(gradient.x, gradient.y);
         if (mag > 0.0f) {
@@ -144,20 +176,45 @@ namespace lfs::training::kernels {
             }
         }
 
-        if (yid < height && xid < width) {
-            output[yid * width + xid] = mag;
-        }
+        output[yid * width + xid] = mag;
     }
 
     __global__ void normalize_by_device_scalar_kernel(
         float* __restrict__ data,
         const std::size_t n,
-        const float* __restrict__ scalar) {
-        const float divisor = fmaxf(*scalar, 1e-9f);
+        const float* __restrict__ scalar,
+        const float skip_below) {
+        const float value = *scalar;
+        if (value <= skip_below) {
+            return;
+        }
+        const float divisor = fmaxf(value, 1e-9f);
         const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
         for (std::size_t i = idx; i < n; i += stride) {
             data[i] /= divisor;
+        }
+    }
+
+    template <typename InputT>
+    __global__ void composite_over_background_kernel(
+        const InputT* __restrict__ rgb,
+        const float* __restrict__ alpha,
+        const float* __restrict__ background_color,
+        const float* __restrict__ background_image,
+        float* __restrict__ output,
+        const std::size_t pixels) {
+        const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= pixels) {
+            return;
+        }
+        const float a = fminf(fmaxf(alpha[i], 0.0f), 1.0f);
+        for (int c = 0; c < 3; ++c) {
+            const std::size_t at = c * pixels + i;
+            const float color = std::is_same_v<InputT, uint8_t> ? static_cast<float>(rgb[at]) * (1.0f / 255.0f)
+                                                                : static_cast<float>(rgb[at]);
+            const float background = background_image ? background_image[at] : background_color[c];
+            output[at] = color * a + background * (1.0f - a);
         }
     }
 
@@ -166,18 +223,68 @@ namespace lfs::training::kernels {
     // ============================================================================
 
     template <typename InputT>
-    void launch_fused_canny_edge_filter_chw_impl(
-        const InputT* d_input_chw,
-        float* d_output_hw,
+    void launch_composite_over_background_impl(
+        const InputT* d_rgb_chw,
+        const float* d_alpha_hw,
+        const float* d_background_color,
+        const float* d_background_image_chw,
+        float* d_output_chw,
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        const std::size_t pixels = static_cast<std::size_t>(height) * static_cast<std::size_t>(width);
+        if (pixels == 0) {
+            return;
+        }
+        constexpr int block_size = 256;
+        const auto blocks = static_cast<unsigned int>((pixels + block_size - 1) / block_size);
+        composite_over_background_kernel<<<blocks, block_size, 0, stream>>>(
+            d_rgb_chw, d_alpha_hw, d_background_color, d_background_image_chw, d_output_chw, pixels);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.image.composite_over_background");
+    }
+
+    void launch_composite_over_background(
+        const float* d_rgb_chw, const float* d_alpha_hw, const float* d_background_color,
+        const float* d_background_image_chw, float* d_output_chw, const int height, const int width,
+        cudaStream_t stream) {
+        launch_composite_over_background_impl(d_rgb_chw, d_alpha_hw, d_background_color, d_background_image_chw,
+                                              d_output_chw, height, width, stream);
+    }
+
+    void launch_composite_over_background(
+        const uint8_t* d_rgb_chw, const float* d_alpha_hw, const float* d_background_color,
+        const float* d_background_image_chw, float* d_output_chw, const int height, const int width,
+        cudaStream_t stream) {
+        launch_composite_over_background_impl(d_rgb_chw, d_alpha_hw, d_background_color, d_background_image_chw,
+                                              d_output_chw, height, width, stream);
+    }
+
+    template <typename InputT, typename MaskT>
+    void launch_fused_canny_edge_filter_chw_impl(
+        const InputT* d_input_chw,
+        const MaskT* d_mask,
+        float* d_output_hw,
+        const int height,
+        const int width,
+        const MaskPhotoMode mode,
+        cudaStream_t stream) {
+        stream = resolve_stream(stream);
         dim3 blockDim(32, 32, 1);
         dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
                      (height + blockDim.y - 1) / blockDim.y);
 
-        fused_canny_edge_filter_chw_kernel<InputT><<<gridDim, blockDim, 0, stream>>>(
-            d_input_chw, d_output_hw, height, width);
+        fused_canny_edge_filter_chw_kernel<InputT, MaskT><<<gridDim, blockDim, 0, stream>>>(
+            d_input_chw, d_mask, d_output_hw, height, width, mode);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.image.canny_edge_chw");
+    }
+
+    template <typename InputT>
+    void launch_fused_canny_edge_filter_chw_impl(
+        const InputT* d_input_chw, float* d_output_hw, const int height,
+        const int width, cudaStream_t stream) {
+        launch_fused_canny_edge_filter_chw_impl<InputT, void>(
+            d_input_chw, nullptr, d_output_hw, height, width, MaskPhotoMode::BinaryGt0, stream);
     }
 
     void launch_fused_canny_edge_filter_chw(
@@ -186,6 +293,7 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
     }
 
@@ -195,21 +303,150 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
+    }
+
+    void compute_edge_weight_map(
+        const lfs::core::Tensor& image,
+        const lfs::core::Tensor& photometric_mask,
+        const MaskPhotoMode mask_mode,
+        lfs::core::Tensor& edges,
+        cudaStream_t stream) {
+        LFS_ASSERT_MSG(image.is_valid() && image.device() == lfs::core::Device::CUDA && image.ndim() == 3 &&
+                           image.shape()[0] >= 3,
+                       "edge-weight input must be CUDA CHW image data");
+        const size_t height = image.shape()[1];
+        const size_t width = image.shape()[2];
+        LFS_ASSERT_MSG(edges.is_valid() && edges.dtype() == lfs::core::DataType::Float32 && edges.ndim() == 2 &&
+                           edges.shape()[0] == height && edges.shape()[1] == width,
+                       "edge-weight output must be a Float32 [H,W] map");
+        const int h = static_cast<int>(height);
+        const int w = static_cast<int>(width);
+        const lfs::core::Tensor mask = photometric_mask.is_valid() && photometric_mask.numel() > 0
+                                           ? (photometric_mask.ndim() == 3 ? photometric_mask.squeeze(0) : photometric_mask)
+                                           : lfs::core::Tensor{};
+        if (mask.is_valid()) {
+            LFS_ASSERT_MSG(mask.ndim() == 2 && mask.shape()[0] == height && mask.shape()[1] == width &&
+                               mask.device() == lfs::core::Device::CUDA,
+                           "edge-weight mask must be a CUDA [H,W] map matching the image");
+            mask.sync_to_stream(stream);
+        }
+
+        if (image.dtype() == lfs::core::DataType::UInt8) {
+            if (!mask.is_valid())
+                launch_fused_canny_edge_filter_chw(image.ptr<uint8_t>(), edges.ptr<float>(), h, w, stream);
+            else if (mask.dtype() == lfs::core::DataType::Float32)
+                launch_fused_canny_edge_filter_chw_impl<uint8_t, float>(
+                    image.ptr<uint8_t>(), mask.ptr<float>(), edges.ptr<float>(), h, w, mask_mode, stream);
+            else
+                launch_fused_canny_edge_filter_chw_impl<uint8_t, uint8_t>(
+                    image.ptr<uint8_t>(), mask.ptr<uint8_t>(), edges.ptr<float>(), h, w, mask_mode, stream);
+        } else {
+            LFS_ASSERT_MSG(image.dtype() == lfs::core::DataType::Float32, "edge-weight input must be float32 or uint8");
+            if (!mask.is_valid())
+                launch_fused_canny_edge_filter_chw(image.ptr<float>(), edges.ptr<float>(), h, w, stream);
+            else if (mask.dtype() == lfs::core::DataType::Float32)
+                launch_fused_canny_edge_filter_chw_impl<float, float>(
+                    image.ptr<float>(), mask.ptr<float>(), edges.ptr<float>(), h, w, mask_mode, stream);
+            else
+                launch_fused_canny_edge_filter_chw_impl<float, uint8_t>(
+                    image.ptr<float>(), mask.ptr<uint8_t>(), edges.ptr<float>(), h, w, mask_mode, stream);
+        }
+
+        if (mask.is_valid()) {
+            if (mask.dtype() == lfs::core::DataType::Float32) {
+                launch_zero_where_photometric_weight_is_zero_f32(edges.ptr<float>(), mask.ptr<float>(), h, w, mask_mode, stream);
+            } else {
+                launch_zero_where_photometric_weight_is_zero_u8(edges.ptr<float>(), mask.ptr<uint8_t>(), h, w, mask_mode, stream);
+            }
+        }
+
+        launch_normalize_by_positive_median(edges.ptr<float>(), height * width, stream);
     }
 
     void launch_normalize_by_device_scalar(
         float* d_data,
         const std::size_t n,
         const float* d_scalar,
+        const float skip_below,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         if (n == 0) {
             return;
         }
 
         constexpr int block_size = 256;
         const int grid_size = static_cast<int>(std::min<std::size_t>((n + block_size - 1) / block_size, 4096));
-        normalize_by_device_scalar_kernel<<<grid_size, block_size, 0, stream>>>(d_data, n, d_scalar);
-        cudaStreamSynchronize(stream);
+        normalize_by_device_scalar_kernel<<<grid_size, block_size, 0, stream>>>(d_data, n, d_scalar, skip_below);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.image.normalize_by_scalar");
+    }
+
+    namespace {
+        // levels arrives at run time so the division compiles exactly like the tensor library's scalar division,
+        // which the saved and evaluated images have always used.
+        __global__ void quantize_to_grid_kernel(const float* __restrict__ input, float* __restrict__ output,
+                                                const std::size_t n, const float levels) {
+            for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n;
+                 i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+                const float clamped = fminf(fmaxf(input[i], 0.0f), 1.0f);
+                output[i] = truncf(__fadd_rn(__fmul_rn(clamped, levels), 0.5f)) / levels;
+            }
+        }
+    } // namespace
+
+    lfs::core::Tensor quantize_to_8bit_grid(const lfs::core::Tensor& image) {
+        return quantize_to_grid(image, 255.0f);
+    }
+
+    lfs::core::Tensor quantize_to_grid(const lfs::core::Tensor& image, const float levels) {
+        assert(image.device() == lfs::core::Device::CUDA && image.dtype() == lfs::core::DataType::Float32);
+        assert(levels >= 1.0f);
+        const cudaStream_t stream = resolve_stream(image.stream());
+        const auto source = image.contiguous();
+        source.sync_to_stream(stream);
+        auto out = lfs::core::Tensor::empty(source.shape(), lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+        out.set_stream(stream);
+        const std::size_t n = source.numel();
+        if (n == 0)
+            return out;
+        constexpr int block_size = 256;
+        const int grid_size = static_cast<int>(std::min<std::size_t>((n + block_size - 1) / block_size, 4096));
+        quantize_to_grid_kernel<<<grid_size, block_size, 0, stream>>>(source.ptr<float>(), out.ptr<float>(), n,
+                                                                      levels);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.image.quantize_to_grid");
+        return out;
+    }
+
+    lfs::core::Tensor composite_over_background(const lfs::core::Tensor& rgb,
+                                                const lfs::core::Tensor& alpha,
+                                                const lfs::core::Tensor& background) {
+        using lfs::core::DataType;
+        assert(rgb.device() == lfs::core::Device::CUDA && rgb.ndim() == 3 && rgb.shape()[0] == 3);
+        assert(rgb.dtype() == DataType::Float32 || rgb.dtype() == DataType::UInt8);
+        const size_t height = rgb.shape()[1], width = rgb.shape()[2];
+        assert(alpha.dtype() == DataType::Float32 && alpha.numel() == height * width);
+        assert(background.dtype() == DataType::Float32 &&
+               (background.numel() == 3 || background.numel() == 3 * height * width));
+        const cudaStream_t stream = resolve_stream(rgb.stream());
+        const auto source = rgb.contiguous();
+        const auto coverage = alpha.contiguous();
+        const auto backdrop = background.contiguous();
+        source.sync_to_stream(stream);
+        coverage.sync_to_stream(stream);
+        backdrop.sync_to_stream(stream);
+        auto out = lfs::core::Tensor::empty(source.shape(), lfs::core::Device::CUDA, DataType::Float32);
+        out.set_stream(stream);
+        const bool per_pixel = backdrop.numel() != 3;
+        const float* color = per_pixel ? nullptr : backdrop.ptr<float>();
+        const float* image = per_pixel ? backdrop.ptr<float>() : nullptr;
+        if (source.dtype() == DataType::UInt8) {
+            launch_composite_over_background(source.ptr<uint8_t>(), coverage.ptr<float>(), color, image, out.ptr<float>(),
+                                             static_cast<int>(height), static_cast<int>(width), stream);
+        } else {
+            launch_composite_over_background(source.ptr<float>(), coverage.ptr<float>(), color, image, out.ptr<float>(),
+                                             static_cast<int>(height), static_cast<int>(width), stream);
+        }
+        return out;
     }
 } // namespace lfs::training::kernels

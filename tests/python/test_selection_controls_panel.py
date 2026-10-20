@@ -19,9 +19,11 @@ def _install_lf_stub(monkeypatch):
         depth_enabled=False,
         depth_near=0.25,
         depth_far=7.5,
+        depth_read_error=False,
         depth_width=1.35,
         depth_calls=[],
         stage_calls=[],
+        command_calls=[],
         undo_available=True,
         redo_available=True,
         undo_calls=0,
@@ -45,6 +47,9 @@ def _install_lf_stub(monkeypatch):
         get_active_tool=lambda: state.active_tool,
         get_active_submode=lambda: state.active_submode,
         message_dialog=lambda *_args, **_kwargs: None,
+        select_all_gaussians=lambda: state.command_calls.append("select_all"),
+        invert_gaussian_selection=lambda: state.command_calls.append("invert"),
+        deselect_all_gaussians=lambda: state.command_calls.append("deselect_all"),
     )
     lf_stub.has_scene = lambda: state.has_scene
     lf_stub.get_scene = lambda: _SceneStub() if state.has_scene else None
@@ -56,22 +61,22 @@ def _install_lf_stub(monkeypatch):
         state.depth_width = float(width)
         state.depth_calls.append((state.depth_enabled, state.depth_near, state.depth_far, state.depth_width))
 
-    lf_stub.selection = SimpleNamespace(
-        get_depth_filter_range=lambda: (
+    def _get_depth_filter_range():
+        if state.depth_read_error:
+            raise RuntimeError("depth state unavailable")
+        return (
             state.depth_enabled,
             state.depth_near,
             state.depth_far,
             state.depth_width,
-        ),
+        )
+
+    lf_stub.selection = SimpleNamespace(
+        get_depth_filter_range=_get_depth_filter_range,
         set_depth_filter_range=_set_depth_filter_range,
     )
     lf_stub.pipeline = SimpleNamespace(
         edit=SimpleNamespace(delete_=lambda: _StageStub("edit.delete")),
-        select=SimpleNamespace(
-            all=lambda: _StageStub("select.all"),
-            invert=lambda: _StageStub("select.invert"),
-            none=lambda: _StageStub("select.none"),
-        ),
     )
     lf_stub.undo = SimpleNamespace(
         can_undo=lambda: state.undo_available,
@@ -117,6 +122,7 @@ class _ElementStub:
         self.classes = set()
         self.attributes = {}
         self.listeners = []
+        self.select_calls = 0
 
     def set_class(self, name, active):
         if active:
@@ -132,6 +138,33 @@ class _ElementStub:
 
     def set_attribute(self, name, value):
         self.attributes[name] = value
+
+    def parent(self):
+        return self
+
+    def select(self):
+        self.select_calls += 1
+        return True
+
+    def emit(self, name, event=None):
+        event = event or _InputEventStub()
+        for event_name, callback in list(self.listeners):
+            if event_name == name:
+                callback(event)
+
+
+class _InputEventStub:
+    def __init__(self, *, linebreak=False):
+        self._linebreak = linebreak
+        self.propagation_stopped = False
+
+    def get_bool_parameter(self, name, default=False):
+        if name == "linebreak":
+            return self._linebreak
+        return default
+
+    def stop_propagation(self):
+        self.propagation_stopped = True
 
 
 class _DocumentStub:
@@ -175,7 +208,7 @@ def test_selection_controls_show_for_selection_modes(selection_controls_module):
     panel.update(doc)
 
     assert "hidden" not in doc.wrap.classes
-    assert model.bound_funcs["selection_mode_label"]() == "Rectangle"
+    assert "selection_mode_label" not in model.bound_funcs
     assert model.bound_funcs["selection_has_scene"]() is True
     assert model.bound_funcs["selection_has_selection"]() is True
     assert model.bound_funcs["selection_can_undo"]() is True
@@ -189,8 +222,21 @@ def test_selection_controls_show_for_selection_modes(selection_controls_module):
     state.active_submode = "lasso"
     panel.update(doc)
 
-    assert model.bound_funcs["selection_mode_label"]() == "Lasso"
-    assert "selection_mode_label" in model.handle.dirty_calls
+    assert "selection_mode_label" not in model.handle.dirty_calls
+
+
+def test_selection_depth_fallback_far_defaults_to_6(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+
+    state.depth_read_error = True
+    panel.bind_model(model)
+    panel.update(_DocumentStub())
+
+    assert model.bound_binds["selection_depth_near_str"][0]() == "0.00"
+    assert model.bound_binds["selection_depth_far_str"][0]() == "6.00"
+    assert model.bound_funcs["selection_depth_far_slider_max"]() == "26.000"
 
 
 def test_selection_depth_toggle_and_sliders_use_selection_api(selection_controls_module):
@@ -204,14 +250,114 @@ def test_selection_depth_toggle_and_sliders_use_selection_api(selection_controls
     model.bound_events["selection_action"](None, None, ["toggle_depth"])
     assert state.depth_calls[-1] == (True, 0.25, 7.5, 1.35)
 
-    model.bound_binds["selection_depth_near_str"][1]("1.5")
+    model.bound_binds["selection_depth_near_value"][1]("1.5")
     assert state.depth_calls[-1] == (True, 1.5, 7.5, 1.35)
 
-    model.bound_binds["selection_depth_far_str"][1]("2.0")
+    model.bound_binds["selection_depth_far_value"][1]("2.0")
     assert state.depth_calls[-1] == (True, 1.5, 2.0, 1.35)
 
 
-def test_selection_actions_use_undoable_pipeline_and_history(selection_controls_module):
+def test_selection_depth_user_edit_mark_expires(selection_controls_module, monkeypatch):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+
+    panel.bind_model(model)
+    panel.update(_DocumentStub())
+    panel._depth_echo_holdoff = 1
+    panel._mark_depth_user_edit("near")
+    marked_at = module.time.monotonic()
+    monkeypatch.setattr(
+        module.time,
+        "monotonic",
+        lambda: marked_at + module._DEPTH_USER_EDIT_MARK_TTL + 0.01,
+    )
+
+    model.bound_binds["selection_depth_near_value"][1]("1.5")
+
+    assert state.depth_calls == []
+    assert "near" not in panel._depth_user_edit_pending
+
+
+def test_selection_depth_text_fields_commit_like_panel_inputs(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+    doc = _DocumentStub()
+
+    state.depth_enabled = True
+    panel.bind_model(model)
+    panel.mount(doc)
+    panel.update(doc)
+
+    near_getter, near_setter = model.bound_binds["selection_depth_near_str"]
+    far_getter, far_setter = model.bound_binds["selection_depth_far_str"]
+
+    doc.near.emit("focus")
+    near_setter("1")
+
+    assert doc.near.select_calls == 1
+    assert near_getter() == "1"
+    assert state.depth_calls == []
+
+    doc.near.emit("change", _InputEventStub(linebreak=True))
+
+    assert state.depth_calls[-1] == (True, 1.0, 7.5, 1.35)
+    assert near_getter() == "1.00"
+
+    far_setter("9")
+    assert far_getter() == "9"
+
+    doc.far.emit("blur")
+
+    assert state.depth_calls[-1] == (True, 1.0, 9.0, 1.35)
+    assert far_getter() == "9.00"
+
+
+def test_selection_depth_text_escape_reverts_pending_edit(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+    doc = _DocumentStub()
+
+    panel.bind_model(model)
+    panel.mount(doc)
+    panel.update(doc)
+
+    near_getter, near_setter = model.bound_binds["selection_depth_near_str"]
+    event = _InputEventStub()
+
+    doc.near.emit("focus")
+    near_setter("4")
+    doc.near.emit("escapecancel", event)
+
+    assert near_getter() == "0.25"
+    assert state.depth_calls == []
+    assert event.propagation_stopped
+
+
+def test_selection_depth_text_invalid_commit_reverts(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+    doc = _DocumentStub()
+
+    panel.bind_model(model)
+    panel.mount(doc)
+    panel.update(doc)
+
+    near_getter, near_setter = model.bound_binds["selection_depth_near_str"]
+
+    doc.near.emit("focus")
+    near_setter("not-a-number")
+    doc.near.emit("blur")
+
+    assert near_getter() == "0.25"
+    assert state.depth_calls == []
+
+
+# Catches toolbar buttons that bypass the Select menu commands, which honor group locks and filters.
+def test_selection_actions_use_the_select_menu_commands_and_history(selection_controls_module):
     module, state = selection_controls_module
     panel = module.SelectionControlsController()
     model = _DataModelStub()
@@ -225,7 +371,8 @@ def test_selection_actions_use_undoable_pipeline_and_history(selection_controls_
     model.bound_events["selection_action"](None, None, ["undo"])
     model.bound_events["selection_action"](None, None, ["redo"])
 
-    assert state.stage_calls == ["edit.delete", "select.all", "select.invert", "select.none"]
+    assert state.stage_calls == ["edit.delete"]
+    assert state.command_calls == ["select_all", "invert", "deselect_all"]
     assert state.undo_calls == 1
     assert state.redo_calls == 1
 

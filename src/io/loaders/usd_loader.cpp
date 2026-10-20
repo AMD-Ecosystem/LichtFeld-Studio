@@ -4,6 +4,7 @@
 
 #include "usd_loader.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
 #include "formats/nurec_usdz.hpp"
@@ -21,6 +22,13 @@ namespace lfs::io {
     using lfs::core::SplatData;
     using lfs::core::Tensor;
 
+    namespace {
+        std::string_view project_error_message(const lfs::Error& error) {
+            return error.user_message().empty() ? error.detail()
+                                                : error.user_message();
+        }
+    } // namespace
+
     Result<LoadResult> USDLoader::load(
         const std::filesystem::path& path,
         const LoadOptions& options) {
@@ -34,19 +42,19 @@ namespace lfs::io {
             options.progress(0.0f, "Loading USD gaussian file...");
         }
 
-        if (!std::filesystem::exists(path)) {
+        if (!lfs::core::native_fs::exists(path)) {
             return make_error(ErrorCode::PATH_NOT_FOUND,
                               "USD file does not exist",
                               path);
         }
 
-        if (!std::filesystem::is_regular_file(path)) {
+        if (!lfs::core::native_fs::is_regular_file(path)) {
             return make_error(ErrorCode::NOT_A_FILE,
                               "Path is not a regular file",
                               path);
         }
 
-        auto extension = path.extension().string();
+        auto extension = lfs::core::path_to_utf8(path.extension());
         std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
 
         if (options.validate_only) {
@@ -98,6 +106,7 @@ namespace lfs::io {
 
         std::string loader_used = name();
         std::expected<SplatData, std::string> splat_result = std::unexpected(std::string{"USD loader not initialized"});
+        std::optional<double> usd_meters_per_unit;
 
         if (extension == ".usdz") {
             const auto nurec_hint = is_nurec_usdz(path);
@@ -118,9 +127,10 @@ namespace lfs::io {
                     options.progress(50.0f, "Parsing OpenUSD data...");
                 }
 
-                auto openusd_result = load_usd(path);
+                auto openusd_result = load_usd_project_units(path);
                 if (openusd_result) {
-                    splat_result = std::move(openusd_result);
+                    usd_meters_per_unit = openusd_result->meters_per_unit;
+                    splat_result = std::move(openusd_result->data);
                 } else if (!nurec_hint) {
                     LOG_INFO("USDZ archive inspection failed for {}: {}. Trying NuRec fallback after OpenUSD failure.",
                              lfs::core::path_to_utf8(path), nurec_hint.error());
@@ -135,13 +145,14 @@ namespace lfs::io {
                     } else {
                         return make_error(ErrorCode::CORRUPTED_DATA,
                                           std::format("Failed to load USD gaussian file: OpenUSD: {}; NuRec USDZ: {}",
-                                                      openusd_result.error(),
+                                                      project_error_message(openusd_result.error()),
                                                       nurec_result.error()),
                                           path);
                     }
                 } else {
                     return make_error(ErrorCode::CORRUPTED_DATA,
-                                      std::format("Failed to load USD gaussian file: {}", openusd_result.error()),
+                                      std::format("Failed to load USD gaussian file: {}",
+                                                  project_error_message(openusd_result.error())),
                                       path);
                 }
             }
@@ -150,12 +161,15 @@ namespace lfs::io {
                 options.progress(50.0f, "Parsing OpenUSD ParticleField...");
             }
 
-            splat_result = load_usd(path);
-            if (!splat_result) {
+            auto openusd_result = load_usd_project_units(path);
+            if (!openusd_result) {
                 return make_error(ErrorCode::CORRUPTED_DATA,
-                                  std::format("Failed to load USD gaussian file: {}", splat_result.error()),
+                                  std::format("Failed to load USD gaussian file: {}",
+                                              project_error_message(openusd_result.error())),
                                   path);
             }
+            usd_meters_per_unit = openusd_result->meters_per_unit;
+            splat_result = std::move(openusd_result->data);
         }
 
         if (options.progress) {
@@ -170,18 +184,29 @@ namespace lfs::io {
             .scene_center = Tensor::zeros({3}, Device::CPU),
             .loader_used = loader_used,
             .load_time = load_time,
-            .warnings = {}};
+            .warnings = {},
+            .georeference =
+                usd_meters_per_unit
+                    ? std::optional<ImportGeoreference>(
+                          ImportGeoreference{
+                              .crs = std::nullopt,
+                              .world_origin = {},
+                              .world_unit_scale = *usd_meters_per_unit,
+                              .world_origin_provenance =
+                                  ImportWorldOriginProvenance::Import,
+                          })
+                    : std::nullopt};
 
         LOG_INFO("USD gaussian file loaded successfully in {}ms", load_time.count());
         return result;
     }
 
     bool USDLoader::canLoad(const std::filesystem::path& path) const {
-        if (!std::filesystem::exists(path) || std::filesystem::is_directory(path)) {
+        if (!lfs::core::native_fs::exists(path) || lfs::core::native_fs::is_directory(path)) {
             return false;
         }
 
-        auto ext = path.extension().string();
+        auto ext = lfs::core::path_to_utf8(path.extension());
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         return ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz";
     }

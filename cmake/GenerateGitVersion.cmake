@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+if(NOT DEFINED GIT_SRC_DIR OR GIT_SRC_DIR STREQUAL "")
+    message(FATAL_ERROR "GIT_SRC_DIR is required")
+endif()
+if(NOT IS_DIRECTORY "${GIT_SRC_DIR}")
+    message(FATAL_ERROR "GIT_SRC_DIR is not a directory: ${GIT_SRC_DIR}")
+endif()
+if(NOT DEFINED GIT_VERSION_HEADER OR GIT_VERSION_HEADER STREQUAL "")
+    message(FATAL_ERROR "GIT_VERSION_HEADER is required")
+endif()
+
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY "${GIT_SRC_DIR}"
+    OUTPUT_VARIABLE GIT_COMMIT_HASH_SHORT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+execute_process(
+    COMMAND git describe --tags --dirty --always --match "v*"
+    WORKING_DIRECTORY "${GIT_SRC_DIR}"
+    OUTPUT_VARIABLE GIT_TAGGED_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+if(NOT GIT_COMMIT_HASH_SHORT AND DEFINED ENV{GITHUB_SHA} AND NOT "$ENV{GITHUB_SHA}" STREQUAL "")
+    string(SUBSTRING "$ENV{GITHUB_SHA}" 0 7 GIT_COMMIT_HASH_SHORT)
+endif()
+if(NOT GIT_TAGGED_VERSION)
+    if(DEFINED ENV{GITHUB_REF_TYPE} AND "$ENV{GITHUB_REF_TYPE}" STREQUAL "tag" AND
+       DEFINED ENV{GITHUB_REF_NAME} AND NOT "$ENV{GITHUB_REF_NAME}" STREQUAL "")
+        set(GIT_TAGGED_VERSION "$ENV{GITHUB_REF_NAME}")
+    elseif(GIT_COMMIT_HASH_SHORT)
+        set(GIT_TAGGED_VERSION "${GIT_COMMIT_HASH_SHORT}")
+    endif()
+endif()
+if(NOT GIT_COMMIT_HASH_SHORT)
+    set(GIT_COMMIT_HASH_SHORT "unknown")
+endif()
+if(NOT GIT_TAGGED_VERSION)
+    set(GIT_TAGGED_VERSION "unknown")
+endif()
+
+# A build past the last release tag is work toward the version the project declares, so it is named after that
+# version: v0.5.5-dev-12-g1a2b3c4 instead of v0.5.4-12-g1a2b3c4. A build exactly at a release tag keeps the tag.
+if(NOT DEFINED LFS_PROJECT_VERSION AND DEFINED PROJECT_VERSION)
+    set(LFS_PROJECT_VERSION "${PROJECT_VERSION}")
+endif()
+if(DEFINED LFS_PROJECT_VERSION AND NOT LFS_PROJECT_VERSION STREQUAL "" AND
+   GIT_TAGGED_VERSION MATCHES "^v[0-9][0-9.]*-([0-9]+)-g([0-9a-f]+)(-dirty)?$")
+    set(GIT_TAGGED_VERSION "v${LFS_PROJECT_VERSION}-dev-${CMAKE_MATCH_1}-g${CMAKE_MATCH_2}${CMAKE_MATCH_3}")
+endif()
+
+set(GIT_VERSION_CONTENT
+    "#pragma once\n#define GIT_COMMIT_HASH_SHORT \"${GIT_COMMIT_HASH_SHORT}\"\n#define GIT_TAGGED_VERSION \"${GIT_TAGGED_VERSION}\"\n")
+
+set(CURRENT_GIT_VERSION_CONTENT "")
+if(EXISTS "${GIT_VERSION_HEADER}")
+    file(READ "${GIT_VERSION_HEADER}" CURRENT_GIT_VERSION_CONTENT)
+endif()
+
+if(NOT EXISTS "${GIT_VERSION_HEADER}" OR
+   NOT CURRENT_GIT_VERSION_CONTENT STREQUAL GIT_VERSION_CONTENT)
+    get_filename_component(GIT_VERSION_HEADER_DIR "${GIT_VERSION_HEADER}" DIRECTORY)
+    file(MAKE_DIRECTORY "${GIT_VERSION_HEADER_DIR}")
+    file(WRITE "${GIT_VERSION_HEADER}" "${GIT_VERSION_CONTENT}")
+endif()

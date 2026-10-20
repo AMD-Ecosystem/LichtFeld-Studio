@@ -3,10 +3,12 @@
 """Selection controls controller for the viewport selection overlay."""
 
 import math
+import time
 
 import lichtfeld as lf
 
 from . import rml_widgets as w
+from .ui import RuntimeState
 
 try:
     from .ui import native_value as _native_store_value
@@ -21,19 +23,11 @@ _DEPTH_MAX = 1000.0
 _DEPTH_GAP = 0.01
 _DEPTH_SLIDER_HALF_WINDOW = 20.0
 _DEPTH_SLIDER_MIN_SPAN = 1.0
+_DEPTH_USER_EDIT_MARK_TTL = 0.75
 _DEFAULT_DEPTH_NEAR = 0.0
-_DEFAULT_DEPTH_FAR = 5.3
+_DEFAULT_DEPTH_FAR = 6.0
 _DEFAULT_FRUSTUM_HALF_WIDTH = 1.35
 _MISSING = object()
-
-_MODE_LABELS = {
-    "centers": ("toolbar.brush_selection", "Brush"),
-    "rectangle": ("toolbar.rect_selection", "Rectangle"),
-    "polygon": ("toolbar.polygon_selection", "Polygon"),
-    "lasso": ("toolbar.lasso_selection", "Lasso"),
-    "rings": ("toolbar.ring_selection", "Rings"),
-    "color": ("toolbar.color_selection", "Color"),
-}
 
 
 def _ui_label(key: str, fallback: str) -> str:
@@ -89,7 +83,7 @@ def _execute_stage(stage):
     result = stage.execute()
     result_get = getattr(result, "get", None)
     if result_get is None:
-        return "Operation returned an invalid result."
+        return _ui_label("selection.operation_failed_generic", "Operation failed.")
     if bool(result_get("ok", False)):
         return None
     error = str(result_get("error", "") or "").strip()
@@ -98,8 +92,6 @@ def _execute_stage(stage):
 
 class SelectionControlsController:
     _DIRTY_FIELDS = (
-        "selection_tool_label",
-        "selection_mode_label",
         "selection_depth_mode_active",
         "selection_has_scene",
         "selection_has_selection",
@@ -138,10 +130,16 @@ class SelectionControlsController:
         self._frustum_half_width = _DEFAULT_FRUSTUM_HALF_WIDTH
         self._last_state_key = None
         self._last_state_items = None
+        self._depth_echo_holdoff = 0
+        self._depth_user_edit_pending = {}
+        self._depth_text_bufs = {
+            "selection_depth_near_str": None,
+            "selection_depth_far_str": None,
+        }
+        self._editing_depth_text = set()
+        self._escape_revert = w.EscapeRevertController()
 
     def bind_model(self, model):
-        model.bind_func("selection_tool_label", lambda: _ui_label("toolbar.selection", "Select"))
-        model.bind_func("selection_mode_label", self._mode_label)
         model.bind_func("selection_depth_mode_active", lambda: self._depth_enabled)
         model.bind_func("selection_has_scene", lambda: self._has_scene)
         model.bind_func("selection_has_selection", lambda: self._has_selection)
@@ -163,8 +161,8 @@ class SelectionControlsController:
 
         model.bind(
             "selection_depth_near_str",
-            lambda: f"{self._depth_near:.2f}",
-            self._set_depth_near,
+            lambda: self._depth_text_value("selection_depth_near_str"),
+            lambda value: self._set_depth_text_value("selection_depth_near_str", value),
         )
         model.bind(
             "selection_depth_near_value",
@@ -175,8 +173,8 @@ class SelectionControlsController:
         model.bind_func("selection_depth_near_slider_max", lambda: f"{self._near_slider_bounds()[1]:.3f}")
         model.bind(
             "selection_depth_far_str",
-            lambda: f"{self._depth_far:.2f}",
-            self._set_depth_far,
+            lambda: self._depth_text_value("selection_depth_far_str"),
+            lambda value: self._set_depth_text_value("selection_depth_far_str", value),
         )
         model.bind(
             "selection_depth_far_value",
@@ -198,8 +196,20 @@ class SelectionControlsController:
         if wrap:
             wrap.set_class("hidden", True)
 
-        for input_id in ("selection-depth-near", "selection-depth-far"):
-            w.bind_select_all_on_focus(doc.get_element_by_id(input_id))
+        self._mount_depth_text_input(doc, "selection-depth-near", "selection_depth_near_str")
+        self._mount_depth_text_input(doc, "selection-depth-far", "selection_depth_far_str")
+        for element_id, key in (
+            ("selection-depth-near-slider", "near"),
+            ("selection-depth-far-slider", "far"),
+        ):
+            slider = doc.get_element_by_id(element_id)
+            if slider is not None:
+                slider.add_event_listener(
+                    "mousedown", lambda _event, k=key: self._mark_depth_user_edit(k)
+                )
+                slider.add_event_listener(
+                    "focus", lambda _event, k=key: self._mark_depth_user_edit(k)
+                )
 
     def update(self, doc):
         dirty = False
@@ -220,7 +230,14 @@ class SelectionControlsController:
             self._last_state_items = None
             return ",".join(dirty_reasons) if dirty else None
 
+        previous_depth = (self._depth_near, self._depth_far)
         self._refresh_state()
+        # RmlUi range inputs echo stale values when attributes update in the same frame.
+        if (self._depth_near, self._depth_far) != previous_depth:
+            self._depth_echo_holdoff = 2
+        else:
+            self._depth_echo_holdoff = max(0, self._depth_echo_holdoff - 1)
+        self._sync_depth_text_bufs()
         state_items = self._state_items()
         state_key = self._state_key(state_items)
         if state_key != self._last_state_key:
@@ -237,10 +254,10 @@ class SelectionControlsController:
         self._visible = False
         self._last_state_key = None
         self._last_state_items = None
-
-    def _mode_label(self):
-        key, fallback = _MODE_LABELS.get(self._active_mode, ("toolbar.selection", "Selection"))
-        return _ui_label(key, fallback)
+        self._depth_echo_holdoff = 0
+        self._depth_user_edit_pending.clear()
+        self._editing_depth_text.clear()
+        self._escape_revert.clear()
 
     def _get_active_tool(self):
         value = _native_store_value("active_tool", _MISSING)
@@ -294,6 +311,7 @@ class SelectionControlsController:
 
     def _state_items(self):
         return (
+            ("language_generation", RuntimeState.language_generation.value),
             ("active_tool", self._active_tool),
             ("active_mode", self._active_mode),
             ("has_scene", self._has_scene),
@@ -368,15 +386,32 @@ class SelectionControlsController:
             return False
 
     def _set_depth_near(self, value):
+        if not self._depth_setter_allowed("near"):
+            return
         self._refresh_depth_state()
         near = _clamp(_parse_float(value, self._depth_near), _DEPTH_MIN, _DEPTH_MAX - _DEPTH_GAP)
         far = max(self._depth_far, near + _DEPTH_GAP)
         self._apply_depth_range(self._depth_enabled, near, far)
 
     def _set_depth_far(self, value):
+        if not self._depth_setter_allowed("far"):
+            return
         self._refresh_depth_state()
         far = _clamp(_parse_float(value, self._depth_far), self._depth_near + _DEPTH_GAP, _DEPTH_MAX)
         self._apply_depth_range(self._depth_enabled, self._depth_near, far)
+
+    def _mark_depth_user_edit(self, key):
+        self._depth_user_edit_pending[key] = time.monotonic()
+
+    def _depth_setter_allowed(self, key):
+        if not self._visible or self._last_state_key is None:
+            return False
+        marked_at = self._depth_user_edit_pending.pop(key, None)
+        user_edit = (
+            marked_at is not None
+            and time.monotonic() - marked_at <= _DEPTH_USER_EDIT_MARK_TTL
+        )
+        return self._depth_echo_holdoff == 0 or user_edit
 
     def _apply_depth_range(self, enabled, near, far):
         self._depth_enabled = bool(enabled)
@@ -396,7 +431,81 @@ class SelectionControlsController:
                 or _ui_label("selection.update_depth_failed", "Could not update selection depth filter.")
             )
 
+        self._sync_depth_text_bufs()
         self._dirty_all()
+
+    def _mount_depth_text_input(self, doc, input_id, key):
+        w.bind_committed_text_input(
+            doc.get_element_by_id(input_id),
+            key,
+            escape_revert=self._escape_revert,
+            capture=lambda k=key: self._capture_depth_text_snapshot(k),
+            restore=lambda snapshot, k=key: self._restore_depth_text_snapshot(k, snapshot),
+            commit=self._commit_depth_text_key,
+            on_focus=self._begin_depth_text_edit,
+            on_blur=self._end_depth_text_edit,
+        )
+
+    def _depth_text_value(self, key):
+        value = self._depth_text_bufs.get(key)
+        if value is not None:
+            return value
+        return self._canonical_depth_text_value(key)
+
+    def _set_depth_text_value(self, key, value):
+        self._depth_text_bufs[key] = str(value)
+
+    def _begin_depth_text_edit(self, key):
+        self._editing_depth_text.add(key)
+        if key == "selection_depth_near_str":
+            self._mark_depth_user_edit("near")
+        elif key == "selection_depth_far_str":
+            self._mark_depth_user_edit("far")
+
+    def _end_depth_text_edit(self, key):
+        self._editing_depth_text.discard(key)
+
+    def _capture_depth_text_snapshot(self, key):
+        return self._canonical_depth_text_value(key)
+
+    def _restore_depth_text_snapshot(self, key, snapshot):
+        self._depth_text_bufs[key] = str(snapshot or "")
+        if self._handle:
+            self._handle.dirty(key)
+
+    def _commit_depth_text_key(self, key):
+        value = self._depth_text_bufs.get(key)
+        if value is not None and value.strip():
+            parsed = _parse_float(value, None)
+            if parsed is None:
+                self._sync_depth_text_bufs(force=True)
+                return
+            if key == "selection_depth_near_str":
+                self._mark_depth_user_edit("near")
+                self._set_depth_near(parsed)
+            elif key == "selection_depth_far_str":
+                self._mark_depth_user_edit("far")
+                self._set_depth_far(parsed)
+
+        self._sync_depth_text_bufs(force=True)
+
+    def _sync_depth_text_bufs(self, force=False):
+        for key in self._depth_text_bufs:
+            if not force and key in self._editing_depth_text:
+                continue
+            canonical = self._canonical_depth_text_value(key)
+            if self._depth_text_bufs.get(key) == canonical:
+                continue
+            self._depth_text_bufs[key] = canonical
+            if self._handle:
+                self._handle.dirty(key)
+
+    def _canonical_depth_text_value(self, key):
+        if key == "selection_depth_near_str":
+            return f"{self._depth_near:.2f}"
+        if key == "selection_depth_far_str":
+            return f"{self._depth_far:.2f}"
+        return ""
 
     def _on_action(self, handle, event, args):
         del handle, event
@@ -405,14 +514,15 @@ class SelectionControlsController:
 
         action = str(args[0])
         if action == "toggle_depth":
+            self._depth_echo_holdoff = 0
             self._refresh_depth_state()
             self._apply_depth_range(not self._depth_enabled, self._depth_near, self._depth_far)
         elif action == "delete":
             self._execute_selection_stage(lambda: lf.pipeline.edit.delete_())
         elif action == "select_all":
-            self._execute_selection_stage(lambda: lf.pipeline.select.all())
+            self._run_selection_command(lf.ui.select_all_gaussians)
         elif action == "unselect":
-            self._execute_selection_stage(lambda: lf.pipeline.select.none())
+            self._run_selection_command(lf.ui.deselect_all_gaussians)
         elif action == "undo":
             try:
                 if lf.undo.can_undo():
@@ -426,7 +536,7 @@ class SelectionControlsController:
             except Exception as exc:
                 self._report_error(str(exc).strip() or _ui_label("selection.redo_failed", "Redo failed."))
         elif action == "invert":
-            self._execute_selection_stage(lambda: lf.pipeline.select.invert())
+            self._run_selection_command(lf.ui.invert_gaussian_selection)
 
         self._refresh_state()
         self._dirty_all()
@@ -438,6 +548,13 @@ class SelectionControlsController:
             error = str(exc).strip() or _ui_label("selection.operation_failed_generic", "Operation failed.")
         if error:
             self._report_error(error)
+
+    def _run_selection_command(self, command):
+        """The toolbar buttons run the same commands as the Select menu and their shortcuts."""
+        try:
+            command()
+        except Exception as exc:
+            self._report_error(str(exc).strip() or _ui_label("selection.operation_failed_generic", "Operation failed."))
 
     def _report_error(self, message):
         dialog = getattr(lf.ui, "message_dialog", None)
@@ -458,7 +575,6 @@ class SelectionControlsController:
             return
 
         field_map = {
-            "active_mode": ("selection_mode_label",),
             "has_scene": (
                 "selection_has_scene",
                 "selection_depth_near_str",
@@ -504,7 +620,7 @@ class SelectionControlsController:
 
         dirty_fields = []
         for changed in changed_fields:
-            if changed == "active_tool":
+            if changed in {"active_tool", "language_generation"}:
                 self._dirty_all()
                 return
             dirty_fields.extend(field_map.get(changed, ()))

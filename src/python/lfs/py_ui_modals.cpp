@@ -4,9 +4,20 @@
 
 #include "core/logger.hpp"
 #include "py_ui.hpp"
+#include "python/python_runtime.hpp"
+#include "visualizer/gui/gui_manager.hpp"
+#include "visualizer/gui/rml_modal_overlay.hpp"
+#include "visualizer/post_work_utils.hpp"
+#include "visualizer/visualizer.hpp"
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
+#include <functional>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <utility>
 
 namespace lfs::python {
 
@@ -44,6 +55,83 @@ namespace lfs::python {
             default: return lfs::core::ModalStyle::Info;
             }
         }
+
+        struct ModalView {
+            std::optional<vis::gui::ModalSnapshot> snap;
+            std::size_t pending = 0;
+        };
+
+        template <typename F>
+        auto invoke_on_viewer(F&& fn, std::invoke_result_t<F> fallback) {
+            auto* const viewer = get_visualizer();
+            if (!viewer || viewer->isOnViewerThread())
+                return std::invoke(std::forward<F>(fn));
+            if (!viewer->acceptsPostedWork())
+                return fallback;
+            nb::gil_scoped_release release;
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                std::forward<F>(fn),
+                [fallback]() { return fallback; });
+        }
+
+        ModalView read_modal_view() {
+            auto* const gui = get_gui_manager();
+            auto* const overlay = gui ? gui->modalOverlay() : nullptr;
+            if (!overlay)
+                return {};
+            return ModalView{overlay->current(), overlay->pending_count()};
+        }
+
+        bool press_modal_button(const std::string& label) {
+            auto* const gui = get_gui_manager();
+            auto* const overlay = gui ? gui->modalOverlay() : nullptr;
+            if (!overlay)
+                return false;
+            return overlay->dismiss(label);
+        }
+
+        std::optional<nb::dict> modal_view_to_dict(const ModalView& view) {
+            if (!view.snap)
+                return std::nullopt;
+            nb::dict result;
+            result["title"] = view.snap->title;
+            result["body"] = view.snap->body_text;
+            nb::list buttons;
+            const auto n = view.snap->button_labels.size() < view.snap->button_enabled.size()
+                               ? view.snap->button_labels.size()
+                               : view.snap->button_enabled.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                nb::dict button;
+                button["label"] = view.snap->button_labels[i];
+                button["enabled"] = static_cast<bool>(view.snap->button_enabled[i]);
+                buttons.append(button);
+            }
+            result["buttons"] = buttons;
+            result["has_input"] = view.snap->has_input;
+            result["pending"] = view.pending;
+            return result;
+        }
+
+        std::vector<lfs::core::ModalButtonSpec> form_buttons(const nb::list& buttons) {
+            std::vector<lfs::core::ModalButtonSpec> result;
+            for (auto item : buttons) {
+                const auto button = nb::cast<nb::dict>(item);
+                const auto label = nb::cast<std::string>(button["label"]);
+                const auto style = button.contains("style") ? nb::cast<std::string>(button["style"]) : "secondary";
+                if (style != "primary" && style != "secondary" && style != "error" && style != "warning" && style != "success")
+                    throw nb::value_error("Unknown modal button style");
+                result.push_back({label, style, button.contains("disabled") && nb::cast<bool>(button["disabled"])});
+            }
+            return result;
+        }
+
+        nb::dict form_values(const lfs::core::ModalResult& result) {
+            nb::dict values;
+            for (const auto& [key, value] : result.form_values)
+                values[nb::str(key.c_str())] = value;
+            return values;
+        }
     } // namespace
 
     void PyModalRegistry::draw_modals() {
@@ -70,7 +158,9 @@ namespace lfs::python {
             case ModalDialogType::Confirm: {
                 for (size_t i = 0; i < modal.buttons.size(); ++i) {
                     const std::string style = (i == 0) ? "primary" : "secondary";
-                    req.buttons.push_back({modal.buttons[i], style});
+                    const std::string button_style =
+                        (i == 0 && modal.style == MessageStyle::Error) ? "error" : style;
+                    req.buttons.push_back({modal.buttons[i], button_style});
                 }
 
                 if (modal.cpp_callback) {
@@ -88,13 +178,12 @@ namespace lfs::python {
                             LOG_ERROR("Modal callback error: {}", e.what());
                         }
                     };
-                    const std::string cancel_label = modal.buttons.size() >= 2
-                                                         ? modal.buttons.back()
-                                                         : "";
-                    req.on_cancel = [py_cb, cancel_label]() {
+                    // Cancellation is state cleanup, not an implicit click on
+                    // whichever button happens to be last.
+                    req.on_cancel = [py_cb]() {
                         nb::gil_scoped_acquire gil;
                         try {
-                            (*py_cb)(cancel_label);
+                            (*py_cb)("");
                         } catch (const std::exception& e) {
                             LOG_ERROR("Modal cancel callback error: {}", e.what());
                         }
@@ -155,14 +244,90 @@ namespace lfs::python {
 
     void register_ui_modals(nb::module_& m) {
         m.def(
+            "form_dialog",
+            [](const std::string& key, const std::string& title, const std::string& body_rml,
+               const nb::list& buttons, nb::object callback, nb::object on_change, int width) {
+                if (key.empty())
+                    throw nb::value_error("A form dialog needs a nonempty key");
+                lfs::core::ModalRequest req;
+                req.key = key;
+                req.title = escapeRml(title);
+                req.body_rml = body_rml;
+                req.width_dp = std::clamp(width, 320, 960);
+                req.buttons = form_buttons(buttons);
+                if (!callback.is_none()) {
+                    auto cb = make_safe_py_func(std::move(callback));
+                    req.on_result = [cb](const lfs::core::ModalResult& result) {
+                        nb::gil_scoped_acquire gil;
+                        try {
+                            (*cb)(result.button_label, form_values(result));
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("Form dialog callback error: {}", e.what());
+                        }
+                    };
+                    req.on_cancel = [cb]() {
+                        nb::gil_scoped_acquire gil;
+                        try {
+                            (*cb)("", nb::dict{});
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("Form dialog cancel callback error: {}", e.what());
+                        }
+                    };
+                }
+                if (!on_change.is_none()) {
+                    auto cb = make_safe_py_func(std::move(on_change));
+                    req.on_change = [cb](const lfs::core::ModalResult& result) {
+                        nb::gil_scoped_acquire gil;
+                        try {
+                            (*cb)(form_values(result));
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("Form dialog change callback error: {}", e.what());
+                        }
+                    };
+                }
+                return invoke_on_viewer([req = std::move(req)]() mutable {
+                    auto* gui = get_gui_manager();
+                    if (!gui)
+                        return false;
+                    gui->enqueueModal(std::move(req));
+                    return true;
+                },
+                                        false);
+            },
+            nb::arg("key"), nb::arg("title"), nb::arg("body_rml"), nb::arg("buttons"),
+            nb::arg("callback"), nb::arg("on_change") = nb::none(), nb::arg("width") = 640,
+            "Show a form in the shared modal overlay. Escape user text in body_rml; callbacks receive native form values.");
+
+        m.def(
+            "form_dialog_update",
+            [](const std::string& key, const nb::list& buttons, const std::optional<std::string>& body_rml) {
+                auto specs = form_buttons(buttons);
+                return invoke_on_viewer([key, specs = std::move(specs), body_rml] {
+                    auto* gui = get_gui_manager();
+                    auto* overlay = gui ? gui->modalOverlay() : nullptr;
+                    return overlay && overlay->updateForm(key, body_rml, specs);
+                },
+                                        false);
+            },
+            nb::arg("key"), nb::arg("buttons"), nb::arg("body_rml") = nb::none(),
+            "Update a matching live or queued form. Omit body_rml to preserve input focus and values.");
+
+        m.def(
             "confirm_dialog",
             [](const std::string& title, const std::string& message,
-               const std::vector<std::string>& buttons, nb::object callback) {
-                PyModalRegistry::instance().show_confirm(title, message, buttons, callback);
+               const std::vector<std::string>& buttons, nb::object callback,
+               const std::string& style) {
+                MessageStyle msg_style = MessageStyle::Info;
+                if (style == "warning")
+                    msg_style = MessageStyle::Warning;
+                else if (style == "error")
+                    msg_style = MessageStyle::Error;
+                PyModalRegistry::instance().show_confirm(title, message, buttons, callback, msg_style);
             },
             nb::arg("title"), nb::arg("message"),
             nb::arg("buttons") = std::vector<std::string>{"OK", "Cancel"},
             nb::arg("callback") = nb::none(),
+            nb::arg("style") = "info",
             "Show a confirmation dialog with custom buttons");
 
         m.def(
@@ -191,6 +356,21 @@ namespace lfs::python {
             nb::arg("style") = "info",
             nb::arg("callback") = nb::none(),
             "Show a message dialog (style: 'info', 'warning', or 'error')");
+
+        m.def(
+            "modal_get",
+            []() -> std::optional<nb::dict> {
+                return modal_view_to_dict(invoke_on_viewer([] { return read_modal_view(); }, ModalView{}));
+            },
+            "Return the currently shown modal dialog as a dict, or None if none is open");
+
+        m.def(
+            "modal_press",
+            [](const std::string& label) {
+                return invoke_on_viewer([label] { return press_modal_button(label); }, false);
+            },
+            nb::arg("label"),
+            "Press an enabled modal button by label. Returns False if no matching enabled button.");
     }
 
 } // namespace lfs::python
