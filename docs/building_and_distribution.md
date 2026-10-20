@@ -230,7 +230,7 @@ Dependencies are supplied directly rather than through vcpkg:
 - ROCm 7.x (tested with 7.2), with `clang++` and `clang` from the ROCm LLVM directory. The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`; set it if ROCm is installed elsewhere.
 - GLM 1.0.1 or newer, passed as `-DLFS_GLM_INCLUDE_DIR`. Older GLM has no HIP path and its math will not compile in device code.
 - Taywee/args, passed as `-DLFS_ARGS_INCLUDE_DIR`.
-- spdlog, nlohmann-json, TBB, OpenImageIO and OpenMesh from the distribution packages.
+- spdlog, nlohmann-json, TBB, xxHash, libjpeg, libpng, libtiff, libwebp, OpenEXR 3 and OpenMesh from the distribution packages (on Ubuntu, `libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenexr-dev libxxhash-dev libopenmesh-dev`). xxHash is used header-only, so only `xxhash.h` is required.
 - With `-DBUILD_TESTS=ON`, GoogleTest and a ROCm build of LibTorch, which the tensor tests use as a comparison oracle. Both are found by config package, so point `GTest_DIR` and `Torch_DIR` at them or list their install prefixes in `CMAKE_PREFIX_PATH`. The `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
 
 ```bash
@@ -255,7 +255,7 @@ HIP_VISIBLE_DEVICES=0 ./build-hip/cmake/hip_tests/lfs_compute_tests
 
 The commands above are the Linux recipe. `CMAKE_HIP_COMPILER` does not have to be set when ROCm's `bin` directory is on `PATH`: CMake asks `hipconfig` where the ROCm Clang lives, and HIP is enabled at `project()` time so no reconfigure is needed. Otherwise name the compiler yourself with `-DCMAKE_HIP_COMPILER` or the `HIPCXX` environment variable; setting `ROCM_PATH` alone does not steer that search.
 
-On Windows, configure from a Visual Studio developer prompt so the MSVC libraries and linker are found. C and C++ use `clang-cl` and HIP uses `clang++`, both from the ROCm LLVM directory; HIP is enabled after C and C++, which lets the two front ends coexist. LibTorch comes from a ROCm PyTorch install, whose `LoadHIP.cmake` requires `PYTORCH_ROCM_ARCH` to name the target. OpenImageIO and OpenMesh are not needed on Windows. spdlog, nlohmann-json, TBB and GoogleTest are found by config package as on Linux, but Windows has no system location for them: list the install prefixes that hold them in `CMAKE_PREFIX_PATH`. If `clang++` cannot find the device libraries, set `HIP_DEVICE_LIB_PATH` to `%ROCM_PATH%\lib\llvm\amdgcn\bitcode`.
+On Windows, configure from a Visual Studio developer prompt so the MSVC libraries and linker are found. C and C++ use `clang-cl` and HIP uses `clang++`, both from the ROCm LLVM directory; HIP is enabled after C and C++, which lets the two front ends coexist. LibTorch comes from a ROCm PyTorch install, whose `LoadHIP.cmake` requires `PYTORCH_ROCM_ARCH` to name the target. The image codec libraries and OpenMesh are not needed on Windows. spdlog, nlohmann-json, TBB, GoogleTest and the `xxhash.h` header are found as on Linux, but Windows has no system location for them: list the install prefixes that hold them in `CMAKE_PREFIX_PATH`. If `clang++` cannot find the device libraries, set `HIP_DEVICE_LIB_PATH` to `%ROCM_PATH%\lib\llvm\amdgcn\bitcode`.
 
 ```bat
 set PYTORCH_ROCM_ARCH=gfx1151
