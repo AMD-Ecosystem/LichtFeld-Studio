@@ -339,6 +339,20 @@ target_include_directories(lfs_io INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src/io/
 add_subdirectory(src/diagnostics)
 add_subdirectory(src/geometry)
 add_subdirectory(src/core)
+# std::stacktrace in libstdc++ lives in libstdc++exp. Upstream links it for GCC;
+# the ROCm clang uses the same libstdc++ on Linux, so link it when it works.
+if(UNIX AND NOT APPLE)
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS "-std=c++23")
+    set(CMAKE_REQUIRED_LIBRARIES stdc++exp)
+    check_cxx_source_compiles("#include <stacktrace>
+int main() { return static_cast<int>(std::stacktrace::current().size()); }" LFS_HAVE_STDCXXEXP)
+    unset(CMAKE_REQUIRED_FLAGS)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(LFS_HAVE_STDCXXEXP)
+        target_link_libraries(lfs_core PRIVATE stdc++exp)
+    endif()
+endif()
 add_subdirectory(src/training)
 
 # ---- Focused GPU gtest binary ------------------------------------------------
