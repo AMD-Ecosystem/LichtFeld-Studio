@@ -788,6 +788,12 @@ namespace lfs::core::nn::kernels {
             launch_simt();
             return;
         }
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        // The HIP device pass compiles the WMMA and mma kernels to their pre-Volta
+        // branches, so take the SIMT kernel as a pre-Volta CUDA device does.
+        launch_simt();
+        return;
+#endif
         const bool auto75 = forced_path && std::strcmp(forced_path, "auto75") == 0;
         int device = 0;
         int major = 0;

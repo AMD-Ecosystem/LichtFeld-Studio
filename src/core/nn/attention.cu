@@ -861,6 +861,10 @@ namespace lfs::core::nn::kernels {
         }
         const bool is_half = dtype == DataType::Float16;
 
+#if !defined(USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
+        // The two fp16 tensor-core kernels below compile to their pre-Volta
+        // branches in the HIP device pass (the flash kernel to an empty body),
+        // so the HIP build uses the SIMT tiled kernels, which take fp16 too.
         if (is_half && d <= kFlashD && !has_mask && n_k > 0) {
             dim3 grid((n_q + kFlashBr - 1) / kFlashBr, batch * heads);
             const int smem = flash_d64_smem_bytes();
@@ -887,8 +891,11 @@ namespace lfs::core::nn::kernels {
             return;
         }
 
+#endif
+
         dim3 grid((n_q + kBr - 1) / kBr, batch * heads);
 
+#if !defined(USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
         if (is_half && d <= kFlashD && n_k > 0) {
             constexpr int Br = 64;
             constexpr int Bc = 64;
@@ -905,6 +912,8 @@ namespace lfs::core::nn::kernels {
             LFS_CUDA_LAUNCH_CHECK(stream, "nn.attention.wmma");
             return;
         }
+
+#endif
 
         if (d <= 64) {
             constexpr int Br = 64;
