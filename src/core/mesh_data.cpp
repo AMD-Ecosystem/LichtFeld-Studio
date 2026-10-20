@@ -3,14 +3,20 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/mesh_data.hpp"
+// The ROCm compute build on Windows has no OpenMesh package; the compute tests
+// never compute mesh normals.
+#if !(defined(USE_HIP) && defined(_WIN32))
 #include <OpenMesh/Core/Mesh/TriMesh_ArrayKernelT.hh>
+#endif
 #include <cassert>
 #include <stdexcept>
 #include <utility>
 
 namespace lfs::core {
 
+#if !(defined(USE_HIP) && defined(_WIN32))
     using TriMesh = OpenMesh::TriMesh_ArrayKernelT<>;
+#endif
 
     uint64_t MeshData::next_id() {
         static std::atomic<uint64_t> counter{0};
@@ -45,6 +51,11 @@ namespace lfs::core {
         }
     }
 
+#if defined(USE_HIP) && defined(_WIN32)
+    void MeshData::compute_normals() {
+        throw std::runtime_error("compute_normals: OpenMesh not available in compute-only Windows build");
+    }
+#else
     void MeshData::compute_normals() {
         validate_indices();
 
@@ -87,5 +98,6 @@ namespace lfs::core {
 
         mark_dirty();
     }
+#endif
 
 } // namespace lfs::core

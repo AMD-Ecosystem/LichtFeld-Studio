@@ -3,7 +3,7 @@
 #
 # ROCm/HIP compute-only build (linux-gfx90a). Builds the
 # libtorch-free GPU COMPUTE tranche -- tensor library, training kernels, and the
-# gsplat/fastgs/edge rasterizer backends -- plus a focused GPU gtest binary
+# gsplat/fastgs rasterizer backends -- plus a focused GPU gtest binary
 # (lfs_compute_tests). The full desktop app (GUI/Vulkan-interop/Python/MCP/USD/
 # nvImageCodec) is DEFERRED and never configured here. The top-level CMakeLists
 # returns immediately after including this file, so the NVIDIA path is untouched.
@@ -188,6 +188,11 @@ endif()
 if(NOT TARGET CUDA::nvToolsExt)
     add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
 endif()
+# Only the compile-only lfs_cuda_diagnostics_compile_check object library names
+# Vulkan; it is not part of the compute tests.
+if(NOT TARGET Vulkan::Vulkan)
+    add_library(Vulkan::Vulkan INTERFACE IMPORTED)
+endif()
 set(CUDAToolkit_INCLUDE_DIRS "" CACHE STRING "" FORCE)
 # Some leaf targets set CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}" on
 # their (now HIP) sources; give it a harmless value (HIP_ARCHITECTURES is what
@@ -215,6 +220,36 @@ configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/config.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/include/config.h" @ONLY)
 
+# lfs_core ABI stamp header (lfs_core depends on the lfs_core_abi_stamp target),
+# as in the top-level CMakeLists, with the HIP compiler in the device fields.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/InitializeCoreAbiStamp.cmake")
+lfs_initialize_core_abi_stamps()
+add_custom_target(lfs_core_abi_stamp ALL
+    BYPRODUCTS "${LFS_CORE_ABI_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        "-DLFS_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DLFS_CORE_ABI_TEMPLATE=${CMAKE_SOURCE_DIR}/cmake/lfs_core_abi_stamp.h.in"
+        "-DLFS_CORE_ABI_HEADER=${LFS_CORE_ABI_HEADER}"
+        "-DLFS_PROJECT_VERSION=${PROJECT_VERSION}"
+        "-DLFS_CONFIGURED_GIT_COMMIT_HASH_SHORT=${GIT_COMMIT_HASH_SHORT}"
+        "-DLFS_BUILD_CONFIG=$<CONFIG>"
+        "-DLFS_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
+        "-DLFS_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P}"
+        "-DLFS_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}"
+        "-DLFS_CXX_COMPILER_VERSION=${CMAKE_CXX_COMPILER_VERSION}"
+        "-DLFS_CUDA_COMPILER_ID=${CMAKE_HIP_COMPILER_ID}"
+        "-DLFS_CUDA_COMPILER_VERSION=${CMAKE_HIP_COMPILER_VERSION}"
+        "-DLFS_CUDA_ARCHITECTURES=${CMAKE_HIP_ARCHITECTURES}"
+        "-DLFS_VCPKG_TARGET_TRIPLET="
+        -P "${CMAKE_SOURCE_DIR}/cmake/GenerateCoreAbiStamp.cmake"
+    COMMENT "Refreshing lfs_core ABI stamp"
+    VERBATIM
+)
+add_compile_definitions(
+    $<$<CONFIG:Debug>:DEBUG_BUILD>
+    $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:RELEASE_BUILD>
+)
+
 # ---- Dependencies (no vcpkg: glm vendored, gtest conda, libtorch ROCm) -------
 # Use GLM 1.0.1 (vendored via -DLFS_GLM_INCLUDE_DIR), NOT the system 0.9.9.8:
 # 1.0.1 has a native GLM_COMPILER_HIP path so glm:: math compiles in __device__
@@ -232,30 +267,34 @@ find_package(OpenMP)
 find_package(spdlog REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(TBB REQUIRED)
-# lfs_core's Camera/Scene/image_io retain their CPU image + mesh paths; supply
-# the libs (installed via apt; vcpkg is not bootstrapped). The shipped binary's
-# GUI/io codec stack (FFmpeg/WebP/nvjpeg/USD/assimp) stays DEFERRED -- only the
-# compute libraries and their CPU data-structure deps are built here.
-# Construct the OpenImageIO target by hand: the apt -dev package's CMake config
-# references CLI tool binaries (iconvert/...) that the package omits, which trips
-# find_package. We only need the lib + headers for image_io.cpp.
-# On Windows, image_io.cpp and mesh_data.cpp are replaced by stubs that do not
-# include OIIO/OpenMesh headers, so both libraries are skipped on that platform.
+# lfs_logger hashes with xxHash. Use it header-only (XXH_INLINE_ALL) when no
+# CMake package is installed, so only xxhash.h is needed.
+find_package(xxHash CONFIG QUIET)
+if(NOT TARGET xxHash::xxhash)
+    find_path(LFS_XXHASH_INCLUDE_DIR xxhash.h REQUIRED)
+    add_library(xxHash::xxhash INTERFACE IMPORTED)
+    set_target_properties(xxHash::xxhash PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${LFS_XXHASH_INCLUDE_DIR}"
+        INTERFACE_COMPILE_DEFINITIONS XXH_INLINE_ALL)
+endif()
+# lfs_core keeps its CPU image codec and mesh paths. On Linux supply the codec
+# libraries (distribution packages; vcpkg is not bootstrapped) and OpenMesh. On
+# Windows image_codecs.cpp, image_exr.cpp and mesh_data.cpp are replaced by stubs
+# (src/core/CMakeLists.txt), so the targets are empty stand-ins there.
 if(NOT WIN32)
-    # OpenImageIO: on Linux use the apt-installed shared lib.
-    if(LFS_OIIO_LIB AND LFS_OIIO_INC)
-        set(OIIO_LIB "${LFS_OIIO_LIB}")
-        set(OIIO_INC "${LFS_OIIO_INC}")
-    else()
-        find_library(OIIO_LIB NAMES OpenImageIO HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
-        find_path(OIIO_INC NAMES OpenImageIO/imageio.h HINTS /usr/include REQUIRED)
+    find_package(JPEG REQUIRED)
+    find_package(PNG REQUIRED)
+    find_package(TIFF REQUIRED)
+    find_package(WebP CONFIG QUIET)
+    if(NOT TARGET WebP::webp)
+        find_library(LFS_WEBP_LIB NAMES webp REQUIRED)
+        find_path(LFS_WEBP_INC NAMES webp/decode.h REQUIRED)
+        add_library(WebP::webp INTERFACE IMPORTED)
+        set_target_properties(WebP::webp PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${LFS_WEBP_INC}"
+            INTERFACE_LINK_LIBRARIES "${LFS_WEBP_LIB}")
     endif()
-    if(NOT TARGET OpenImageIO::OpenImageIO)
-        add_library(OpenImageIO::OpenImageIO INTERFACE IMPORTED)
-        set_target_properties(OpenImageIO::OpenImageIO PROPERTIES
-            INTERFACE_INCLUDE_DIRECTORIES "${OIIO_INC}"
-            INTERFACE_LINK_LIBRARIES "${OIIO_LIB}")
-    endif()
+    find_package(OpenEXR CONFIG REQUIRED)
     # OpenMesh: on Linux the apt package ships OpenMeshCore (shared).
     if(LFS_OPENMESH_LIB AND LFS_OPENMESH_INC)
         set(OPENMESH_CORE_LIB "${LFS_OPENMESH_LIB}")
@@ -264,12 +303,16 @@ if(NOT WIN32)
         find_library(OPENMESH_CORE_LIB NAMES OpenMeshCore HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
         find_path(OPENMESH_INC NAMES OpenMesh/Core/Mesh/ArrayKernel.hh HINTS /usr/include REQUIRED)
     endif()
-    foreach(_omt OpenMeshCore OpenMeshCoreStatic)
-        if(NOT TARGET ${_omt})
-            add_library(${_omt} INTERFACE IMPORTED)
-            set_target_properties(${_omt} PROPERTIES
-                INTERFACE_INCLUDE_DIRECTORIES "${OPENMESH_INC}"
-                INTERFACE_LINK_LIBRARIES "${OPENMESH_CORE_LIB}")
+    if(NOT TARGET OpenMeshCore)
+        add_library(OpenMeshCore INTERFACE IMPORTED)
+        set_target_properties(OpenMeshCore PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${OPENMESH_INC}"
+            INTERFACE_LINK_LIBRARIES "${OPENMESH_CORE_LIB}")
+    endif()
+else()
+    foreach(_lfs_stub JPEG::JPEG PNG::PNG TIFF::TIFF WebP::webp OpenEXR::OpenEXRCore OpenMeshCore)
+        if(NOT TARGET ${_lfs_stub})
+            add_library(${_lfs_stub} INTERFACE IMPORTED)
         endif()
     endforeach()
 endif()
@@ -286,6 +329,11 @@ endif()
 # GLM device-code steering also needs GLM to NOT clamp z to [0,1] differently
 # than the kernels expect; keep its default (the GUI's GLM_FORCE_DEPTH_ZERO_TO_ONE
 # is a viewer convention, irrelevant to the compute math).
+
+# The io library is not built here. A few compute sources (MRNF, the depth
+# anchor cache) include its lightweight headers, so expose those only.
+add_library(lfs_io INTERFACE)
+target_include_directories(lfs_io INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src/io/include")
 
 # ---- Compute libraries (the tranche) -----------------------------------------
 add_subdirectory(src/diagnostics)

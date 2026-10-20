@@ -112,11 +112,11 @@ set(CORE_SOURCES
         persisted_settings.cpp
         legacy_settings_migration.cpp
 )
-# The ROCm compute build on Windows has no image codec or OpenMesh packages;
-# the compute tests never decode images or compute mesh normals, so use stubs.
+# The ROCm compute build on Windows has no image codec packages; the compute
+# tests never decode or encode image files, so use a stub.
 if(USE_HIP AND WIN32)
-    list(REMOVE_ITEM CORE_SOURCES image_codecs.cpp image_exr.cpp mesh_data.cpp)
-    list(APPEND CORE_SOURCES image_codecs_win_stub.cpp mesh_data_win_stub.cpp)
+    list(REMOVE_ITEM CORE_SOURCES image_codecs.cpp image_exr.cpp)
+    list(APPEND CORE_SOURCES image_codecs_win_stub.cpp)
 endif()
 
 add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})

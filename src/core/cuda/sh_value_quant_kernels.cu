@@ -30,11 +30,19 @@ namespace lfs::core::sh_value_quant {
             float range, normalized, value;
             const float code = static_cast<float>(q);
             constexpr float inv_q = 1.0f / 65535.0f;
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+            // The HIP build uses no fast math and keeps f32 denormals, so the RN
+            // intrinsics give the same rounding as the PTX below.
+            range = __fsub_rn(hi, lo);
+            normalized = __fmul_rn(code, inv_q);
+            value = __fmaf_rn(range, normalized, lo);
+#else
             // Explicit RN PTX also avoids fast-math's FTZ modifier.
             asm("sub.rn.f32 %0, %1, %2;" : "=f"(range) : "f"(hi), "f"(lo));
             asm("mul.rn.f32 %0, %1, %2;" : "=f"(normalized) : "f"(code), "f"(inv_q));
             // Same fused RN operation as __fmaf_rn, without fast-math FTZ.
             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(value) : "f"(range), "f"(normalized), "f"(lo));
+#endif
             return value;
         }
 

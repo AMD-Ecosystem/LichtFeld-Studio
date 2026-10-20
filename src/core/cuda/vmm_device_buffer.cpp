@@ -16,6 +16,19 @@
 #include <utility>
 #include <vector>
 
+// The header keeps the reservation base and the allocation handles as 64-bit
+// integers. CUdeviceptr and CUmemGenericAllocationHandle are integers on CUDA
+// but pointers on HIP, so convert at each driver call there.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define LFS_VMM_PTR(addr) reinterpret_cast<CUdeviceptr>(static_cast<std::uintptr_t>(addr))
+#define LFS_VMM_HANDLE(h) reinterpret_cast<CUmemGenericAllocationHandle>(static_cast<std::uintptr_t>(h))
+#define LFS_VMM_U64(v) static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(v))
+#else
+#define LFS_VMM_PTR(addr) (addr)
+#define LFS_VMM_HANDLE(h) (h)
+#define LFS_VMM_U64(v) (v)
+#endif
+
 namespace lfs::core {
 
     namespace {
@@ -162,7 +175,7 @@ namespace lfs::core {
         }
 
         VmmDeviceBuffer buffer;
-        buffer.base_ = base;
+        buffer.base_ = LFS_VMM_U64(base);
         buffer.reservation_bytes_ = reserved;
         buffer.granularity_bytes_ = granularity;
         buffer.device_ = device;
@@ -201,7 +214,7 @@ namespace lfs::core {
                     label_, "cuMemCreate", status, bytes));
             }
 
-            if (const CUresult status = cuMemMap(base_ + offset, bytes, 0, handle, 0);
+            if (const CUresult status = cuMemMap(LFS_VMM_PTR(base_ + offset), bytes, 0, handle, 0);
                 status != CUDA_SUCCESS) {
                 (void)cuMemRelease(handle);
                 return Status::failure(vmm_error(ErrorCode::Internal, label_, "cuMemMap", status, bytes));
@@ -211,16 +224,16 @@ namespace lfs::core {
             access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             access.location.id = device_;
             access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            if (const CUresult status = cuMemSetAccess(base_ + offset, bytes, &access, 1);
+            if (const CUresult status = cuMemSetAccess(LFS_VMM_PTR(base_ + offset), bytes, &access, 1);
                 status != CUDA_SUCCESS) {
-                (void)cuMemUnmap(base_ + offset, bytes);
+                (void)cuMemUnmap(LFS_VMM_PTR(base_ + offset), bytes);
                 (void)cuMemRelease(handle);
                 return Status::failure(
                     vmm_error(ErrorCode::Internal, label_, "cuMemSetAccess", status, bytes));
             }
 
             chunks_.push_back(Chunk{
-                .handle = handle,
+                .handle = LFS_VMM_U64(handle),
                 .offset = offset,
                 .bytes = bytes,
             });
@@ -239,7 +252,7 @@ namespace lfs::core {
             Chunk& chunk = chunks_.back();
             if (chunk.mapped) {
                 if (const CUresult status = cuMemUnmap(
-                        base_ + chunk.offset, chunk.bytes);
+                        LFS_VMM_PTR(base_ + chunk.offset), chunk.bytes);
                     status != CUDA_SUCCESS) {
                     return Status::failure(
                         vmm_error(ErrorCode::Internal, label_, "cuMemUnmap decommit chunk",
@@ -248,7 +261,7 @@ namespace lfs::core {
                 chunk.mapped = false;
             }
             chunk.bytes = 0;
-            if (const CUresult status = cuMemRelease(chunk.handle); status != CUDA_SUCCESS) {
+            if (const CUresult status = cuMemRelease(LFS_VMM_HANDLE(chunk.handle)); status != CUDA_SUCCESS) {
                 return Status::failure(
                     vmm_error(ErrorCode::Internal, label_, "cuMemRelease decommit chunk",
                               status));
@@ -278,20 +291,20 @@ namespace lfs::core {
         }
         for (const auto& chunk : chunks_) {
             if (chunk.mapped) {
-                if (const CUresult status = cuMemUnmap(base_ + chunk.offset, chunk.bytes);
+                if (const CUresult status = cuMemUnmap(LFS_VMM_PTR(base_ + chunk.offset), chunk.bytes);
                     status != CUDA_SUCCESS) {
                     LOG_ERROR("VMM CUDA cleanup cuMemUnmap failed: {}",
                               driver_error_text(status));
                 }
             }
-            if (const CUresult status = cuMemRelease(chunk.handle); status != CUDA_SUCCESS) {
+            if (const CUresult status = cuMemRelease(LFS_VMM_HANDLE(chunk.handle)); status != CUDA_SUCCESS) {
                 LOG_ERROR("VMM CUDA cleanup cuMemRelease failed: {}",
                           driver_error_text(status));
             }
         }
         chunks_.clear();
         if (base_ != 0) {
-            if (const CUresult status = cuMemAddressFree(base_, reservation_bytes_);
+            if (const CUresult status = cuMemAddressFree(LFS_VMM_PTR(base_), reservation_bytes_);
                 status != CUDA_SUCCESS) {
                 LOG_ERROR("VMM CUDA cleanup cuMemAddressFree failed: {}",
                           driver_error_text(status));

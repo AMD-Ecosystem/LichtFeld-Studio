@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.30)
 
 # ROCm/HIP port of the GPU compute tranche only (tensor library, training
-# kernels, gsplat/fastgs/edge rasterizer backends + a focused GPU gtest binary).
+# kernels, gsplat/fastgs rasterizer backends + a focused GPU gtest binary).
 # The full desktop app (GUI/Vulkan-interop/Python/MCP/USD/nvImageCodec) is NVIDIA-
 # only and DEFERRED. When -DUSE_HIP=ON, route to a self-contained compute-only
 # build (cmake/HipCompute.cmake) and skip the entire NVIDIA path below, so the

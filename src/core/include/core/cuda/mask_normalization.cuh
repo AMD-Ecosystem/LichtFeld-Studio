@@ -25,9 +25,14 @@ namespace lfs::core::cuda {
 
     // Explicit non-FTZ comparison: a positive subnormal cutoff excludes zero.
     __device__ __forceinline__ bool mask_value_at_least(const float value, const float threshold) {
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        // HIP device code does not flush f32 denormals.
+        return value >= threshold;
+#else
         unsigned result;
         asm("{ .reg .pred p; setp.ge.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }"
             : "=r"(result) : "f"(value), "f"(threshold));
         return result != 0;
+#endif
     }
 } // namespace lfs::core::cuda

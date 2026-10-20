@@ -94,19 +94,25 @@ if(USE_HIP)
     set(TRAINING_NEW_SOURCES
         optimizer/adam_optimizer.cpp
         optimizer/scheduler.cpp
+        sh_value_codec.cpp
+        sh_value_storage.cpp
+        morton_reorder.cpp
+        live_model_mutation_guard.cpp
+        perf_bench.cpp
         losses/regularization.cpp
         losses/photometric_loss.cpp
         strategies/strategy_utils.cpp
         strategies/mcmc.cpp
+        strategies/mrnf.cpp
+        strategies/blob_seeding.cpp
         rasterization/fast_rasterizer.cpp
         rasterization/gsplat_rasterizer.cpp
-        rasterization/edge_rasterizer.cpp
+        components/config_serialization.cpp
         components/bilateral_grid.cpp
         components/ppisp.cpp
         components/ppisp_controller.cu
         components/ppisp_controller_pool.cu
         components/ppisp_file.cpp
-        components/sparsity_optimizer.cpp
     )
     # control/command_api.cpp transitively includes trainer.hpp -> dataset.hpp ->
     # io/pipelined_image_loader.hpp (the deferred io tranche); the compute gtests
@@ -196,7 +202,8 @@ if(USE_HIP)
             lfs_training_kernels
             fastlfs_backend
             gsplat_backend_lfs
-            edge_compute_backend
+        PRIVATE
+            lfs_io
     )
 else()
 target_link_libraries(lfs_training
