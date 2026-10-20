@@ -1242,6 +1242,35 @@ namespace lfs::core {
         }
     }
 
+    bool RasterizerMemoryArena::owns_device_allocation(const void* ptr, const size_t bytes) const {
+        if (ptr == nullptr || bytes == 0) {
+            return false;
+        }
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) {
+            return false;
+        }
+        const auto address = reinterpret_cast<std::uintptr_t>(ptr);
+        std::lock_guard<std::mutex> lock(arena_mutex_);
+        const auto it = device_arenas_.find(device);
+        if (it == device_arenas_.end() || !it->second || it->second->external_backing) {
+            return false;
+        }
+        const auto& arena = *it->second;
+        if (arena.d_ptr != 0) {
+            const auto base = reinterpret_cast<std::uintptr_t>(
+                reinterpret_cast<const void*>(arena.d_ptr));
+            return address >= base && address - base < arena.committed_size &&
+                   bytes <= arena.committed_size - (address - base);
+        }
+        if (!arena.fallback_buffer || !arena.owns_fallback_buffer) {
+            return false;
+        }
+        const auto base = reinterpret_cast<std::uintptr_t>(arena.fallback_buffer);
+        return address >= base && address - base < arena.capacity &&
+               bytes <= arena.capacity - (address - base);
+    }
+
     RasterizerMemoryArena::Statistics RasterizerMemoryArena::get_statistics() const {
         Statistics stats;
 

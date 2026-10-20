@@ -45,6 +45,7 @@ namespace fast_lfs::rasterization {
         const float cy,
         bool mip_filter,
         DensificationType densification_type = DensificationType::None,
-        FusedAdamSettings fused_adam = {});
+        FusedAdamSettings fused_adam = {},
+        bool native_gradient_atomics = false);
 
 }

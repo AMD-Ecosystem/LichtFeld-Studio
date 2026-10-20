@@ -266,6 +266,7 @@ set(TEST_FILES
     test_selection_operator_modal.cpp
     test_operator_registry_props.cpp
     test_fastgs_analytical_gradients.cpp
+    test_fastgs_native_atomics.cpp
     test_background_image.cpp
     test_operator_return_value.cpp
     test_sdl_rml_key_mapping.cpp
@@ -322,6 +323,7 @@ endforeach()
 
 # Create test executable
 add_executable(lichtfeld_tests ${TEST_SOURCES})
+target_sources(lichtfeld_tests PRIVATE fastgs_native_atomic_probe.cu)
 
 # Set CUDA architectures
 set_target_properties(lichtfeld_tests PROPERTIES

@@ -60,6 +60,7 @@ set(LFS_HIP_TEST_FILES
     # rasterizers
     test_gsplat_rasterizer.cpp
     test_fastgs_analytical_gradients.cpp
+    test_fastgs_native_atomics.cpp
     # adam / scheduler / bilateral / ppisp / sparsity
     test_lfs_scheduler.cpp
     test_bilateral_grid.cpp
@@ -140,6 +141,7 @@ foreach(_t IN LISTS LFS_HIP_TEST_FILES)
     endif()
 endforeach()
 
+list(APPEND LFS_HIP_TEST_SOURCES "${LFS_TESTS_DIR}/fastgs_native_atomic_probe.cu")
 add_executable(lfs_compute_tests ${LFS_HIP_TEST_SOURCES})
 
 set_target_properties(lfs_compute_tests PROPERTIES

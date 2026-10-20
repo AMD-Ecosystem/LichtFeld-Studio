@@ -503,6 +503,24 @@ namespace fast_lfs::rasterization {
                            "cudaMemset(grad_w2c)");
             }
 
+            // Native HIP atomics are safe only for ranges owned by this arena.
+            // Caller-owned camera and densification outputs stay on atomicAdd.
+            bool native_gradient_atomics = false;
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+            if (n_primitives > 0) {
+                auto& arena = lfs::core::GlobalArenaManager::instance().get_arena();
+                native_gradient_atomics =
+                    arena.owns_device_allocation(grad_mean2d_helper,
+                                                 static_cast<size_t>(n_primitives) * 2 * sizeof(float)) &&
+                    arena.owns_device_allocation(grad_conic_helper,
+                                                 static_cast<size_t>(n_primitives) * 3 * sizeof(float)) &&
+                    arena.owns_device_allocation(grad_opacity_helper,
+                                                 static_cast<size_t>(n_primitives) * sizeof(float)) &&
+                    arena.owns_device_allocation(grad_color_helper,
+                                                 static_cast<size_t>(n_primitives) * 3 * sizeof(float));
+            }
+#endif
+
             // Call the actual backward implementation
             backward(
                 densification_error_map_ptr,
@@ -538,7 +556,8 @@ namespace fast_lfs::rasterization {
                 center_y,
                 mip_filter,
                 densification_type,
-                *fused_adam);
+                *fused_adam,
+                native_gradient_atomics);
 
             // Mark frame as complete
             release_forward_context(forward_ctx);

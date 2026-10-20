@@ -5,6 +5,7 @@
 #pragma once
 
 #include "buffer_utils.h"
+#include "device_gradient_atomic.cuh"
 #include "helper_math.h"
 #include "kernel_utils.cuh"
 #include "rasterization_config.h"
@@ -352,7 +353,7 @@ namespace fast_lfs::rasterization::kernels::backward {
         return {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     }
 
-    template <DensificationType DENSIFICATION_TYPE>
+    template <DensificationType DENSIFICATION_TYPE, bool NATIVE_GRADIENT_ATOMICS = false>
     // The (128, 8) occupancy hint was tuned on sm_89 (-4.3%, all variants spill-free).
     __global__ void __launch_bounds__(config::block_size_blend_backward, 8) blend_backward_cu(
         const uint2* __restrict__ tile_instance_ranges,
@@ -563,18 +564,26 @@ namespace fast_lfs::rasterization::kernels::backward {
             }
 
             if (valid_splat && has_contribution && primitive_idx < n_primitives) {
-                atomicAdd(&grad_mean2d[primitive_idx].x, clamp_grad(accum.mean_x));
-                atomicAdd(&grad_mean2d[primitive_idx].y, clamp_grad(accum.mean_y));
-                atomicAdd(&grad_conic[primitive_idx], clamp_grad(accum.conic_x));
-                atomicAdd(&grad_conic[n_primitives + primitive_idx], clamp_grad(accum.conic_y));
-                atomicAdd(&grad_conic[2 * n_primitives + primitive_idx], clamp_grad(accum.conic_z));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_mean2d[primitive_idx].x, clamp_grad(accum.mean_x));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_mean2d[primitive_idx].y, clamp_grad(accum.mean_y));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_conic[primitive_idx], clamp_grad(accum.conic_x));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_conic[n_primitives + primitive_idx], clamp_grad(accum.conic_y));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_conic[2 * n_primitives + primitive_idx], clamp_grad(accum.conic_z));
 
-                atomicAdd(&grad_compensated_opacity[primitive_idx],
-                          clamp_grad(accum.compensated_opacity));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_compensated_opacity[primitive_idx], clamp_grad(accum.compensated_opacity));
 
-                atomicAdd(&grad_color[primitive_idx].x, clamp_grad(accum.color_x));
-                atomicAdd(&grad_color[primitive_idx].y, clamp_grad(accum.color_y));
-                atomicAdd(&grad_color[primitive_idx].z, clamp_grad(accum.color_z));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_color[primitive_idx].x, clamp_grad(accum.color_x));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_color[primitive_idx].y, clamp_grad(accum.color_y));
+                atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                    &grad_color[primitive_idx].z, clamp_grad(accum.color_z));
 
                 if constexpr (DENSIFICATION_TYPE != DensificationType::None) {
                     atomicAdd(&densification_info[primitive_idx], accum.densification_weight);

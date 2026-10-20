@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <functional>
@@ -156,6 +157,10 @@ namespace lfs::core {
         // Allow move operations
         RasterizerMemoryArena(RasterizerMemoryArena&&) noexcept;
         RasterizerMemoryArena& operator=(RasterizerMemoryArena&&) noexcept;
+
+        // True only for a range in storage allocated by this arena. External
+        // imports are excluded because their HIP memory attributes are unknown.
+        [[nodiscard]] bool owns_device_allocation(const void* ptr, size_t bytes) const;
 
         uint64_t begin_frame(bool from_rendering = false);
         std::optional<uint64_t> try_begin_frame(bool from_rendering = false);

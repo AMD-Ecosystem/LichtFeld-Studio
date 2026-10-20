@@ -8,7 +8,47 @@
 #include "kernels_backward.cuh"
 #include "rasterization_config.h"
 #include "utils.h"
+#include <cstdlib>
+#include <cstring>
 #include <functional>
+
+namespace {
+    bool native_gradient_atomics_supported() {
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        static const bool disabled = [] {
+            const char* raw = std::getenv("LFS_DISABLE_HIP_FASTGS_NATIVE_ATOMICS");
+            return raw != nullptr && raw[0] != '\0' && raw[0] != '0' &&
+                   raw[0] != 'f' && raw[0] != 'F' && raw[0] != 'n' && raw[0] != 'N';
+        }();
+        if (disabled) {
+            return false;
+        }
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) {
+            return false;
+        }
+        static thread_local int cached_device = -1;
+        static thread_local bool supported = false;
+        if (device != cached_device) {
+            cudaDeviceProp properties{};
+            if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+                return false;
+            }
+            const auto* arch = properties.gcnArchName;
+            const auto matches = [arch](const char* target) {
+                return std::strncmp(arch, target, 7) == 0 &&
+                       (arch[7] == '\0' || arch[7] == ':');
+            };
+            supported = matches("gfx1100") || matches("gfx1101") || matches("gfx1102") ||
+                        matches("gfx1103") || matches("gfx1150") || matches("gfx1151");
+            cached_device = device;
+        }
+        return supported;
+#else
+        return false;
+#endif
+    }
+} // namespace
 
 void fast_lfs::rasterization::backward(
     const float* densification_error_map,
@@ -44,7 +84,8 @@ void fast_lfs::rasterization::backward(
     const float cy,
     bool mip_filter,
     DensificationType densification_type,
-    FusedAdamSettings fused_adam) {
+    FusedAdamSettings fused_adam,
+    bool native_gradient_atomics) {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const uint64_t n_tiles_u64 = static_cast<uint64_t>(grid.x) * static_cast<uint64_t>(grid.y);
     const int n_tiles = checked_to_int(n_tiles_u64, "n_tiles exceeds int range");
@@ -57,8 +98,9 @@ void fast_lfs::rasterization::backward(
 
     if (n_instances > 0) {
         // Backward blend (template dispatch eliminates densification branch from inner loop)
-        auto launch_blend_backward = [&]<DensificationType DENS_TYPE>() {
-            kernels::backward::blend_backward_cu<DENS_TYPE><<<n_tiles, config::block_size_blend_backward>>>(
+        auto launch_blend_backward_typed = [&]<DensificationType DENS_TYPE, bool NATIVE_GRADIENT_ATOMICS>() {
+            kernels::backward::blend_backward_cu<DENS_TYPE, NATIVE_GRADIENT_ATOMICS>
+                <<<n_tiles, config::block_size_blend_backward>>>(
                 per_tile_buffers.instance_ranges,
                 sorted_primitive_indices,
                 per_primitive_buffers.mean2d,
@@ -82,6 +124,15 @@ void fast_lfs::rasterization::backward(
                 width,
                 height,
                 grid.x);
+        };
+        auto launch_blend_backward = [&]<DensificationType DENS_TYPE>() {
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+            if (native_gradient_atomics && native_gradient_atomics_supported()) {
+                launch_blend_backward_typed.template operator()<DENS_TYPE, true>();
+                return;
+            }
+#endif
+            launch_blend_backward_typed.template operator()<DENS_TYPE, false>();
         };
         if (densification_type == DensificationType::MRNF && densification_info != nullptr) {
             launch_blend_backward.template operator()<DensificationType::MRNF>();
