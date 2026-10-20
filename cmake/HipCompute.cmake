@@ -60,6 +60,18 @@ if(WIN32)
     set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL -fms-runtime-lib=dll)
     set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDebug -fms-runtime-lib=static_dbg)
     set(CMAKE_HIP_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDebugDLL -fms-runtime-lib=dll_dbg)
+    # With C/CXX on clang-cl, CMake 4.3+ seeds the HIP flags with MSVC-style
+    # defaults (/DWIN32 /O2 ...) that clang++ rejects; use GNU-style ones.
+    string(REGEX REPLACE "(^| )/[A-Za-z][A-Za-z0-9_:=.]*" "" CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS}")
+    set(_lfs_hip_flags_DEBUG "-O0 -g")
+    set(_lfs_hip_flags_RELEASE "-O3 -DNDEBUG")
+    set(_lfs_hip_flags_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+    set(_lfs_hip_flags_MINSIZEREL "-Os -DNDEBUG")
+    foreach(_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+        if(CMAKE_HIP_FLAGS_${_cfg} MATCHES "(^| )/[A-Za-z]")
+            set(CMAKE_HIP_FLAGS_${_cfg} "${_lfs_hip_flags_${_cfg}}")
+        endif()
+    endforeach()
 endif()
 
 # ---- Toolkit shim include dir (HIP build only) -------------------------------
