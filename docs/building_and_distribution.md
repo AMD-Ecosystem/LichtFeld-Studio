@@ -113,7 +113,7 @@ HIP_VISIBLE_DEVICES=0 ./build-hip/cmake/hip_tests/lfs_compute_tests
 
 The commands above are the Linux recipe. `CMAKE_HIP_COMPILER` does not have to be set when ROCm's `bin` directory is on `PATH`: CMake asks `hipconfig` where the ROCm Clang lives, and HIP is enabled at `project()` time so no reconfigure is needed. Otherwise name the compiler yourself with `-DCMAKE_HIP_COMPILER` or the `HIPCXX` environment variable; setting `ROCM_PATH` alone does not steer that search.
 
-On Windows, configure from a Visual Studio developer prompt so the MSVC libraries and linker are found. C and C++ use `clang-cl` and HIP uses `clang++`, both from the ROCm LLVM directory; HIP is enabled after C and C++, which lets the two front ends coexist. LibTorch comes from a ROCm PyTorch install, whose `LoadHIP.cmake` requires `PYTORCH_ROCM_ARCH` to name the target. OpenImageIO and OpenMesh are not needed on Windows. If `clang++` cannot find the device libraries, set `HIP_DEVICE_LIB_PATH` to `%ROCM_PATH%\lib\llvm\amdgcn\bitcode`.
+On Windows, configure from a Visual Studio developer prompt so the MSVC libraries and linker are found. C and C++ use `clang-cl` and HIP uses `clang++`, both from the ROCm LLVM directory; HIP is enabled after C and C++, which lets the two front ends coexist. LibTorch comes from a ROCm PyTorch install, whose `LoadHIP.cmake` requires `PYTORCH_ROCM_ARCH` to name the target. OpenImageIO and OpenMesh are not needed on Windows. spdlog, nlohmann-json, TBB and GoogleTest are found by config package as on Linux, but Windows has no system location for them: list the install prefixes that hold them in `CMAKE_PREFIX_PATH`. If `clang++` cannot find the device libraries, set `HIP_DEVICE_LIB_PATH` to `%ROCM_PATH%\lib\llvm\amdgcn\bitcode`.
 
 ```bat
 set PYTORCH_ROCM_ARCH=gfx1151
@@ -126,9 +126,9 @@ cmake -B build-hip -G Ninja ^
   -DROCM_PATH=%ROCM_PATH% ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DBUILD_TESTS=ON ^
+  "-DCMAKE_PREFIX_PATH=C:\path\to\deps;C:\path\to\more\deps" ^
   -DLFS_GLM_INCLUDE_DIR=C:\path\to\glm ^
   -DLFS_ARGS_INCLUDE_DIR=C:\path\to\args ^
-  -DGTest_DIR=C:\path\to\gtest\lib\cmake\GTest ^
   -DTorch_DIR=C:\path\to\torch\share\cmake\Torch
 cmake --build build-hip --target lfs_compute_tests
 build-hip\cmake\hip_tests\lfs_compute_tests.exe
