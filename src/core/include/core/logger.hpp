@@ -13,7 +13,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include <cstdio>
 #else
 #include <format>

@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #error "core/cuda_error_typed.hpp is host-C++23-only and must never be parsed by nvcc. " \
        "It declares lfs::Error/lfs::Exception-returning CUDA adapters; CUDA translation " \
        "units use core/cuda_error.hpp's CudaCheckState/CudaCheckCompletion/ensure_cuda_success " \

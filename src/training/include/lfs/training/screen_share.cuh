@@ -6,7 +6,7 @@
 
 #include <cmath>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include <cuda_runtime.h>
 #endif
 
@@ -15,7 +15,7 @@ namespace lfs::training {
     // Dimensionless angular / screen-share of a 3D Gaussian. Saturates toward 1
     // when the splat swallows the camera (d ≲ r). Host and device.
     [[nodiscard]]
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
     __host__ __device__
 #endif
         inline float gaussian_screen_share(
@@ -60,14 +60,14 @@ namespace lfs::training {
     }
 
     [[nodiscard]]
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
     __host__ __device__
 #endif
         inline bool screen_share_cap_active(const float max_screen_share) {
         return max_screen_share > 0.0f && max_screen_share < 1.0f;
     }
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
     __device__ __forceinline__ void atomic_max_float(float* addr, const float val) {
         int* const addr_i = reinterpret_cast<int*>(addr);
         int old = *addr_i;

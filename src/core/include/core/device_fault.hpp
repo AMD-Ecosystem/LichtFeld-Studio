@@ -17,7 +17,7 @@
 #include <string_view>
 #include <type_traits>
 
-#if !defined(__CUDACC__)
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
 #include "core/error.hpp"
 #include "core/source_site.hpp"
 #endif
@@ -59,7 +59,7 @@ namespace lfs::core {
     static_assert(sizeof(std::uint32_t) == sizeof(unsigned int),
                   "DeviceFaultRecord::code CAS view requires uint32_t == unsigned int");
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
     // Device-side first-fault protocol (spec §1.4). Call ONLY on the failure
     // branch of a bounds (or similar) check — never on the hot success path.
     //
@@ -172,7 +172,7 @@ namespace lfs::core {
     // no getenv/alloc/lock/sync on the hot path.
     [[nodiscard]] LFS_CORE_API bool device_fault_trap_after_record_for_launch() noexcept;
 
-#if !defined(__CUDACC__)
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
     // Host-only harvest → typed Error surface (phase-6c P2). Not visible to nvcc;
     // implementations live in the host TU device_fault.cpp and mirror the
     // cuda_error_typed cold-path construction idiom (make_error + Exception).

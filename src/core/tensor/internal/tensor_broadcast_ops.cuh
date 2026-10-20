@@ -940,7 +940,7 @@ namespace lfs::core::tensor_ops {
                 const size_t M = c_shape[0];
                 const size_t N = c_shape[1];
                 const bool a_is_row = (a_shape[0] == 1);
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 if (N < kFlatBroadcastWidth) {
                     launch_broadcast_2d_flat(a, b, c, M, N, a_is_row ? 1 : 0, a_is_row ? 0 : 1, op, stream);
                     return;
@@ -1014,7 +1014,7 @@ namespace lfs::core::tensor_ops {
                 const size_t M = c_shape[0];
                 const size_t N = c_shape[1];
                 const bool a_is_row = (a_shape[0] == 1);
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 if (N < kFlatBroadcastWidth) {
                     launch_broadcast_2d_flat(a, b, c, M, N, a_is_row ? 1 : 0, a_is_row ? 0 : 1, op, stream);
                     return;
@@ -1053,7 +1053,7 @@ namespace lfs::core::tensor_ops {
                 const size_t M = c_shape[0];
                 const size_t N = c_shape[1];
                 const bool a_is_col = (a_shape[1] == 1);
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 if (N < kFlatBroadcastWidth) {
                     launch_broadcast_2d_flat(a, b, c, M, N, a_is_col ? 2 : 0, a_is_col ? 0 : 2, op, stream);
                     return;
@@ -1203,7 +1203,7 @@ namespace lfs::core::tensor_ops {
             }
         }
         if (same_shape) {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
             if constexpr (std::is_same_v<T, float> && std::is_same_v<OutputT, float>) {
                 const bool a_al = (reinterpret_cast<uintptr_t>(a) % 16) == 0;
                 const bool b_al = (reinterpret_cast<uintptr_t>(b) % 16) == 0;

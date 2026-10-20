@@ -3,7 +3,7 @@
 #pragma once
 
 #include <cstdint>
-#if !defined(__CUDACC__)
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
 #include <source_location>
 #endif
 
@@ -31,7 +31,7 @@ namespace lfs::core {
         uint_least32_t line_;
     };
 
-#if !defined(__CUDACC__)
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
     [[nodiscard]] constexpr SourceSite source_site_from_location(
         const std::source_location& location) noexcept {
         return SourceSite{
@@ -43,7 +43,7 @@ namespace lfs::core {
 
 // std::source_location remains the exact host capture mechanism. nvcc never
 // parses that branch and receives only scalar built-ins at the call site.
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #if defined(_MSC_VER)
 #define LFS_SOURCE_SITE_CURRENT() \
     ::lfs::core::SourceSite(__builtin_FILE(), __builtin_LINE(), __builtin_FUNCSIG())

@@ -4,7 +4,7 @@
 
 #include <cmath>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define LFS_TRANSFORM_INLINE __host__ __device__ inline
 #else
 #define LFS_TRANSFORM_INLINE inline

@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #error "core/error.hpp is host-C++23-only and must never be parsed by nvcc. " \
        "CUDA translation units use core/error_codes.hpp (ErrorCode/ErrorDomain) " \
        "and core/source_site.hpp instead; convert to lfs::Error only in an " \

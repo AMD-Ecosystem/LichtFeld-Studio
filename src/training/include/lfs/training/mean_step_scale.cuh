@@ -11,7 +11,7 @@ namespace lfs::training {
     inline constexpr float kPerSplatMeanStepRatioMin = 1.0f;
     inline constexpr float kPerSplatMeanStepRatioMax = 300.0f;
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
     __device__ __forceinline__ float per_splat_mean_step_ratio(
         const float s0,
         const float s1,
