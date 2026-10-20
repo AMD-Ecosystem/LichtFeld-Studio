@@ -158,6 +158,39 @@ TEST_F(FusedL1SSIMTest, BackwardMatchesReference) {
     EXPECT_LT(mean_diff, 1e-5f) << "Mean gradient difference: " << mean_diff;
 }
 
+TEST_F(FusedL1SSIMTest, BackwardMatchesReferenceOnPartialTiles) {
+    const int N = 2, C = 3, H = 37, W = 45;
+    auto img1 = Tensor::randn({N, C, H, W}, Device::CUDA);
+    auto img2 = Tensor::randn({N, C, H, W}, Device::CUDA);
+
+    constexpr float ssim_weight = 0.35f;
+    FusedL1SSIMWorkspace workspace;
+    auto [loss, ctx] = fused_l1_ssim_forward(img1, img2, ssim_weight, workspace, true);
+    auto fused_grad = fused_l1_ssim_backward(ctx, workspace);
+    const auto [ref_loss, ref_grad] = compute_reference_loss_and_grad(img1, img2, ssim_weight);
+
+    EXPECT_NEAR(loss.item<float>(), ref_loss, 1e-4f);
+    const auto diff = (fused_grad - ref_grad).abs();
+    EXPECT_LT(diff.max().item<float>(), 1e-3f);
+    EXPECT_LT(diff.mean().item<float>(), 1e-5f);
+}
+
+TEST_F(FusedL1SSIMTest, BackwardFallsBackWhenPlaneGridExceedsLimit) {
+    constexpr int C = 3, N = 21846, H = 1, W = 1;
+    auto img1 = Tensor::randn({N, C, H, W}, Device::CUDA);
+    auto img2 = Tensor::randn({N, C, H, W}, Device::CUDA);
+
+    FusedL1SSIMWorkspace workspace;
+    auto [loss, ctx] = fused_l1_ssim_forward(img1, img2, 0.2f, workspace, true);
+    const auto fused_grad = fused_l1_ssim_backward(ctx, workspace);
+    const auto [ref_loss, ref_grad] = compute_reference_loss_and_grad(img1, img2, 0.2f);
+
+    EXPECT_NEAR(loss.item<float>(), ref_loss, 1e-4f);
+    const auto diff = (fused_grad - ref_grad).abs();
+    EXPECT_LT(diff.max().item<float>(), 1e-3f);
+    EXPECT_LT(diff.mean().item<float>(), 1e-5f);
+}
+
 // Test various SSIM weights
 TEST_F(FusedL1SSIMTest, VariousSSIMWeights) {
     const int N = 1, C = 3, H = 64, W = 64;
@@ -605,7 +638,7 @@ TEST_F(MaskedFusedL1SSIMTest, UInt8TargetAndMaskMatchFloatReference) {
 // ============================================================================
 
 TEST_F(FusedL1SSIMTest, DecoupledMatchesStandardWhenCorrectedEqualsRaw) {
-    const int N = 1, C = 3, H = 64, W = 64;
+    const int N = 2, C = 3, H = 37, W = 45;
     const float ssim_weight = 0.2f;
 
     auto raw = Tensor::randn({N, C, H, W}, Device::CUDA).abs() + 0.1f;
