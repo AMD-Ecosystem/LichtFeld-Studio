@@ -294,7 +294,8 @@ if(NOT WIN32)
             INTERFACE_INCLUDE_DIRECTORIES "${LFS_WEBP_INC}"
             INTERFACE_LINK_LIBRARIES "${LFS_WEBP_LIB}")
     endif()
-    find_package(OpenEXR CONFIG REQUIRED)
+    # src/core/image_exr.cpp calls exr_get_chunk_table_offset, new in OpenEXR 3.3.
+    find_package(OpenEXR 3.3 CONFIG REQUIRED)
     # OpenMesh: on Linux the apt package ships OpenMeshCore (shared).
     if(LFS_OPENMESH_LIB AND LFS_OPENMESH_INC)
         set(OPENMESH_CORE_LIB "${LFS_OPENMESH_LIB}")

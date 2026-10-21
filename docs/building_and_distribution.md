@@ -230,7 +230,9 @@ Dependencies are supplied directly rather than through vcpkg:
 - ROCm 7.x (tested with 7.2), with `clang++` and `clang` from the ROCm LLVM directory. The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`; set it if ROCm is installed elsewhere.
 - GLM 1.0.1 or newer, passed as `-DLFS_GLM_INCLUDE_DIR`. Older GLM has no HIP path and its math will not compile in device code.
 - Taywee/args, passed as `-DLFS_ARGS_INCLUDE_DIR`.
-- spdlog, nlohmann-json, TBB, xxHash, libjpeg, libpng, libtiff, libwebp, OpenEXR 3 and OpenMesh from the distribution packages (on Ubuntu, `libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenexr-dev libxxhash-dev libopenmesh-dev`). xxHash is used header-only, so only `xxhash.h` is required.
+- nlohmann-json, TBB, xxHash, libjpeg, libpng, libtiff, libwebp and OpenMesh from the distribution packages (on Ubuntu, `libjpeg-dev libpng-dev libtiff-dev libwebp-dev libxxhash-dev libopenmesh-dev`). xxHash is used header-only, so only `xxhash.h` is required.
+- OpenEXR 3.3 or newer. The `libopenexr-dev` package in Ubuntu 24.04 is 3.1 and too old, so build OpenEXR from source there and pass `-DOpenEXR_DIR=<prefix>/lib/cmake/OpenEXR` or add its install prefix to `CMAKE_PREFIX_PATH`.
+- spdlog 1.15 built with its bundled fmt (`-DSPDLOG_FMT_EXTERNAL=OFF`, the default). The `libspdlog-dev` package in Ubuntu 24.04 (spdlog 1.12 on an external fmt 9) does not compile with the ROCm Clang. Point `spdlog_DIR` at the install or add its prefix to `CMAKE_PREFIX_PATH`.
 - With `-DBUILD_TESTS=ON`, GoogleTest and a ROCm build of LibTorch, which the tensor tests use as a comparison oracle. Both are found by config package, so point `GTest_DIR` and `Torch_DIR` at them or list their install prefixes in `CMAKE_PREFIX_PATH`. The `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
 
 ```bash
