@@ -33,6 +33,19 @@
 // failed expression and source location. Caller-provided formatting is not
 // evaluated in the device hot path.
 #define LFS_DEBUG_ASSERT_MSG(condition, message) assert(condition)
+#elif defined(__HIPCC__)
+// clang also checks __global__ bodies in the HIP host pass and rejects calls
+// to __host__ templates there. The message is formatted inside a lambda, which
+// clang treats as __host__ __device__, so kernels still compile and host code
+// keeps the formatted message.
+#define LFS_DEBUG_ASSERT_MSG(condition, message)                                   \
+    do {                                                                           \
+        if (!(condition)) [[unlikely]] {                                           \
+            ::lfs::core::detail::assertion_failed(                                 \
+                "LFS debug invariant", #condition, [&]() { return (message); }(), \
+                LFS_SOURCE_SITE_CURRENT());                                        \
+        }                                                                          \
+    } while (false)
 #else
 #define LFS_DEBUG_ASSERT_MSG(condition, message)                                          \
     do {                                                                                  \
