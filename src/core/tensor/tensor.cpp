@@ -1660,12 +1660,21 @@ namespace lfs::core {
     }
 
     // ============= Type Conversion =============
+#ifdef USE_HIP
     namespace {
-        // Per-element host conversion. A real template so `if constexpr` discards
-        // the non-matching branches (a macro in a non-template function does NOT,
-        // and HIP's __half -- with both operator=(float) and operator=(double) --
-        // makes a bare static_cast<__half>(int)/__half=uint8_t ambiguous in the
-        // dead branches). Routing __half through float is exact for these types.
+        // CUDA's __half converts to integers through __half2int_rz/__half2ll_rz,
+        // which saturate and map NaN to 0 (32-bit) or the minimum (64-bit).
+        template <typename TO_TYPE>
+        inline TO_TYPE half_to_integer_rz(const __half& v) {
+            const float f = static_cast<float>(v);
+            if (f != f && sizeof(TO_TYPE) == 8)
+                return std::numeric_limits<TO_TYPE>::lowest();
+            return detail::saturating_float_cast<TO_TYPE>(f);
+        }
+
+        // A template, so the discarded branches are not instantiated: HIP's
+        // __half converts to and from every arithmetic type, which makes a
+        // plain static_cast between __half and an integer ambiguous.
         template <typename FROM_TYPE, typename TO_TYPE>
         inline TO_TYPE convert_one(const FROM_TYPE& v) {
             if constexpr (std::is_same_v<FROM_TYPE, float> &&
@@ -1677,6 +1686,9 @@ namespace lfs::core {
                 return detail::torch_uint8_cast(v);
             } else if constexpr (std::is_same_v<TO_TYPE, __half>) {
                 return static_cast<__half>(static_cast<float>(v));
+            } else if constexpr (std::is_same_v<FROM_TYPE, __half> && std::is_integral_v<TO_TYPE> &&
+                                 !std::is_same_v<TO_TYPE, bool>) {
+                return half_to_integer_rz<TO_TYPE>(v);
             } else if constexpr (std::is_same_v<FROM_TYPE, __half>) {
                 return static_cast<TO_TYPE>(static_cast<float>(v));
             } else {
@@ -1684,6 +1696,7 @@ namespace lfs::core {
             }
         }
     } // namespace
+#endif
 
     Tensor Tensor::to(DataType dtype) const {
         LFS_CUDA_BREADCRUMB_STREAM("tensor.dtype_convert", stream());
@@ -1706,6 +1719,7 @@ namespace lfs::core {
         if (device_ == Device::CUDA)
             conversion_stream.emplace(prepare_inputs_for_stream({this}));
 
+#ifdef USE_HIP
 // Macro for type conversions using launch_convert_type
 #define CONVERT_DTYPE_CUDA(FROM_TYPE, TO_TYPE, FROM_DTYPE, TO_DTYPE)                \
     if (dtype_ == FROM_DTYPE && dtype == TO_DTYPE) {                                \
@@ -1726,6 +1740,37 @@ namespace lfs::core {
         }                                                                           \
         return result;                                                              \
     }
+#else
+// Macro for type conversions using launch_convert_type
+#define CONVERT_DTYPE_CUDA(FROM_TYPE, TO_TYPE, FROM_DTYPE, TO_DTYPE)                \
+    if (dtype_ == FROM_DTYPE && dtype == TO_DTYPE) {                                \
+        auto result = empty(shape_, device_, TO_DTYPE);                             \
+        if (numel() == 0)                                                           \
+            return result;                                                          \
+        if (device_ == Device::CUDA) {                                              \
+            tensor_ops::launch_convert_type<FROM_TYPE, TO_TYPE>(                    \
+                ptr<FROM_TYPE>(), result.ptr<TO_TYPE>(), numel(), result.stream()); \
+            /* No sync - tensor-to-tensor operation */                              \
+            return result;                                                          \
+        }                                                                           \
+        /* CPU fallback */                                                          \
+        const FROM_TYPE* src = ptr<FROM_TYPE>();                                    \
+        TO_TYPE* dst = result.ptr<TO_TYPE>();                                       \
+        for (size_t i = 0; i < numel(); ++i) {                                      \
+            if constexpr (std::is_same_v<FROM_TYPE, float> &&                       \
+                          (std::is_same_v<TO_TYPE, int> ||                          \
+                           std::is_same_v<TO_TYPE, int64_t> ||                      \
+                           std::is_same_v<TO_TYPE, uint32_t>)) {                    \
+                dst[i] = detail::saturating_float_cast<TO_TYPE>(src[i]);            \
+            } else if constexpr (std::is_same_v<TO_TYPE, uint8_t>) {                \
+                dst[i] = detail::torch_uint8_cast(src[i]);                          \
+            } else {                                                                \
+                dst[i] = static_cast<TO_TYPE>(src[i]);                              \
+            }                                                                       \
+        }                                                                           \
+        return result;                                                              \
+    }
+#endif
 
         // Bool <-> Float32 (manual - can't use launch_convert_type due to uint8_t conflict)
         if (dtype_ == DataType::Bool && dtype == DataType::Float32) {
