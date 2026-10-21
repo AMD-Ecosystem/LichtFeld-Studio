@@ -7,7 +7,6 @@
 #include "lfs/cuda_scratch.hpp"
 #include "mcmc_kernels.hpp"
 #include <cassert>
-#include <cmath>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -47,9 +46,12 @@ namespace lfs::training::mcmc {
             float binom = 1.0f;
             for (int k = 0; k <= n; k++) {
                 const float sign = (k % 2 == 0) ? 1.0f : -1.0f;
-                // Host helper (no __device__): rsqrtf is a device builtin not
-                // available on the HIP host pass; use 1/sqrt explicitly.
-                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * (1.0f / std::sqrt(static_cast<float>(k + 1)));
+#ifdef __HIPCC__
+                // HIP has no host rsqrtf; this is how CUDA's host rsqrtf computes it.
+                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * static_cast<float>(1.0 / std::sqrt(static_cast<double>(k + 1)));
+#else
+                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * rsqrtf(static_cast<float>(k + 1));
+#endif
                 if (k < n)
                     binom *= static_cast<float>(n - k) / static_cast<float>(k + 1);
             }
