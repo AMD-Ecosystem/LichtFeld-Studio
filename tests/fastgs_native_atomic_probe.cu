@@ -29,9 +29,10 @@ cudaError_t launch_fastgs_atomic_probe(float* sums, int count, float value,
 cudaError_t launch_fastgs_blend_backward_probe(
     const uint2* tile_instance_ranges,
     const uint* instance_primitive_indices,
-    const float2* primitive_mean2d,
+    const uint* primitive_work_indices,
+    const fast_lfs::rasterization::PackedMeanBBox* primitive_mean2d,
     const float4* primitive_conic_opacity,
-    const float3* primitive_color,
+    const float4* primitive_color,
     const float* grad_image,
     const float* grad_alpha_map,
     const float* image,
@@ -39,34 +40,50 @@ cudaError_t launch_fastgs_blend_backward_probe(
     const uint* tile_n_contributions,
     const float* tile_final_transmittance,
     float2* safe_grad_mean2d,
-    float* safe_grad_conic,
+    float3* safe_grad_conic,
+    float* safe_grad_depth,
     float* safe_grad_opacity,
     float3* safe_grad_color,
     float2* native_grad_mean2d,
-    float* native_grad_conic,
+    float3* native_grad_conic,
+    float* native_grad_depth,
     float* native_grad_opacity,
     float3* native_grad_color,
     uint n_instances,
     uint n_primitives,
+    uint n_visible,
     uint width,
     uint height) {
     using fast_lfs::rasterization::config::block_size_blend_backward;
     using fast_lfs::rasterization::kernels::backward::blend_backward_cu;
-    blend_backward_cu<::DensificationType::None, false><<<1, block_size_blend_backward>>>(
-        tile_instance_ranges, instance_primitive_indices, primitive_mean2d,
-        primitive_conic_opacity, primitive_color, grad_image, grad_alpha_map,
-        image, alpha_map, tile_n_contributions, tile_final_transmittance,
-        safe_grad_mean2d, safe_grad_conic, safe_grad_opacity, safe_grad_color,
-        nullptr, nullptr, nullptr, n_instances, n_primitives, width, height, 1);
+    const fast_lfs::rasterization::BackgroundAlphaGradient background{
+        .grad_alpha_map = grad_alpha_map};
+    blend_backward_cu<::DensificationType::None, false, false, 0, false>
+        <<<1, block_size_blend_backward>>>(
+        tile_instance_ranges, instance_primitive_indices, primitive_work_indices,
+        primitive_mean2d, primitive_conic_opacity, primitive_color, nullptr, nullptr,
+        grad_image, background, nullptr, nullptr, image, alpha_map,
+        tile_n_contributions, tile_final_transmittance, safe_grad_mean2d,
+        safe_grad_conic, safe_grad_depth, nullptr, safe_grad_opacity, safe_grad_color,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        n_instances, n_primitives, n_visible, width, height, 1, 0);
     auto error = cudaGetLastError();
     if (error != cudaSuccess) {
         return error;
     }
-    blend_backward_cu<::DensificationType::None, true><<<1, block_size_blend_backward>>>(
-        tile_instance_ranges, instance_primitive_indices, primitive_mean2d,
-        primitive_conic_opacity, primitive_color, grad_image, grad_alpha_map,
-        image, alpha_map, tile_n_contributions, tile_final_transmittance,
-        native_grad_mean2d, native_grad_conic, native_grad_opacity, native_grad_color,
-        nullptr, nullptr, nullptr, n_instances, n_primitives, width, height, 1);
-    return cudaGetLastError();
+    error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) {
+        return error;
+    }
+    blend_backward_cu<::DensificationType::None, false, false, 0, true>
+        <<<1, block_size_blend_backward>>>(
+        tile_instance_ranges, instance_primitive_indices, primitive_work_indices,
+        primitive_mean2d, primitive_conic_opacity, primitive_color, nullptr, nullptr,
+        grad_image, background, nullptr, nullptr, image, alpha_map,
+        tile_n_contributions, tile_final_transmittance, native_grad_mean2d,
+        native_grad_conic, native_grad_depth, nullptr, native_grad_opacity, native_grad_color,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        n_instances, n_primitives, n_visible, width, height, 1, 0);
+    error = cudaGetLastError();
+    return error == cudaSuccess ? cudaDeviceSynchronize() : error;
 }

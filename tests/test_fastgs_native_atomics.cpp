@@ -15,18 +15,25 @@
 #include <memory>
 #include <vector>
 
+namespace fast_lfs::rasterization {
+    struct PackedMeanBBox;
+}
+
 cudaError_t launch_fastgs_atomic_probe(float* sums, int count, float value,
                                        bool alternate_sign, cudaStream_t stream);
 cudaError_t launch_fastgs_blend_backward_probe(
     const uint2* tile_instance_ranges, const unsigned int* instance_primitive_indices,
-    const float2* primitive_mean2d, const float4* primitive_conic_opacity,
-    const float3* primitive_color, const float* grad_image, const float* grad_alpha_map,
+    const unsigned int* primitive_work_indices,
+    const fast_lfs::rasterization::PackedMeanBBox* primitive_mean2d,
+    const float4* primitive_conic_opacity, const float4* primitive_color,
+    const float* grad_image, const float* grad_alpha_map,
     const float* image, const float* alpha_map, const unsigned int* tile_n_contributions,
     const float* tile_final_transmittance, float2* safe_grad_mean2d,
-    float* safe_grad_conic, float* safe_grad_opacity, float3* safe_grad_color,
-    float2* native_grad_mean2d, float* native_grad_conic, float* native_grad_opacity,
+    float3* safe_grad_conic, float* safe_grad_depth, float* safe_grad_opacity,
+    float3* safe_grad_color, float2* native_grad_mean2d, float3* native_grad_conic,
+    float* native_grad_depth, float* native_grad_opacity,
     float3* native_grad_color, unsigned int n_instances, unsigned int n_primitives,
-    unsigned int width, unsigned int height);
+    unsigned int n_visible, unsigned int width, unsigned int height);
 
 namespace {
     using lfs::core::RasterizerMemoryArena;
@@ -284,9 +291,12 @@ namespace {
 
         auto* tile_instance_ranges = arena_array<uint2>(allocate, 1);
         auto* instance_primitive_indices = arena_array<unsigned int>(allocate, 2);
-        auto* primitive_mean2d = arena_array<float2>(allocate, 1);
+        auto* primitive_work_indices = arena_array<unsigned int>(allocate, 1);
+        auto* primitive_mean2d_storage = allocate(16);
+        auto* primitive_mean2d =
+            reinterpret_cast<fast_lfs::rasterization::PackedMeanBBox*>(primitive_mean2d_storage);
         auto* primitive_conic_opacity = arena_array<float4>(allocate, 1);
-        auto* primitive_color = arena_array<float3>(allocate, 1);
+        auto* primitive_color = arena_array<float4>(allocate, 1);
         auto* grad_image = arena_array<float>(allocate, pixels * 3);
         auto* grad_alpha = arena_array<float>(allocate, pixels);
         auto* image = arena_array<float>(allocate, pixels * 3);
@@ -294,15 +304,18 @@ namespace {
         auto* contributions = arena_array<unsigned int>(allocate, pixels);
         auto* transmittance = arena_array<float>(allocate, pixels);
         auto* safe_mean = arena_array<float2>(allocate, 1);
-        auto* safe_conic = arena_array<float>(allocate, 3);
+        auto* safe_conic = arena_array<float3>(allocate, 1);
+        auto* safe_depth = arena_array<float>(allocate, 1);
         auto* safe_opacity = arena_array<float>(allocate, 1);
         auto* safe_color = arena_array<float3>(allocate, 1);
         auto* native_mean = arena_array<float2>(allocate, 1);
-        auto* native_conic = arena_array<float>(allocate, 3);
+        auto* native_conic = arena_array<float3>(allocate, 1);
+        auto* native_depth = arena_array<float>(allocate, 1);
         auto* native_opacity = arena_array<float>(allocate, 1);
         auto* native_color = arena_array<float3>(allocate, 1);
         ASSERT_NE(tile_instance_ranges, nullptr);
         ASSERT_NE(instance_primitive_indices, nullptr);
+        ASSERT_NE(primitive_work_indices, nullptr);
         ASSERT_NE(primitive_mean2d, nullptr);
         ASSERT_NE(primitive_conic_opacity, nullptr);
         ASSERT_NE(primitive_color, nullptr);
@@ -314,19 +327,21 @@ namespace {
         ASSERT_NE(transmittance, nullptr);
         ASSERT_NE(safe_mean, nullptr);
         ASSERT_NE(safe_conic, nullptr);
+        ASSERT_NE(safe_depth, nullptr);
         ASSERT_NE(safe_opacity, nullptr);
         ASSERT_NE(safe_color, nullptr);
         ASSERT_NE(native_mean, nullptr);
         ASSERT_NE(native_conic, nullptr);
+        ASSERT_NE(native_depth, nullptr);
         ASSERT_NE(native_opacity, nullptr);
         ASSERT_NE(native_color, nullptr);
 
         ASSERT_TRUE(arena.owns_device_allocation(safe_mean, 2 * sizeof(float)));
-        ASSERT_TRUE(arena.owns_device_allocation(safe_conic, 3 * sizeof(float)));
+        ASSERT_TRUE(arena.owns_device_allocation(safe_conic, sizeof(float3)));
         ASSERT_TRUE(arena.owns_device_allocation(safe_opacity, sizeof(float)));
         ASSERT_TRUE(arena.owns_device_allocation(safe_color, sizeof(float3)));
         ASSERT_TRUE(arena.owns_device_allocation(native_mean, 2 * sizeof(float)));
-        ASSERT_TRUE(arena.owns_device_allocation(native_conic, 3 * sizeof(float)));
+        ASSERT_TRUE(arena.owns_device_allocation(native_conic, sizeof(float3)));
         ASSERT_TRUE(arena.owns_device_allocation(native_opacity, sizeof(float)));
         ASSERT_TRUE(arena.owns_device_allocation(native_color, sizeof(float3)));
 
@@ -345,9 +360,15 @@ namespace {
 
         ASSERT_TRUE(upload(tile_instance_ranges, std::vector<uint2>{{0, 2}}));
         ASSERT_TRUE(upload(instance_primitive_indices, std::vector<unsigned int>{0, 0}));
-        ASSERT_TRUE(upload(primitive_mean2d, std::vector<float2>{make_float2(7.5f, 7.5f)}));
+        ASSERT_TRUE(upload(primitive_work_indices, std::vector<unsigned int>{0}));
+        const float2 mean2d = make_float2(7.5f, 7.5f);
+        const ushort4 pixel_bbox = make_ushort4(0, width, 0, height);
+        ASSERT_EQ(cudaMemcpy(primitive_mean2d_storage, &mean2d, sizeof(mean2d), cudaMemcpyHostToDevice),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(primitive_mean2d_storage + sizeof(mean2d), &pixel_bbox,
+                             sizeof(pixel_bbox), cudaMemcpyHostToDevice), cudaSuccess);
         ASSERT_TRUE(upload(primitive_conic_opacity, std::vector<float4>{make_float4(1.0f, 0.0f, 1.0f, 0.3f)}));
-        ASSERT_TRUE(upload(primitive_color, std::vector<float3>{make_float3(0.5f, 0.25f, 0.75f)}));
+        ASSERT_TRUE(upload(primitive_color, std::vector<float4>{make_float4(0.5f, 0.25f, 0.75f, 0.0f)}));
         ASSERT_TRUE(upload(grad_image, image_gradient));
         ASSERT_TRUE(upload(grad_alpha, alpha_gradient));
         ASSERT_TRUE(upload(image, image_values));
@@ -355,20 +376,24 @@ namespace {
         ASSERT_TRUE(upload(contributions, contribution_counts));
         ASSERT_TRUE(upload(transmittance, final_transmittance));
         ASSERT_EQ(cudaMemset(safe_mean, 0, 2 * sizeof(float)), cudaSuccess);
-        ASSERT_EQ(cudaMemset(safe_conic, 0, 3 * sizeof(float)), cudaSuccess);
+        ASSERT_EQ(cudaMemset(safe_conic, 0, sizeof(float3)), cudaSuccess);
+        ASSERT_EQ(cudaMemset(safe_depth, 0, sizeof(float)), cudaSuccess);
         ASSERT_EQ(cudaMemset(safe_opacity, 0, sizeof(float)), cudaSuccess);
         ASSERT_EQ(cudaMemset(safe_color, 0, sizeof(float3)), cudaSuccess);
         ASSERT_EQ(cudaMemset(native_mean, 0, 2 * sizeof(float)), cudaSuccess);
-        ASSERT_EQ(cudaMemset(native_conic, 0, 3 * sizeof(float)), cudaSuccess);
+        ASSERT_EQ(cudaMemset(native_conic, 0, sizeof(float3)), cudaSuccess);
+        ASSERT_EQ(cudaMemset(native_depth, 0, sizeof(float)), cudaSuccess);
         ASSERT_EQ(cudaMemset(native_opacity, 0, sizeof(float)), cudaSuccess);
         ASSERT_EQ(cudaMemset(native_color, 0, sizeof(float3)), cudaSuccess);
 
         ASSERT_EQ(launch_fastgs_blend_backward_probe(
-                      tile_instance_ranges, instance_primitive_indices, primitive_mean2d,
+                      tile_instance_ranges, instance_primitive_indices, primitive_work_indices,
+                      primitive_mean2d,
                       primitive_conic_opacity, primitive_color, grad_image, grad_alpha,
                       image, alpha_map, contributions, transmittance, safe_mean, safe_conic,
-                      safe_opacity, safe_color, native_mean, native_conic, native_opacity,
-                      native_color, 2, 1, width, height),
+                      safe_depth, safe_opacity, safe_color, native_mean, native_conic,
+                      native_depth, native_opacity,
+                      native_color, 2, 1, 1, width, height),
                   cudaSuccess);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
