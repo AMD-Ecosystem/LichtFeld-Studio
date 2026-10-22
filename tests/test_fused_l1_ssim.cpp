@@ -13,19 +13,47 @@
 #include <gtest/gtest.h>
 
 #include "core/tensor.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "lfs/kernels/l1_loss.cuh"
 #include "lfs/kernels/ssim.cuh"
 #include "masked_ssim_reference.hpp"
 #include "training/losses/photometric_loss.hpp"
+#include <atomic>
+#include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cuda_runtime.h>
 #include <limits>
+#include <thread>
 #include <utility>
 
 using namespace lfs::core;
 using namespace lfs::training::kernels;
 
 namespace {
+    struct BoundedStreamGate {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> released{false};
+        std::atomic<bool> timed_out{false};
+
+#if defined(USE_HIP)
+        static void hold(void* opaque) {
+#else
+        static void CUDART_CB hold(void* opaque) {
+#endif
+            auto& gate = *static_cast<BoundedStreamGate*>(opaque);
+            gate.entered.store(true, std::memory_order_release);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!gate.released.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (!gate.released.load(std::memory_order_acquire)) {
+                gate.timed_out.store(true, std::memory_order_release);
+            }
+        }
+    };
+
     // Corrected-image gradient plus the raw-render gradient, as the trainer adds them into the render gradient.
     template <typename Context>
     Tensor combined_gradient(const DecoupledGradients& grads, const Context& ctx) {
@@ -176,6 +204,173 @@ TEST_F(FusedL1SSIMTest, BackwardMatchesReference) {
 
     EXPECT_LT(max_diff, 1e-3f) << "Max gradient difference: " << max_diff;
     EXPECT_LT(mean_diff, 1e-5f) << "Mean gradient difference: " << mean_diff;
+}
+
+TEST_F(FusedL1SSIMTest, BackwardMatchesReferenceOnPartialTiles) {
+    const int N = 2, C = 3, H = 37, W = 45;
+    auto img1 = Tensor::randn({N, C, H, W}, Device::CUDA);
+    auto img2 = Tensor::randn({N, C, H, W}, Device::CUDA);
+
+    constexpr float ssim_weight = 0.35f;
+    FusedL1SSIMWorkspace workspace;
+    auto [loss, ctx] = fused_l1_ssim_forward(img1, img2, ssim_weight, workspace, true);
+    auto fused_grad = fused_l1_ssim_backward(ctx, workspace);
+    const auto [ref_loss, ref_grad] = compute_reference_loss_and_grad(img1, img2, ssim_weight);
+
+    EXPECT_NEAR(loss.item<float>(), ref_loss, 1e-4f);
+    const auto diff = (fused_grad - ref_grad).abs();
+    EXPECT_LT(diff.max().item<float>(), 1e-3f);
+    EXPECT_LT(diff.mean().item<float>(), 1e-5f);
+}
+
+TEST_F(FusedL1SSIMTest, BackwardFallsBackWhenPlaneGridExceedsLimit) {
+    constexpr int C = 3, N = 21846, H = 1, W = 1;
+    constexpr float expected_scaled_gradient = -1.0f;
+    constexpr float ssim_weight = 0.0f;
+    auto img1 = Tensor::zeros({N, C, H, W}, Device::CUDA);
+    auto img2 = Tensor::ones({N, C, H, W}, Device::CUDA);
+
+    FusedL1SSIMWorkspace workspace;
+    auto [loss, ctx] = fused_l1_ssim_forward(img1, img2, ssim_weight, workspace, true);
+    workspace.grad_img.zero_(); // Seed unwritten planes so truncated launches cannot pass on stale arena data.
+    const auto fused_grad = fused_l1_ssim_backward(ctx, workspace);
+
+    EXPECT_NEAR(loss.item<float>(), 1.0f, 1e-4f);
+    const auto gradients = fused_grad.to_vector();
+    ASSERT_EQ(gradients.size(), static_cast<size_t>(N) * C);
+    float max_scaled_error = 0.0f;
+    for (size_t i = 0; i < gradients.size(); ++i) {
+        max_scaled_error = std::max(
+            max_scaled_error,
+            std::abs(gradients[i] * static_cast<float>(gradients.size()) - expected_scaled_gradient));
+    }
+    EXPECT_LT(max_scaled_error, 1e-4f) << "at least one gradient plane was omitted or incorrect";
+    for (size_t i = gradients.size() - 3; i < gradients.size(); ++i) {
+        EXPECT_NEAR(gradients[i] * static_cast<float>(gradients.size()), expected_scaled_gradient, 1e-4f)
+            << "tail plane " << i << " was omitted";
+    }
+}
+
+TEST_F(FusedL1SSIMTest, ReusedWorkspaceFollowsNonblockingCurrentStream) {
+    constexpr int N = 1, C = 3, H = 16, W = 16;
+    constexpr float expected_loss = 1.0f;
+    constexpr float expected_valid_gradient = -1.0f / (C * 6.0f * 6.0f);
+    cudaStream_t allocation_stream = nullptr;
+    cudaStream_t execution_stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&allocation_stream, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&execution_stream, cudaStreamNonBlocking), cudaSuccess);
+    struct StreamCleanup {
+        cudaStream_t first;
+        cudaStream_t second;
+        ~StreamCleanup() {
+            if (first) cudaStreamDestroy(first);
+            if (second) cudaStreamDestroy(second);
+        }
+    } stream_cleanup{allocation_stream, execution_stream};
+
+    FusedL1SSIMWorkspace workspace;
+    DecoupledFusedL1SSIMWorkspace decoupled_workspace;
+    {
+        const CUDAStreamGuard guard(allocation_stream);
+        auto first = Tensor::empty({N, C, H, W}, Device::CUDA);
+        auto target = Tensor::empty({N, C, H, W}, Device::CUDA);
+        first.fill_(0.0f, allocation_stream);
+        target.fill_(1.0f, allocation_stream);
+        first.set_stream(allocation_stream);
+        target.set_stream(allocation_stream);
+        auto [loss, ctx] = fused_l1_ssim_forward(first, target, 0.0f, workspace, true);
+        auto grad = fused_l1_ssim_backward(ctx, workspace);
+        ASSERT_EQ(cudaStreamSynchronize(allocation_stream), cudaSuccess);
+        EXPECT_EQ(loss.stream(), allocation_stream);
+        EXPECT_EQ(grad.stream(), allocation_stream);
+
+        auto decoupled = decoupled_fused_l1_ssim_forward(
+            first, first, target, 0.0f, decoupled_workspace, true);
+        auto decoupled_grads = decoupled_fused_l1_ssim_backward(decoupled.second, decoupled_workspace);
+        ASSERT_EQ(cudaStreamSynchronize(allocation_stream), cudaSuccess);
+        EXPECT_EQ(decoupled.first.stream(), allocation_stream);
+        EXPECT_EQ(decoupled_grads.grad_corrected.stream(), allocation_stream);
+    }
+
+    BoundedStreamGate gate;
+    ASSERT_EQ(cudaLaunchHostFunc(allocation_stream, &BoundedStreamGate::hold, &gate), cudaSuccess);
+    const auto gate_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!gate.entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < gate_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!gate.entered.load(std::memory_order_acquire)) {
+        gate.released.store(true, std::memory_order_release);
+        EXPECT_EQ(cudaStreamSynchronize(allocation_stream), cudaSuccess);
+        FAIL() << "bounded stream gate did not start";
+    }
+    struct GateCleanup {
+        BoundedStreamGate& gate;
+        cudaStream_t stream;
+        ~GateCleanup() {
+            gate.released.store(true, std::memory_order_release);
+            cudaStreamSynchronize(stream);
+        }
+    } gate_cleanup{gate, allocation_stream};
+
+    cudaEvent_t completed = nullptr;
+    ASSERT_EQ(cudaEventCreateWithFlags(&completed, cudaEventDisableTiming), cudaSuccess);
+    struct EventCleanup {
+        cudaEvent_t event;
+        ~EventCleanup() { if (event) cudaEventDestroy(event); }
+    } event_cleanup{completed};
+
+    Tensor execution_input;
+    Tensor execution_target;
+    Tensor execution_loss;
+    Tensor execution_grad;
+    Tensor decoupled_loss;
+    Tensor decoupled_grad;
+    {
+        const CUDAStreamGuard guard(execution_stream);
+        execution_input = Tensor::empty({N, C, H, W}, Device::CUDA);
+        execution_target = Tensor::empty({N, C, H, W}, Device::CUDA);
+        execution_input.fill_(0.0f, execution_stream);
+        execution_target.fill_(1.0f, execution_stream);
+        execution_input.set_stream(execution_stream);
+        execution_target.set_stream(execution_stream);
+        auto forward = fused_l1_ssim_forward(execution_input, execution_target, 0.0f, workspace, true);
+        execution_loss = forward.first;
+        execution_grad = fused_l1_ssim_backward(forward.second, workspace);
+        auto decoupled = decoupled_fused_l1_ssim_forward(
+            execution_input, execution_input, execution_target, 0.0f, decoupled_workspace, true);
+        decoupled_loss = decoupled.first;
+        const auto decoupled_grads = decoupled_fused_l1_ssim_backward(decoupled.second, decoupled_workspace);
+        decoupled_grad = decoupled_grads.grad_corrected;
+        EXPECT_EQ(execution_loss.stream(), execution_stream);
+        EXPECT_EQ(execution_grad.stream(), execution_stream);
+        EXPECT_EQ(decoupled_loss.stream(), execution_stream);
+        EXPECT_EQ(decoupled_grad.stream(), execution_stream);
+        EXPECT_EQ(cudaEventRecord(completed, execution_stream), cudaSuccess);
+    }
+
+    const cudaError_t before_release = cudaEventQuery(completed);
+    gate.released.store(true, std::memory_order_release);
+    EXPECT_EQ(cudaStreamSynchronize(allocation_stream), cudaSuccess);
+    EXPECT_EQ(cudaEventSynchronize(completed), cudaSuccess);
+    EXPECT_FALSE(gate.timed_out.load(std::memory_order_acquire));
+    EXPECT_EQ(before_release, cudaErrorNotReady)
+        << "reused fused and decoupled workspaces did not carry their old-stream dependency to the new stream";
+    EXPECT_NEAR(execution_loss.item<float>(), expected_loss, 1e-5f);
+    EXPECT_NEAR(decoupled_loss.item<float>(), expected_loss, 1e-5f);
+    for (const auto& gradient : {execution_grad, decoupled_grad}) {
+        const auto gradients = gradient.to_vector();
+        ASSERT_EQ(gradients.size(), static_cast<size_t>(N) * C * H * W);
+        for (int c = 0; c < C; ++c) {
+            for (int y = 0; y < H; ++y) {
+                for (int x = 0; x < W; ++x) {
+                    const float expected = (y >= 5 && y < H - 5 && x >= 5 && x < W - 5)
+                        ? expected_valid_gradient : 0.0f;
+                    const size_t index = static_cast<size_t>(c) * H * W + y * W + x;
+                    EXPECT_NEAR(gradients[index], expected, 1e-6f) << "gradient index " << index;
+                }
+            }
+        }
+    }
 }
 
 // Test various SSIM weights
@@ -767,7 +962,7 @@ TEST_F(MaskedFusedL1SSIMTest, UInt8TargetAndMaskMatchFloatReference) {
 // ============================================================================
 
 TEST_F(FusedL1SSIMTest, DecoupledMatchesStandardWhenCorrectedEqualsRaw) {
-    const int N = 1, C = 3, H = 64, W = 64;
+    const int N = 2, C = 3, H = 37, W = 45;
     const float ssim_weight = 0.2f;
 
     auto raw = Tensor::randn({N, C, H, W}, Device::CUDA).abs() + 0.1f;

@@ -1447,6 +1447,158 @@ namespace {
         }
     }
 
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+    constexpr int HIP_SSIM_BLOCK_X = 32;
+    constexpr int HIP_SSIM_BLOCK_Y = 8;
+    constexpr int HIP_SSIM_SHARED_X = HIP_SSIM_BLOCK_X + 2 * HALO;
+    constexpr int HIP_SSIM_SHARED_Y = HIP_SSIM_BLOCK_Y + 2 * HALO;
+
+    // Give each block one channel plane so the image and derivative loads stay
+    // contiguous across x. The CUDA kernel above processes every channel in a
+    // block and stores interleaved derivative components in shared memory,
+    // which is poorly matched to the LDS access pattern on AMD GPUs.
+    template <typename TargetT, typename PartialT, bool HasSigmaPartials, bool Accumulate>
+    __global__ void fusedL1SSIMBackwardHIP(
+        float ssim_weight,
+        int H,
+        int W,
+        int CH,
+        float grad_per_pixel,
+        bool apply_valid_padding,
+        const float* __restrict__ img1,
+        const TargetT* __restrict__ img2,
+        float* __restrict__ dL_dimg1,
+        const PartialT* __restrict__ dm_dmu1,
+        const PartialT* __restrict__ dm_dsigma1_sq,
+        const PartialT* __restrict__ dm_dsigma12) {
+        constexpr int COMPONENTS = HasSigmaPartials ? 3 : 1;
+        __shared__ float derivatives[COMPONENTS][HIP_SSIM_SHARED_Y][HIP_SSIM_SHARED_X];
+        __shared__ float horizontal[COMPONENTS][HIP_SSIM_SHARED_Y][HIP_SSIM_BLOCK_X];
+
+        const int plane = static_cast<int>(blockIdx.z);
+        const int batch = plane / CH;
+        const int channel = plane % CH;
+        const int start_x = static_cast<int>(blockIdx.x) * HIP_SSIM_BLOCK_X;
+        const int start_y = static_cast<int>(blockIdx.y) * HIP_SSIM_BLOCK_Y;
+        const int pix_x = start_x + threadIdx.x;
+        const int pix_y = start_y + threadIdx.y;
+        const bool crop_y = apply_valid_padding && H > 10;
+        const bool crop_x = apply_valid_padding && W > 10;
+
+        for (int row = threadIdx.y; row < HIP_SSIM_SHARED_Y; row += HIP_SSIM_BLOCK_Y) {
+            const int gy = start_y + row - HALO;
+            for (int col = threadIdx.x; col < HIP_SSIM_SHARED_X; col += HIP_SSIM_BLOCK_X) {
+                const int gx = start_x + col - HALO;
+                float chain = 0.0f;
+                float vmu = 0.0f;
+                float vs1 = 0.0f;
+                float vs12 = 0.0f;
+                if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+                    if ((!crop_x || (gx >= HALO && gx < W - HALO)) && (!crop_y || (gy >= HALO && gy < H - HALO)))
+                        chain = grad_per_pixel;
+                    vmu = get_pix_value(dm_dmu1, batch, channel, gy, gx, CH, H, W);
+                    if constexpr (HasSigmaPartials) {
+                        vs1 = get_pix_value(dm_dsigma1_sq, batch, channel, gy, gx, CH, H, W);
+                        vs12 = get_pix_value(dm_dsigma12, batch, channel, gy, gx, CH, H, W);
+                    }
+                }
+                derivatives[0][row][col] = -ssim_weight * vmu * chain;
+                if constexpr (HasSigmaPartials) {
+                    derivatives[1][row][col] = -ssim_weight * vs1 * chain;
+                    derivatives[2][row][col] = -ssim_weight * vs12 * chain;
+                }
+            }
+        }
+        __syncthreads();
+
+        const int center_x = threadIdx.x + HALO;
+        for (int row = threadIdx.y; row < HIP_SSIM_SHARED_Y; row += HIP_SSIM_BLOCK_Y) {
+#pragma unroll
+            for (int component = 0; component < COMPONENTS; ++component) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int d = 1; d <= HALO; ++d) {
+                    const float weight = cGauss[HALO - d];
+                    sum += (derivatives[component][row][center_x - d] +
+                            derivatives[component][row][center_x + d]) * weight;
+                }
+                sum += derivatives[component][row][center_x] * cGauss[HALO];
+                horizontal[component][row][threadIdx.x] = sum;
+            }
+        }
+        __syncthreads();
+
+        if (pix_x < W && pix_y < H) {
+            const int center_y = threadIdx.y + HALO;
+            float convolved[3]{};
+#pragma unroll
+            for (int component = 0; component < COMPONENTS; ++component) {
+#pragma unroll
+                for (int d = 1; d <= HALO; ++d) {
+                    const float weight = cGauss[HALO - d];
+                    convolved[component] +=
+                        (horizontal[component][center_y - d][threadIdx.x] +
+                         horizontal[component][center_y + d][threadIdx.x]) * weight;
+                }
+                convolved[component] += horizontal[component][center_y][threadIdx.x] * cGauss[HALO];
+            }
+
+            const int index = batch * CH * H * W + channel * H * W + pix_y * W + pix_x;
+            const float p1 = pixel_value(img1, index);
+            const float p2 = pixel_value(img2, index);
+            const float grad_ssim = convolved[0] + (2.0f * p1) * convolved[1] + p2 * convolved[2];
+            const bool inside_valid_region =
+                (!crop_x || (pix_x >= HALO && pix_x < W - HALO)) && (!crop_y || (pix_y >= HALO && pix_y < H - HALO));
+            const float chain = inside_valid_region ? grad_per_pixel : 0.0f;
+            const float sign = p1 == p2 ? 0.0f : copysignf(1.0f, p1 - p2);
+            const float grad_l1 = (1.0f - ssim_weight) * sign * chain;
+            if constexpr (Accumulate) {
+                dL_dimg1[index] += grad_ssim + grad_l1;
+            } else {
+                dL_dimg1[index] = grad_ssim + grad_l1;
+            }
+        }
+    }
+#endif
+
+    template <typename TargetT, typename PartialT, bool HasSigmaPartials, bool Accumulate>
+    void launch_fused_l1_ssim_backward(
+        float ssim_weight,
+        int N,
+        int H,
+        int W,
+        int CH,
+        float C1,
+        float C2,
+        float grad_per_pixel,
+        bool apply_valid_padding,
+        const float* img1,
+        const TargetT* img2,
+        float* dL_dimg1,
+        const PartialT* dm_dmu1,
+        const PartialT* dm_dsigma1_sq,
+        const PartialT* dm_dsigma12,
+        cudaStream_t stream) {
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        const uint64_t planes = static_cast<uint64_t>(N) * static_cast<uint64_t>(CH);
+        const int grid_x = (W - 1) / HIP_SSIM_BLOCK_X + 1;
+        const int grid_y = (H - 1) / HIP_SSIM_BLOCK_Y + 1;
+        if (planes <= 65535 && grid_y <= 65535) {
+            const dim3 grid(grid_x, grid_y, static_cast<unsigned int>(planes));
+            const dim3 block(HIP_SSIM_BLOCK_X, HIP_SSIM_BLOCK_Y);
+            fusedL1SSIMBackwardHIP<TargetT, PartialT, HasSigmaPartials, Accumulate><<<grid, block, 0, stream>>>(
+                ssim_weight, H, W, CH, grad_per_pixel, apply_valid_padding,
+                img1, img2, dL_dimg1, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
+            return;
+        }
+#endif
+        const dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, N);
+        const dim3 block(BLOCK_X, BLOCK_Y);
+        fusedL1SSIMBackwardCUDA<TargetT, HasSigmaPartials, Accumulate><<<grid, block, 0, stream>>>(
+            ssim_weight, H, W, CH, C1, C2, grad_per_pixel, apply_valid_padding,
+            img1, img2, dL_dimg1, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
+    }
+
     // Masked Fused L1+SSIM Backward Kernel.
     // HasSigmaPartials=false: appearance branch skips unused sigma partials.
     template <typename TargetT, typename MaskT, bool HasSigmaPartials = true, bool Accumulate = false, bool ScaledMeanPartial = false>
@@ -2585,18 +2737,15 @@ namespace lfs::training::kernels {
         const size_t numel = N * C * grad_h * grad_w;
         const float grad_per_pixel = 1.0f / static_cast<float>(numel);
 
-        const dim3 grid((ctx.W + BLOCK_X - 1) / BLOCK_X, (ctx.H + BLOCK_Y - 1) / BLOCK_Y, N);
-        const dim3 block(BLOCK_X, BLOCK_Y);
-
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedL1SSIMBackwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                ctx.ssim_weight, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
+            launch_fused_l1_ssim_backward<TargetT, __half, true, false>(
+                ctx.ssim_weight, static_cast<int>(N), ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                 grad_per_pixel, ctx.apply_valid_padding,
                 ctx.img1.ptr<float>(), img2_ptr,
                 workspace.grad_img.ptr<float>(),
                 ctx.dm_dmu1.ptr<__half>(), ctx.dm_dsigma1_sq.ptr<__half>(),
-                ctx.dm_dsigma12.ptr<__half>());
+                ctx.dm_dsigma12.ptr<__half>(), lfs::core::getCurrentCUDAStream());
             LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.fused_l1_backward");
         });
 
@@ -2703,20 +2852,16 @@ namespace lfs::training::kernels {
         const size_t numel = N * C * grad_h * grad_w;
         const float grad_per_pixel = 1.0f / static_cast<float>(numel);
 
-        const dim3 grid((ctx.W + BLOCK_X - 1) / BLOCK_X, (ctx.H + BLOCK_Y - 1) / BLOCK_Y, N);
-        const dim3 block(BLOCK_X, BLOCK_Y);
-
         dispatch_target_ptr(ctx.gt_img, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            fusedL1SSIMBackwardCUDA<TargetT, /*HasSigmaPartials=*/false>
-                <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                    ctx.ssim_weight, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
-                    grad_per_pixel, ctx.apply_valid_padding,
-                    ctx.corrected_img.ptr<float>(), gt_ptr,
-                    workspace.grad_corrected.ptr<float>(),
-                    ctx.app_dm_dmu1.ptr<__half>(),
-                    /*dm_dsigma1_sq=*/nullptr,
-                    /*dm_dsigma12=*/nullptr);
+            launch_fused_l1_ssim_backward<TargetT, __half, false, false>(
+                ctx.ssim_weight, static_cast<int>(N), ctx.H, ctx.W, static_cast<int>(C), C1, C2,
+                grad_per_pixel, ctx.apply_valid_padding,
+                ctx.corrected_img.ptr<float>(), gt_ptr,
+                workspace.grad_corrected.ptr<float>(),
+                ctx.app_dm_dmu1.ptr<__half>(),
+                /*dm_dsigma1_sq=*/nullptr,
+                /*dm_dsigma12=*/nullptr, lfs::core::getCurrentCUDAStream());
             LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.decoupled_fused_l1_backward");
         });
 
@@ -2758,10 +2903,9 @@ namespace lfs::training::kernels {
 
         const size_t N = raw.raw_img.shape()[0];
         const size_t C = raw.raw_img.shape()[1];
-        const dim3 grid((raw.W + BLOCK_X - 1) / BLOCK_X, (raw.H + BLOCK_Y - 1) / BLOCK_Y, N);
-        const dim3 block(BLOCK_X, BLOCK_Y);
-
         if (raw.mask.is_valid()) {
+            const dim3 grid((raw.W + BLOCK_X - 1) / BLOCK_X, (raw.H + BLOCK_Y - 1) / BLOCK_Y, N);
+            const dim3 block(BLOCK_X, BLOCK_Y);
             LFS_ASSERT_MSG(std::isfinite(raw.mask_sum_value) && raw.mask_sum_value > 0.0f,
                            "Masked loss normalization must be positive and finite");
             const auto mask = prepare_loss_mask(raw.mask, raw.raw_img);
@@ -2795,15 +2939,14 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            fusedL1SSIMBackwardCUDA<TargetT, /*HasSigmaPartials=*/true, /*Accumulate=*/true>
-                <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
-                    1.0f, raw.H, raw.W, static_cast<int>(C), C1, C2,
-                    grad_per_pixel, raw.apply_valid_padding,
-                    raw.raw_img.ptr<float>(), gt_ptr,
-                    grad_image.ptr<float>(),
-                    raw.raw_dm_dmu1.ptr<__half>(),
-                    raw.raw_dm_dsigma1_sq.ptr<__half>(),
-                    raw.raw_dm_dsigma12.ptr<__half>());
+            launch_fused_l1_ssim_backward<TargetT, __half, true, true>(
+                1.0f, static_cast<int>(N), raw.H, raw.W, static_cast<int>(C), C1, C2,
+                grad_per_pixel, raw.apply_valid_padding,
+                raw.raw_img.ptr<float>(), gt_ptr,
+                grad_image.ptr<float>(),
+                raw.raw_dm_dmu1.ptr<__half>(),
+                raw.raw_dm_dsigma1_sq.ptr<__half>(),
+                raw.raw_dm_dsigma12.ptr<__half>(), lfs::core::getCurrentCUDAStream());
             LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.decoupled_raw_backward");
         });
     }
@@ -3155,6 +3298,37 @@ namespace lfs::training::kernels {
         }
     } // namespace
 
+    namespace {
+        void rehome_tensor_stream(lfs::core::Tensor& tensor, cudaStream_t stream) {
+            if (tensor.is_valid() && tensor.stream() != stream) {
+                tensor.set_stream(stream);
+            }
+        }
+
+        void rehome_workspace_stream(FusedL1SSIMWorkspace& workspace, cudaStream_t stream) {
+            rehome_tensor_stream(workspace.ssim_map, stream);
+            rehome_tensor_stream(workspace.cs_map, stream);
+            rehome_tensor_stream(workspace.dm_dmu1, stream);
+            rehome_tensor_stream(workspace.dm_dsigma1_sq, stream);
+            rehome_tensor_stream(workspace.dm_dsigma12, stream);
+            rehome_tensor_stream(workspace.grad_img, stream);
+            rehome_tensor_stream(workspace.reduction_temp, stream);
+            rehome_tensor_stream(workspace.reduction_result, stream);
+        }
+
+        void rehome_workspace_stream(DecoupledFusedL1SSIMWorkspace& workspace, cudaStream_t stream) {
+            rehome_tensor_stream(workspace.ssim_map, stream);
+            rehome_tensor_stream(workspace.cs_map, stream);
+            rehome_tensor_stream(workspace.app_dm_dmu1, stream);
+            rehome_tensor_stream(workspace.raw_dm_dmu1, stream);
+            rehome_tensor_stream(workspace.raw_dm_dsigma1_sq, stream);
+            rehome_tensor_stream(workspace.raw_dm_dsigma12, stream);
+            rehome_tensor_stream(workspace.grad_corrected, stream);
+            rehome_tensor_stream(workspace.reduction_temp, stream);
+            rehome_tensor_stream(workspace.reduction_result, stream);
+        }
+    } // namespace
+
     void SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
         if (arena) {
             arena->ensure_pure_ssim(shape);
@@ -3177,9 +3351,11 @@ namespace lfs::training::kernels {
     }
 
     void FusedL1SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
+        const auto stream = lfs::core::getCurrentCUDAStream();
         if (arena) {
             arena->ensure_fused(shape);
             ensure_independent_cs_map(cs_map, ssim_map);
+            rehome_workspace_stream(*this, stream);
             return;
         }
         if (allocated_shape != shape) {
@@ -3196,12 +3372,15 @@ namespace lfs::training::kernels {
             allocated_shape = shape;
         }
         ensure_independent_cs_map(cs_map, ssim_map);
+        rehome_workspace_stream(*this, stream);
     }
 
     void DecoupledFusedL1SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
+        const auto stream = lfs::core::getCurrentCUDAStream();
         if (arena) {
             arena->ensure_decoupled(shape);
             ensure_independent_cs_map(cs_map, ssim_map);
+            rehome_workspace_stream(*this, stream);
             return;
         }
         if (allocated_shape != shape) {
@@ -3219,6 +3398,7 @@ namespace lfs::training::kernels {
             allocated_shape = shape;
         }
         ensure_independent_cs_map(cs_map, ssim_map);
+        rehome_workspace_stream(*this, stream);
     }
 
     void MaskedFusedL1SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
@@ -3396,6 +3576,10 @@ namespace lfs::training::kernels {
         const bool must_allocate = !storage_.is_valid() || variant_changed ||
                                    required_capacity > capacity_bytes_;
         if (!must_allocate) {
+            const auto current_stream = lfs::core::getCurrentCUDAStream();
+            if (storage_.stream() != current_stream) {
+                storage_.set_stream(current_stream);
+            }
             return;
         }
         // Variant switches are exact in either direction. Within one variant,
