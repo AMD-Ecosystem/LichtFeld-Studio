@@ -598,8 +598,8 @@ namespace lfs::core {
                 else
                     result = powf(magnitude, y);
                 return static_cast<T>(odd && signbit(x) ? -result : result);
-#elif defined(__HIPCC__) && defined(_MSC_VER)
-                // HIP's __half converts to every floating type, which makes the MSVC
+#elif defined(__HIPCC__)
+                // HIP's __half converts to every floating type, which makes the host
                 // <cmath> overloads ambiguous; use the float overload as CUDA does.
                 if constexpr (std::is_arithmetic_v<T>)
                     return static_cast<T>(std::pow(a, b));
@@ -619,7 +619,7 @@ namespace lfs::core {
                 } else {
 #ifdef __CUDA_ARCH__
                     return fmodf(a, b);
-#elif defined(__HIPCC__) && defined(_MSC_VER)
+#elif defined(__HIPCC__)
                     if constexpr (std::is_arithmetic_v<T>)
                         return std::fmod(a, b);
                     else
