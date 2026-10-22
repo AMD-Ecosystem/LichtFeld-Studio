@@ -5,6 +5,7 @@
 #pragma once
 
 #include "buffer_utils.h"
+#include "device_gradient_atomic.cuh"
 #include "helper_math.h"
 #include "kernel_utils.cuh"
 #include "lfs/core/warp_reduce.cuh"
@@ -656,7 +657,8 @@ namespace fast_lfs::rasterization::kernels::backward {
     // ---------------------------------------------------------------------------
     // The removal-impact walk keeps a colour composite per pixel live; at 8 blocks per SM it spills
     // on every fragment, at 6 it fits in registers and runs faster.
-    template <DensificationType DENSIFICATION_TYPE, bool NORMAL_CHANNEL, bool IMPACT_SCORE, int WARP_CULL_MODE = 0>
+    template <DensificationType DENSIFICATION_TYPE, bool NORMAL_CHANNEL, bool IMPACT_SCORE,
+              int WARP_CULL_MODE = 0, bool NATIVE_GRADIENT_ATOMICS = false>
     __global__ void __launch_bounds__(config::block_size_blend_backward, IMPACT_SCORE ? 6 : 8) blend_backward_cu(
         const uint2* __restrict__ tile_instance_ranges,
         const uint* __restrict__ instance_primitive_indices,
@@ -1171,21 +1173,30 @@ namespace fast_lfs::rasterization::kernels::backward {
                                                       : LFS_GROUP32_MAX(impact_peak);
                         }
                         if (lane_id == 0u) {
-                            atomicAdd(&grad_mean2d[work_idx].x, clamp_grad(mean_x));
-                            atomicAdd(&grad_mean2d[work_idx].y, clamp_grad(mean_y));
-                            atomicAdd(&grad_conic[work_idx].x, clamp_grad(conic_x));
-                            atomicAdd(&grad_conic[work_idx].y, clamp_grad(conic_y));
-                            atomicAdd(&grad_conic[work_idx].z, clamp_grad(conic_z));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_mean2d[work_idx].x, clamp_grad(mean_x));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_mean2d[work_idx].y, clamp_grad(mean_y));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_conic[work_idx].x, clamp_grad(conic_x));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_conic[work_idx].y, clamp_grad(conic_y));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_conic[work_idx].z, clamp_grad(conic_z));
                             atomicAdd(&grad_depth[work_idx], clamp_grad(depth_g));
                             if constexpr (NORMAL_CHANNEL) {
                                 atomicAdd(&grad_normal[work_idx].x, clamp_grad(normal_x));
                                 atomicAdd(&grad_normal[work_idx].y, clamp_grad(normal_y));
                                 atomicAdd(&grad_normal[work_idx].z, clamp_grad(normal_z));
                             }
-                            atomicAdd(&grad_compensated_opacity[work_idx], clamp_grad(opac_g));
-                            atomicAdd(&grad_color[work_idx].x, clamp_grad(color_x));
-                            atomicAdd(&grad_color[work_idx].y, clamp_grad(color_y));
-                            atomicAdd(&grad_color[work_idx].z, clamp_grad(color_z));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_compensated_opacity[work_idx], clamp_grad(opac_g));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_color[work_idx].x, clamp_grad(color_x));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_color[work_idx].y, clamp_grad(color_y));
+                            atomic_add_device_gradient<NATIVE_GRADIENT_ATOMICS>(
+                                &grad_color[work_idx].z, clamp_grad(color_z));
                             if constexpr (DENSIFICATION_TYPE != DensificationType::None) {
                                 atomicAdd(&densification_info[primitive_idx], dens_w);
                                 atomicAdd(&densification_info[n_primitives + primitive_idx], dens_e);

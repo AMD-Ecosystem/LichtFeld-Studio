@@ -7,6 +7,7 @@
 #include "fused_adam_types.h"
 #include "helper_math.h"
 #include "rasterization_config.h"
+#include <array>
 #include <cuda_runtime.h>
 #include <functional>
 
@@ -67,6 +68,7 @@ namespace fast_lfs::rasterization {
         float* edge_score_out,
         float* impact_sum_out,
         float* impact_peak_out,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        std::array<const void*, 4> native_gradient_atomics_ranges = {});
 
 } // namespace fast_lfs::rasterization

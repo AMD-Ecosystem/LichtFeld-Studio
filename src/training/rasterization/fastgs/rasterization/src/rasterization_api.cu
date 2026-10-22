@@ -682,7 +682,8 @@ namespace fast_lfs::rasterization {
                 edge_score_out,
                 impact_sum_out,
                 impact_peak_out,
-                stream);
+                stream,
+                {grad_mean2d_helper, grad_conic_helper, grad_opacity_helper, grad_color_helper});
 
             // Mark frame as complete
             release_forward_context(forward_ctx);

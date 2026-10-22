@@ -796,6 +796,8 @@ set(TEST_FILES
     test_selection_operator_modal.cpp
     test_operator_registry_props.cpp
     test_fastgs_analytical_gradients.cpp
+    test_fastgs_native_atomics.cpp
+    fastgs_native_atomic_probe.cu
     test_normal_prior_decode.cpp
     test_normal_auto_generate.cpp
     test_lens_priors.cpp

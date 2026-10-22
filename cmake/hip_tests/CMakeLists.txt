@@ -46,6 +46,7 @@ set(LFS_HIP_TEST_FILES
     # rasterizers
     test_gsplat_rasterizer.cpp
     test_fastgs_analytical_gradients.cpp
+    test_fastgs_native_atomics.cpp
     # adam / scheduler / bilateral / ppisp
     test_lfs_scheduler.cpp
     test_ppisp_cuda_vs_torch.cpp
@@ -185,7 +186,8 @@ set(LFS_HIP_TEST_SOURCES "${LFS_TESTS_DIR}/test_main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/nvcodec_image_loader_stub.cpp"
     "${LFS_TESTS_DIR}/device_fault_cuda_utils.cu"
     "${LFS_TESTS_DIR}/tensor_hardening_cuda_utils.cu"
-    "${LFS_TESTS_DIR}/fastgs_tile_culling_boundary_cuda.cu")
+    "${LFS_TESTS_DIR}/fastgs_tile_culling_boundary_cuda.cu"
+    "${LFS_TESTS_DIR}/fastgs_native_atomic_probe.cu")
 foreach(_t IN LISTS LFS_HIP_TEST_FILES)
     if(EXISTS "${LFS_TESTS_DIR}/${_t}")
         list(APPEND LFS_HIP_TEST_SOURCES "${LFS_TESTS_DIR}/${_t}")

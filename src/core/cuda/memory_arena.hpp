@@ -380,6 +380,10 @@ namespace lfs::core {
         void clear_external_backing(const void* device_ptr = nullptr);
         [[nodiscard]] bool using_external_backing(const void* device_ptr = nullptr) const;
 
+        // True only for a complete range owned by this arena on the current device.
+        // Imported external backing is excluded because its HIP memory attributes are unknown.
+        [[nodiscard]] bool owns_device_allocation(const void* ptr, size_t bytes) const;
+
         Statistics get_statistics() const;
         MemoryInfo get_memory_info() const;
         void log_memory_status(uint64_t frame_id, bool force = false);

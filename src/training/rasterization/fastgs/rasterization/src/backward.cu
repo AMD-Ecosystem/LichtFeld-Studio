@@ -7,8 +7,10 @@
 #include "forward.h"
 #include "helper_math.h"
 #include "kernels_backward.cuh"
+#include "native_gradient_atomics.hpp"
 #include "rasterization_config.h"
 #include "utils.h"
+#include "core/cuda/memory_arena.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +19,35 @@
 
 namespace {
     std::atomic_bool g_force_generic_preprocess_for_testing{false};
+
+    bool native_gradient_atomics_supported() {
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) {
+            return false;
+        }
+        static thread_local int cached_device = -1;
+        static thread_local bool supported = false;
+        if (device != cached_device) {
+            cudaDeviceProp properties{};
+            if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+                return false;
+            }
+            supported = fast_lfs::rasterization::detail::native_gradient_atomics_arch_supported(
+                properties.gcnArchName);
+            cached_device = device;
+        }
+        return supported;
+#else
+        return false;
+#endif
+    }
+}
+
+bool fast_lfs::rasterization::detail::native_gradient_atomics_disabled_from_environment() noexcept {
+    static const bool disabled = native_gradient_atomics_disabled(
+        std::getenv("LFS_DISABLE_HIP_FASTGS_NATIVE_ATOMICS"));
+    return disabled;
 }
 
 void fast_lfs::rasterization::set_force_generic_preprocess_for_testing(const bool force) noexcept {
@@ -78,7 +109,8 @@ void fast_lfs::rasterization::backward(
     float* edge_score_out,
     float* impact_sum_out,
     float* impact_peak_out,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const std::array<const void*, 4> native_gradient_atomics_ranges) {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const uint64_t n_tiles_u64 = static_cast<uint64_t>(grid.x) * static_cast<uint64_t>(grid.y);
     const int n_tiles = checked_to_int(n_tiles_u64, "n_tiles exceeds int range");
@@ -97,14 +129,26 @@ void fast_lfs::rasterization::backward(
         const int warp_cull_mode = warp_cull_mode_for_testing();
         const int blend_batch_override = blend_batch_size_for_testing();
 
+        bool use_native_gradient_atomics = false;
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        if (n_visible > 0) {
+            use_native_gradient_atomics = detail::native_gradient_atomics_eligible(
+                lfs::core::GlobalArenaManager::instance().get_arena(),
+                native_gradient_atomics_ranges, n_visible, native_gradient_atomics_supported(),
+                detail::native_gradient_atomics_disabled_from_environment());
+        }
+#endif
+
         // Backward blend (template dispatch eliminates densification branch from inner loop).
         // Production instantiates WARP_CULL_MODE=0 only (3 dens × 2 normal = 6).
         // Modes 1/2 are test-only (set_warp_cull_mode_for_testing); WarpCullBwd drives
         // DensificationType::None and no normal channel, so those two stay off the
         // production nest.
         auto launch_blend_backward_typed =
-            [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, bool IMPACT_SCORE, int WARP_CULL_MODE>() {
-                kernels::backward::blend_backward_cu<DENS_TYPE, NORMAL_CHANNEL, IMPACT_SCORE, WARP_CULL_MODE>
+            [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, bool IMPACT_SCORE,
+                int WARP_CULL_MODE, bool NATIVE_GRADIENT_ATOMICS = false>() {
+                kernels::backward::blend_backward_cu<DENS_TYPE, NORMAL_CHANNEL, IMPACT_SCORE,
+                                                     WARP_CULL_MODE, NATIVE_GRADIENT_ATOMICS>
                     <<<n_tiles, config::block_size_blend_backward, 0, stream>>>(
                         per_tile_buffers.instance_ranges,
                         sorted_primitive_indices,
@@ -144,18 +188,30 @@ void fast_lfs::rasterization::backward(
                         blend_batch_override);
                 LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.backward.blend_backward");
             };
-        auto launch_production = [&]<DensificationType DENS_TYPE>() {
+        auto launch_production_variant = [&]<DensificationType DENS_TYPE,
+                                            bool NATIVE_GRADIENT_ATOMICS>() {
             const bool impact_score = impact_sum_out != nullptr;
             if (grad_normal != nullptr && grad_normal_helper != nullptr) {
                 if (impact_score)
-                    launch_blend_backward_typed.template operator()<DENS_TYPE, true, true, 0>();
+                    launch_blend_backward_typed.template operator()<DENS_TYPE, true, true, 0,
+                                                                    NATIVE_GRADIENT_ATOMICS>();
                 else
-                    launch_blend_backward_typed.template operator()<DENS_TYPE, true, false, 0>();
+                    launch_blend_backward_typed.template operator()<DENS_TYPE, true, false, 0,
+                                                                    NATIVE_GRADIENT_ATOMICS>();
             } else {
                 if (impact_score)
-                    launch_blend_backward_typed.template operator()<DENS_TYPE, false, true, 0>();
+                    launch_blend_backward_typed.template operator()<DENS_TYPE, false, true, 0,
+                                                                    NATIVE_GRADIENT_ATOMICS>();
                 else
-                    launch_blend_backward_typed.template operator()<DENS_TYPE, false, false, 0>();
+                    launch_blend_backward_typed.template operator()<DENS_TYPE, false, false, 0,
+                                                                     NATIVE_GRADIENT_ATOMICS>();
+            }
+        };
+        auto launch_production = [&]<DensificationType DENS_TYPE>() {
+            if (use_native_gradient_atomics) {
+                launch_production_variant.template operator()<DENS_TYPE, true>();
+            } else {
+                launch_production_variant.template operator()<DENS_TYPE, false>();
             }
         };
         if (warp_cull_mode == 1) {
