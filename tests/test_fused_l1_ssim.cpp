@@ -36,7 +36,11 @@ namespace {
         std::atomic<bool> released{false};
         std::atomic<bool> timed_out{false};
 
+#if defined(USE_HIP)
+        static void hold(void* opaque) {
+#else
         static void CUDART_CB hold(void* opaque) {
+#endif
             auto& gate = *static_cast<BoundedStreamGate*>(opaque);
             gate.entered.store(true, std::memory_order_release);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -228,6 +232,7 @@ TEST_F(FusedL1SSIMTest, BackwardFallsBackWhenPlaneGridExceedsLimit) {
 
     FusedL1SSIMWorkspace workspace;
     auto [loss, ctx] = fused_l1_ssim_forward(img1, img2, ssim_weight, workspace, true);
+    workspace.grad_img.zero_(); // Seed unwritten planes so truncated launches cannot pass on stale arena data.
     const auto fused_grad = fused_l1_ssim_backward(ctx, workspace);
 
     EXPECT_NEAR(loss.item<float>(), 1.0f, 1e-4f);
