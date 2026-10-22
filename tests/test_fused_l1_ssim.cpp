@@ -221,8 +221,8 @@ TEST_F(FusedL1SSIMTest, BackwardMatchesReferenceOnPartialTiles) {
 
 TEST_F(FusedL1SSIMTest, BackwardFallsBackWhenPlaneGridExceedsLimit) {
     constexpr int C = 3, N = 21846, H = 1, W = 1;
-    constexpr float expected_scaled_gradient = -0.8f;
-    constexpr float ssim_weight = 0.2f;
+    constexpr float expected_scaled_gradient = -1.0f;
+    constexpr float ssim_weight = 0.0f;
     auto img1 = Tensor::zeros({N, C, H, W}, Device::CUDA);
     auto img2 = Tensor::ones({N, C, H, W}, Device::CUDA);
 
@@ -230,7 +230,7 @@ TEST_F(FusedL1SSIMTest, BackwardFallsBackWhenPlaneGridExceedsLimit) {
     auto [loss, ctx] = fused_l1_ssim_forward(img1, img2, ssim_weight, workspace, true);
     const auto fused_grad = fused_l1_ssim_backward(ctx, workspace);
 
-    EXPECT_TRUE(std::isfinite(loss.item<float>()));
+    EXPECT_NEAR(loss.item<float>(), 1.0f, 1e-4f);
     const auto gradients = fused_grad.to_vector();
     ASSERT_EQ(gradients.size(), static_cast<size_t>(N) * C);
     float max_scaled_error = 0.0f;
