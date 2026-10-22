@@ -20,11 +20,19 @@ namespace lfs::vis {
         constexpr float MIN_KEYFRAME_SPACING = 0.1f;
         constexpr float DOUBLE_CLICK_TIME = 0.3f;
         constexpr float DRAG_THRESHOLD_PX = 3.0f;
-        constexpr float PLAYHEAD_HIT_RADIUS = 6.0f;
-        constexpr float PLAYHEAD_HANDLE_WIDTH = 8.0f;
     } // namespace
 
     using namespace panel_config;
+
+    void RmlSequencerPanel::setTimelineMarkup(Rml::Element* element, std::string markup) {
+        const auto cached = timeline_markup_.find(element);
+        if (cached != timeline_markup_.end() && cached->second == markup)
+            return;
+
+        // Playback moves the playhead without changing these decorative subtrees.
+        element->SetInnerRML(markup);
+        timeline_markup_.insert_or_assign(element, std::move(markup));
+    }
 
     void RmlSequencerPanel::rebuildEasingStripe(const float timeline_x, const float timeline_width) {
         if (!elements_cached_)
@@ -32,9 +40,9 @@ namespace lfs::vis {
 
         const auto& keyframes = controller_.timeline().keyframes();
         if (timeline_width <= 0.0f || keyframes.empty()) {
-            el_easing_segments_->SetInnerRML("");
-            el_easing_curves_->SetInnerRML("");
-            el_easing_indicators_->SetInnerRML("");
+            setTimelineMarkup(el_easing_segments_, "");
+            setTimelineMarkup(el_easing_curves_, "");
+            setTimelineMarkup(el_easing_indicators_, "");
             return;
         }
 
@@ -123,9 +131,9 @@ namespace lfs::vis {
                 easing_class, tone, kx, iy);
         }
 
-        el_easing_segments_->SetInnerRML(segments_html);
-        el_easing_curves_->SetInnerRML(curves_html);
-        el_easing_indicators_->SetInnerRML(indicators_html);
+        setTimelineMarkup(el_easing_segments_, std::move(segments_html));
+        setTimelineMarkup(el_easing_curves_, std::move(curves_html));
+        setTimelineMarkup(el_easing_indicators_, std::move(indicators_html));
     }
 
     void RmlSequencerPanel::ensureFilmThumbPool(const size_t count) {
@@ -201,7 +209,9 @@ namespace lfs::vis {
                                       gui::FilmStripRenderer::THUMB_PADDING * 2.0f;
         const float base_thumb_w = thumb_display_h * (static_cast<float>(gui::FilmStripRenderer::THUMB_WIDTH) /
                                                       static_cast<float>(gui::FilmStripRenderer::THUMB_HEIGHT));
-        const int num_thumbs = sequencer_ui::thumbnailCount(timeline_width, base_thumb_w, zoom_level_);
+        const int num_thumbs = std::min(
+            gui::FilmStripRenderer::MAX_SLOTS,
+            sequencer_ui::thumbnailCount(timeline_width, base_thumb_w, zoom_level_));
         const float actual_thumb_w = num_thumbs > 0 ? timeline_width / static_cast<float>(num_thumbs) : 0.0f;
         const float groove_w = timeline_width + gui::FilmStripRenderer::THUMB_PADDING * 2.0f;
 
@@ -212,7 +222,7 @@ namespace lfs::vis {
                 "<div class=\"film-strip-divider\" style=\"left:{:.1f}px;\"></div>",
                 gui::FilmStripRenderer::THUMB_PADDING + actual_thumb_w * static_cast<float>(i));
         }
-        el_film_strip_dividers_->SetInnerRML(divider_html);
+        setTimelineMarkup(el_film_strip_dividers_, std::move(divider_html));
 
         std::string sprocket_top_html;
         std::string sprocket_bottom_html;
@@ -228,8 +238,8 @@ namespace lfs::vis {
             sprocket_bottom_html += fmt::format(
                 "<div class=\"film-strip-sprocket bottom\" style=\"left:{:.1f}px;\"></div>", sx);
         }
-        el_film_strip_sprockets_top_->SetInnerRML(sprocket_top_html);
-        el_film_strip_sprockets_bottom_->SetInnerRML(sprocket_bottom_html);
+        setTimelineMarkup(el_film_strip_sprockets_top_, std::move(sprocket_top_html));
+        setTimelineMarkup(el_film_strip_sprockets_bottom_, std::move(sprocket_bottom_html));
     }
 
     void RmlSequencerPanel::rebuildFilmStrip(float timeline_x, const float timeline_width,
@@ -246,11 +256,11 @@ namespace lfs::vis {
             }
             unregisterFilmStripSources();
             clearFilmThumbPool();
-            el_film_strip_gaps_->SetInnerRML("");
-            el_film_strip_markers_->SetInnerRML("");
-            el_film_strip_dividers_->SetInnerRML("");
-            el_film_strip_sprockets_top_->SetInnerRML("");
-            el_film_strip_sprockets_bottom_->SetInnerRML("");
+            setTimelineMarkup(el_film_strip_gaps_, "");
+            setTimelineMarkup(el_film_strip_markers_, "");
+            setTimelineMarkup(el_film_strip_dividers_, "");
+            setTimelineMarkup(el_film_strip_sprockets_top_, "");
+            setTimelineMarkup(el_film_strip_sprockets_bottom_, "");
             updateTimelineTooltip(film_strip, input);
             return;
         }
@@ -325,7 +335,7 @@ namespace lfs::vis {
             if (anim_end_x < visible_right_x)
                 append_gap_region(anim_end_x, visible_right_x);
         }
-        el_film_strip_gaps_->SetInnerRML(gaps_html);
+        setTimelineMarkup(el_film_strip_gaps_, std::move(gaps_html));
 
         ensureFilmThumbPool(film_strip.thumbs().size());
         std::set<std::string> active_sources;
@@ -390,7 +400,7 @@ namespace lfs::vis {
                 marker.hovered ? " hovered" : "",
                 marker.screen_x - groove_origin_x);
         }
-        el_film_strip_markers_->SetInnerRML(markers_html);
+        setTimelineMarkup(el_film_strip_markers_, std::move(markers_html));
 
         updateTimelineTooltip(film_strip, input);
     }

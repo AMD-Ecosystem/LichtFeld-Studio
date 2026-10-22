@@ -5,12 +5,16 @@
 #include "core/splat_simplify.hpp"
 #include "core/splat_simplify_history.hpp"
 #include "core/tensor.hpp"
+#include "io/formats/ply.hpp"
+#include "lfs/training/sh_value_codec.hpp"
+#include "lfs/training/sh_value_storage.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <vector>
@@ -23,7 +27,6 @@ using lfs::core::Tensor;
 
 namespace {
 
-    constexpr double kTwoPiPow1p5 = 15.749609945722419;
     constexpr double kEpsCov = 1e-8;
     constexpr double kMinScale = 1e-12;
     constexpr double kMinQuatNorm = 1e-12;
@@ -95,80 +98,81 @@ namespace {
         out[8] = r20 * r20 * vx + r21 * r21 * vy + r22 * r22 * vz;
     }
 
-    [[nodiscard]] RefMerge reference_moment_match(const RefInput& input, const int i, const int j) {
-        const size_t i3 = static_cast<size_t>(i) * 3;
-        const size_t j3 = static_cast<size_t>(j) * 3;
-        const size_t i4 = static_cast<size_t>(i) * 4;
-        const size_t j4 = static_cast<size_t>(j) * 4;
+    [[nodiscard]] RefMerge reference_moment_match(const RefInput& input, const std::vector<int>& indices) {
+        double total_weight = 0.0;
+        std::array<double, 3> weighted_mean = {0.0, 0.0, 0.0};
 
-        const double sxi = std::max(std::exp(input.scaling_raw[i3 + 0]), kMinScale);
-        const double syi = std::max(std::exp(input.scaling_raw[i3 + 1]), kMinScale);
-        const double szi = std::max(std::exp(input.scaling_raw[i3 + 2]), kMinScale);
-        const double sxj = std::max(std::exp(input.scaling_raw[j3 + 0]), kMinScale);
-        const double syj = std::max(std::exp(input.scaling_raw[j3 + 1]), kMinScale);
-        const double szj = std::max(std::exp(input.scaling_raw[j3 + 2]), kMinScale);
+        // First pass: compute weights and weighted mean
+        for (int idx : indices) {
+            const size_t i3 = static_cast<size_t>(idx) * 3;
+            const double sxi = std::max(std::exp(input.scaling_raw[i3 + 0]), kMinScale);
+            const double syi = std::max(std::exp(input.scaling_raw[i3 + 1]), kMinScale);
+            const double szi = std::max(std::exp(input.scaling_raw[i3 + 2]), kMinScale);
+            const double alpha_i = sigmoid(input.opacity_raw[idx]);
+            const double wi = sxi * syi * szi * alpha_i + 1e-12;
+            total_weight += wi;
 
-        const double alpha_i = sigmoid(input.opacity_raw[i]);
-        const double alpha_j = sigmoid(input.opacity_raw[j]);
-        const double wi = kTwoPiPow1p5 * alpha_i * sxi * syi * szi + 1e-12;
-        const double wj = kTwoPiPow1p5 * alpha_j * sxj * syj * szj + 1e-12;
-        const double W = std::max(wi + wj, 1e-12);
+            weighted_mean[0] += wi * input.means[i3 + 0];
+            weighted_mean[1] += wi * input.means[i3 + 1];
+            weighted_mean[2] += wi * input.means[i3 + 2];
+        }
 
         RefMerge merge;
         merge.mean = {
-            (wi * input.means[i3 + 0] + wj * input.means[j3 + 0]) / W,
-            (wi * input.means[i3 + 1] + wj * input.means[j3 + 1]) / W,
-            (wi * input.means[i3 + 2] + wj * input.means[j3 + 2]) / W,
+            weighted_mean[0] / total_weight,
+            weighted_mean[1] / total_weight,
+            weighted_mean[2] / total_weight,
         };
 
-        double qwi = input.rotation_raw[i4 + 0];
-        double qxi = input.rotation_raw[i4 + 1];
-        double qyi = input.rotation_raw[i4 + 2];
-        double qzi = input.rotation_raw[i4 + 3];
-        double qwj = input.rotation_raw[j4 + 0];
-        double qxj = input.rotation_raw[j4 + 1];
-        double qyj = input.rotation_raw[j4 + 2];
-        double qzj = input.rotation_raw[j4 + 3];
+        // Compute covariance
+        std::fill(merge.sigma.begin(), merge.sigma.end(), 0.0);
+        for (int idx : indices) {
+            const size_t i3 = static_cast<size_t>(idx) * 3;
+            const size_t i4 = static_cast<size_t>(idx) * 4;
 
-        const double inv_i = 1.0 / std::max(quat_norm(qwi, qxi, qyi, qzi), kMinQuatNorm);
-        const double inv_j = 1.0 / std::max(quat_norm(qwj, qxj, qyj, qzj), kMinQuatNorm);
-        qwi *= inv_i;
-        qxi *= inv_i;
-        qyi *= inv_i;
-        qzi *= inv_i;
-        qwj *= inv_j;
-        qxj *= inv_j;
-        qyj *= inv_j;
-        qzj *= inv_j;
+            const double sxi = std::max(std::exp(input.scaling_raw[i3 + 0]), kMinScale);
+            const double syi = std::max(std::exp(input.scaling_raw[i3 + 1]), kMinScale);
+            const double szi = std::max(std::exp(input.scaling_raw[i3 + 2]), kMinScale);
+            const double alpha_i = sigmoid(input.opacity_raw[idx]);
+            const double wi = sxi * syi * szi * alpha_i + 1e-12;
 
-        std::array<double, 9> Ri{};
-        std::array<double, 9> Rj{};
-        quat_to_rotmat(qwi, qxi, qyi, qzi, Ri);
-        quat_to_rotmat(qwj, qxj, qyj, qzj, Rj);
+            double qwi = input.rotation_raw[i4 + 0];
+            double qxi = input.rotation_raw[i4 + 1];
+            double qyi = input.rotation_raw[i4 + 2];
+            double qzi = input.rotation_raw[i4 + 3];
+            const double inv = 1.0 / std::max(quat_norm(qwi, qxi, qyi, qzi), kMinQuatNorm);
+            qwi *= inv;
+            qxi *= inv;
+            qyi *= inv;
+            qzi *= inv;
 
-        std::array<double, 9> sig_i{};
-        std::array<double, 9> sig_j{};
-        sigma_from_rot_var(Ri, sxi * sxi, syi * syi, szi * szi, sig_i);
-        sigma_from_rot_var(Rj, sxj * sxj, syj * syj, szj * szj, sig_j);
+            std::array<double, 9> Ri{};
+            quat_to_rotmat(qwi, qxi, qyi, qzi, Ri);
 
-        const double dix = input.means[i3 + 0] - merge.mean[0];
-        const double diy = input.means[i3 + 1] - merge.mean[1];
-        const double diz = input.means[i3 + 2] - merge.mean[2];
-        const double djx = input.means[j3 + 0] - merge.mean[0];
-        const double djy = input.means[j3 + 1] - merge.mean[1];
-        const double djz = input.means[j3 + 2] - merge.mean[2];
+            std::array<double, 9> sig_i{};
+            sigma_from_rot_var(Ri, sxi * sxi, syi * syi, szi * szi, sig_i);
+
+            const double dix = input.means[i3 + 0] - merge.mean[0];
+            const double diy = input.means[i3 + 1] - merge.mean[1];
+            const double diz = input.means[i3 + 2] - merge.mean[2];
+
+            for (int a = 0; a < 9; ++a)
+                merge.sigma[a] += wi * sig_i[a];
+
+            merge.sigma[0] += wi * dix * dix;
+            merge.sigma[1] += wi * dix * diy;
+            merge.sigma[2] += wi * dix * diz;
+            merge.sigma[3] += wi * diy * dix;
+            merge.sigma[4] += wi * diy * diy;
+            merge.sigma[5] += wi * diy * diz;
+            merge.sigma[6] += wi * diz * dix;
+            merge.sigma[7] += wi * diz * diy;
+            merge.sigma[8] += wi * diz * diz;
+        }
 
         for (int a = 0; a < 9; ++a)
-            merge.sigma[a] = (wi * sig_i[a] + wj * sig_j[a]) / W;
-        merge.sigma[0] += (wi * dix * dix + wj * djx * djx) / W;
-        merge.sigma[1] += (wi * dix * diy + wj * djx * djy) / W;
-        merge.sigma[2] += (wi * dix * diz + wj * djx * djz) / W;
-        merge.sigma[3] += (wi * diy * dix + wj * djy * djx) / W;
-        merge.sigma[4] += (wi * diy * diy + wj * djy * djy) / W;
-        merge.sigma[5] += (wi * diy * diz + wj * djy * djz) / W;
-        merge.sigma[6] += (wi * diz * dix + wj * djz * djx) / W;
-        merge.sigma[7] += (wi * diz * diy + wj * djz * djy) / W;
-        merge.sigma[8] += (wi * diz * diz + wj * djz * djz) / W;
+            merge.sigma[a] /= total_weight;
+
         merge.sigma[1] = merge.sigma[3] = 0.5 * (merge.sigma[1] + merge.sigma[3]);
         merge.sigma[2] = merge.sigma[6] = 0.5 * (merge.sigma[2] + merge.sigma[6]);
         merge.sigma[5] = merge.sigma[7] = 0.5 * (merge.sigma[5] + merge.sigma[7]);
@@ -176,13 +180,36 @@ namespace {
         merge.sigma[4] += kEpsCov;
         merge.sigma[8] += kEpsCov;
 
-        merge.opacity = alpha_i + alpha_j - alpha_i * alpha_j;
+        // Opacity: 1 - prod(1 - alpha_i)
+        double one_minus_alpha_prod = 1.0;
+        for (int idx : indices) {
+            const double alpha_i = sigmoid(input.opacity_raw[idx]);
+            one_minus_alpha_prod *= (1.0 - alpha_i);
+        }
+        merge.opacity = 1.0 - one_minus_alpha_prod;
+
+        // Appearance: weighted average
         merge.appearance.resize(static_cast<size_t>(input.app_dim));
-        const size_t ai = static_cast<size_t>(i) * input.app_dim;
-        const size_t aj = static_cast<size_t>(j) * input.app_dim;
-        for (int k = 0; k < input.app_dim; ++k)
-            merge.appearance[static_cast<size_t>(k)] = (wi * input.appearance[ai + k] + wj * input.appearance[aj + k]) / W;
+        std::fill(merge.appearance.begin(), merge.appearance.end(), 0.0);
+        for (int idx : indices) {
+            const size_t i3 = static_cast<size_t>(idx) * 3;
+            const double sxi = std::max(std::exp(input.scaling_raw[i3 + 0]), kMinScale);
+            const double syi = std::max(std::exp(input.scaling_raw[i3 + 1]), kMinScale);
+            const double szi = std::max(std::exp(input.scaling_raw[i3 + 2]), kMinScale);
+            const double alpha_i = sigmoid(input.opacity_raw[idx]);
+            const double wi = sxi * syi * szi * alpha_i + 1e-12;
+            const size_t ai = static_cast<size_t>(idx) * static_cast<size_t>(input.app_dim);
+            for (int k = 0; k < input.app_dim; ++k)
+                merge.appearance[static_cast<size_t>(k)] += wi * input.appearance[ai + k];
+        }
+        for (size_t k = 0; k < merge.appearance.size(); ++k)
+            merge.appearance[k] /= total_weight;
+
         return merge;
+    }
+
+    [[nodiscard]] RefMerge reference_moment_match(const RefInput& input, const int i, const int j) {
+        return reference_moment_match(input, std::vector<int>{i, j});
     }
 
     [[nodiscard]] std::unique_ptr<SplatData> make_test_splat(const RefInput& input, const int max_sh_degree = 1) {
@@ -236,9 +263,10 @@ namespace {
 
     [[nodiscard]] std::vector<float> appearance_row(const SplatData& splat, const size_t row) {
         std::vector<float> result = row_values(splat.sh0_raw().reshape({static_cast<int>(splat.size()), 3}), row);
-        if (splat.shN_raw().is_valid()) {
+        if (splat.max_sh_coeffs_rest() > 0) {
+            const Tensor shN = splat.shN_canonical();
             auto tail = row_values(
-                splat.shN_raw().reshape({static_cast<int>(splat.size()), static_cast<int>(splat.shN_raw().size(1) * 3)}),
+                shN.reshape({static_cast<int>(splat.size()), static_cast<int>(shN.size(1) * 3)}),
                 row);
             result.insert(result.end(), tail.begin(), tail.end());
         }
@@ -287,6 +315,15 @@ namespace {
         for (size_t i = 0; i < 9; ++i)
             EXPECT_NEAR(actual[i], expected[i], tol);
     }
+
+    struct ShValueQuantGuard {
+        explicit ShValueQuantGuard(const bool enabled) {
+            lfs::training::sh_value::set_sh_value_quant_enabled_for_testing(enabled);
+        }
+        ~ShValueQuantGuard() {
+            lfs::training::sh_value::set_sh_value_quant_enabled_for_testing(std::nullopt);
+        }
+    };
 
 } // namespace
 
@@ -355,8 +392,7 @@ TEST(SplatSimplify, TwoPointMergeMatchesReferenceMomentMatching) {
     const auto before_means = source->means_raw().cpu().to_vector();
 
     SplatSimplifyOptions options;
-    options.ratio = 0.5f;
-    options.knn_k = 16;
+    options.ratio = 0.5;
 
     auto result = lfs::core::simplify_splats(*source, options, {});
     ASSERT_TRUE(result) << result.error();
@@ -376,7 +412,7 @@ TEST(SplatSimplify, TwoPointMergeMatchesReferenceMomentMatching) {
         EXPECT_NEAR(appearance[i], expected.appearance[i], 5e-4);
 }
 
-TEST(SplatSimplify, RandomizedTwoPointMergeMatchesReferenceMomentMatching) {
+TEST(SplatSimplify, RandomizedTwoPointMergeMatchesReference) {
     std::mt19937 rng(12345);
     std::uniform_real_distribution<double> mean_dist(-1.0, 1.0);
     std::uniform_real_distribution<double> scale_dist(std::log(0.02), std::log(0.8));
@@ -416,8 +452,7 @@ TEST(SplatSimplify, RandomizedTwoPointMergeMatchesReferenceMomentMatching) {
 
         auto source = make_test_splat(input);
         SplatSimplifyOptions options;
-        options.ratio = 0.5f;
-        options.knn_k = 16;
+        options.ratio = 0.5;
         options.opacity_prune_threshold = 0.0f;
 
         auto result = lfs::core::simplify_splats(*source, options, {});
@@ -444,7 +479,7 @@ TEST(SplatSimplify, RandomizedTwoPointMergeMatchesReferenceMomentMatching) {
     }
 }
 
-TEST(SplatSimplify, NoOpSimplifyPreservesAppearanceInPlyPropertyOrder) {
+TEST(SplatSimplify, NoOpSimplifyPreservesAppearance) {
     RefInput input{
         .means = {
             0.0,
@@ -507,8 +542,7 @@ TEST(SplatSimplify, NoOpSimplifyPreservesAppearanceInPlyPropertyOrder) {
 
     auto source = make_test_splat(input);
     SplatSimplifyOptions options;
-    options.ratio = 1.0f;
-    options.knn_k = 16;
+    options.ratio = 1.0;
 
     auto result = lfs::core::simplify_splats(*source, options, {});
     ASSERT_TRUE(result) << result.error();
@@ -524,194 +558,7 @@ TEST(SplatSimplify, NoOpSimplifyPreservesAppearanceInPlyPropertyOrder) {
     }
 }
 
-TEST(SplatSimplify, ThreePointSelectionChoosesClosestPairWhenAllPairsAreCandidates) {
-    RefInput input{
-        .means = {
-            0.00,
-            0.00,
-            0.00,
-            0.03,
-            0.01,
-            0.00,
-            2.50,
-            0.50,
-            0.20,
-        },
-        .scaling_raw = {
-            std::log(0.10),
-            std::log(0.10),
-            std::log(0.10),
-            std::log(0.11),
-            std::log(0.10),
-            std::log(0.09),
-            std::log(0.15),
-            std::log(0.14),
-            std::log(0.16),
-        },
-        .rotation_raw = {
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.9807853,
-            0.0,
-            0.1950903,
-            0.0,
-            0.9659258,
-            0.0,
-            0.2588190,
-            0.0,
-        },
-        .opacity_raw = {
-            0.8,
-            0.75,
-            0.9,
-        },
-        .appearance = {
-            0.15,
-            0.16,
-            0.17,
-            0.16,
-            0.15,
-            0.18,
-            0.95,
-            0.05,
-            0.10,
-        },
-        .app_dim = 3,
-    };
-
-    const std::array<double, 3> mean0 = {input.means[0], input.means[1], input.means[2]};
-    const std::array<double, 3> mean1 = {input.means[3], input.means[4], input.means[5]};
-    const std::array<double, 3> mean2 = {input.means[6], input.means[7], input.means[8]};
-    EXPECT_LT(euclidean_distance(mean0, mean1), euclidean_distance(mean0, mean2));
-    EXPECT_LT(euclidean_distance(mean0, mean1), euclidean_distance(mean1, mean2));
-
-    auto source = make_test_splat(input, 0);
-    SplatSimplifyOptions options;
-    options.ratio = 0.5f;
-    options.knn_k = 16;
-
-    auto result = lfs::core::simplify_splats(*source, options, {});
-    ASSERT_TRUE(result) << result.error();
-    ASSERT_EQ((*result)->size(), 2u);
-
-    const RefMerge expected_merge = reference_moment_match(input, 0, 1);
-    const std::array<double, 3> expected_keep = {
-        input.means[6],
-        input.means[7],
-        input.means[8],
-    };
-
-    const auto output_mean0 = mean_from_output_row(**result, 0);
-    const auto output_mean1 = mean_from_output_row(**result, 1);
-    const bool first_is_keep = euclidean_distance(output_mean0, expected_keep) < euclidean_distance(output_mean1, expected_keep);
-    const auto& keep_row = first_is_keep ? output_mean0 : output_mean1;
-    const auto& merge_row = first_is_keep ? output_mean1 : output_mean0;
-
-    expect_vec3_near(keep_row, expected_keep, 1e-5);
-    expect_vec3_near(merge_row, expected_merge.mean, 5e-4);
-}
-
-TEST(SplatSimplify, ThreePointSelectionUsesMeansEvenForRotatedAnisotropicGaussians) {
-    RefInput input{
-        .means = {
-            0.0976270065,
-            0.4303787351,
-            0.2055267543,
-            0.0897663683,
-            -0.1526903957,
-            0.2917882204,
-            -0.1248255745,
-            0.7835460305,
-            0.9273255467,
-        },
-        .scaling_raw = {
-            std::log(0.1982781291),
-            std::log(0.5071074367),
-            std::log(0.2770543098),
-            std::log(0.3031591177),
-            std::log(0.6899558306),
-            std::log(0.0966540575),
-            std::log(0.1002986953),
-            std::log(0.0859922841),
-            std::log(0.5571201444),
-        },
-        .rotation_raw = {
-            0.2761918604,
-            0.2076273263,
-            0.9296838641,
-            -0.1276587844,
-            0.1122946069,
-            -0.3063565493,
-            -0.9157347083,
-            0.2344471812,
-            0.2953715622,
-            -0.2535923719,
-            0.7755585909,
-            -0.4969461560,
-        },
-        .opacity_raw = {
-            std::log(0.2140923440 / (1.0 - 0.2140923440)),
-            std::log(0.6632266045 / (1.0 - 0.6632266045)),
-            std::log(0.6590718031 / (1.0 - 0.6590718031)),
-        },
-        .appearance = {
-            0.1169339940,
-            0.4437480867,
-            0.1818203032,
-            -0.1404920965,
-            -0.0629680455,
-            0.1976311952,
-            -0.4397745430,
-            0.1667667180,
-            0.1706378758,
-            -0.2896174490,
-            -0.3710736930,
-            -0.1845716536,
-            -0.1362892240,
-            0.0701967701,
-            -0.0613984875,
-            0.4883738458,
-            -0.3979551792,
-            -0.2911232412,
-        },
-        .app_dim = 6,
-    };
-
-    const std::array<double, 3> mean0 = {input.means[0], input.means[1], input.means[2]};
-    const std::array<double, 3> mean1 = {input.means[3], input.means[4], input.means[5]};
-    const std::array<double, 3> mean2 = {input.means[6], input.means[7], input.means[8]};
-    EXPECT_LT(euclidean_distance(mean0, mean1), euclidean_distance(mean0, mean2));
-    EXPECT_LT(euclidean_distance(mean0, mean1), euclidean_distance(mean1, mean2));
-
-    auto source = make_test_splat(input, 1);
-    SplatSimplifyOptions options;
-    options.ratio = 0.5f;
-    options.knn_k = 16;
-
-    auto result = lfs::core::simplify_splats(*source, options, {});
-    ASSERT_TRUE(result) << result.error();
-    ASSERT_EQ((*result)->size(), 2u);
-
-    const RefMerge expected_merge = reference_moment_match(input, 0, 1);
-    const std::array<double, 3> expected_keep = {
-        input.means[6],
-        input.means[7],
-        input.means[8],
-    };
-
-    const auto output_mean0 = mean_from_output_row(**result, 0);
-    const auto output_mean1 = mean_from_output_row(**result, 1);
-    const bool first_is_keep = euclidean_distance(output_mean0, expected_keep) < euclidean_distance(output_mean1, expected_keep);
-    const auto& keep_row = first_is_keep ? output_mean0 : output_mean1;
-    const auto& merge_row = first_is_keep ? output_mean1 : output_mean0;
-
-    expect_vec3_near(keep_row, expected_keep, 1e-5);
-    expect_vec3_near(merge_row, expected_merge.mean, 5e-4);
-}
-
-TEST(SplatSimplify, IgnoresAppearanceWhenChoosingClosestPair) {
+TEST(SplatSimplify, FourPointVoxelMergeGroupsSpatiallyClosePoints) {
     RefInput input{
         .means = {
             0.00,
@@ -720,11 +567,17 @@ TEST(SplatSimplify, IgnoresAppearanceWhenChoosingClosestPair) {
             0.02,
             0.00,
             0.00,
-            1.00,
+            2.00,
+            0.00,
+            0.00,
+            2.02,
             0.00,
             0.00,
         },
         .scaling_raw = {
+            std::log(0.10),
+            std::log(0.10),
+            std::log(0.10),
             std::log(0.10),
             std::log(0.10),
             std::log(0.10),
@@ -748,8 +601,13 @@ TEST(SplatSimplify, IgnoresAppearanceWhenChoosingClosestPair) {
             0.0,
             0.0,
             0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
         },
         .opacity_raw = {
+            std::log(0.5 / (1.0 - 0.5)),
             std::log(0.5 / (1.0 - 0.5)),
             std::log(0.5 / (1.0 - 0.5)),
             std::log(0.5 / (1.0 - 0.5)),
@@ -758,46 +616,56 @@ TEST(SplatSimplify, IgnoresAppearanceWhenChoosingClosestPair) {
             0.0,
             0.0,
             0.0,
+            1.0,
+            1.0,
+            1.0,
             2.0,
             2.0,
             2.0,
-            -1.0,
-            -1.0,
-            -1.0,
+            3.0,
+            3.0,
+            3.0,
         },
         .app_dim = 3,
     };
 
     auto source = make_test_splat(input, 0);
     SplatSimplifyOptions options;
-    options.ratio = 0.5f;
-    options.knn_k = 16;
+    options.ratio = 0.5;
 
     auto result = lfs::core::simplify_splats(*source, options, {});
     ASSERT_TRUE(result) << result.error();
     ASSERT_EQ((*result)->size(), 2u);
 
-    const RefMerge expected_merge = reference_moment_match(input, 0, 1);
-    const std::array<double, 3> expected_keep = {
-        input.means[6],
-        input.means[7],
-        input.means[8],
-    };
-
-    const std::array<double, 3> input_mean0 = {input.means[0], input.means[1], input.means[2]};
-    const std::array<double, 3> input_mean1 = {input.means[3], input.means[4], input.means[5]};
-    const std::array<double, 3> input_mean2 = {input.means[6], input.means[7], input.means[8]};
-    EXPECT_LT(euclidean_distance(input_mean0, input_mean1), euclidean_distance(input_mean0, input_mean2));
-    EXPECT_LT(euclidean_distance(input_mean0, input_mean1), euclidean_distance(input_mean1, input_mean2));
+    const RefMerge expected_merge_01 = reference_moment_match(input, 0, 1);
+    const RefMerge expected_merge_23 = reference_moment_match(input, 2, 3);
 
     const auto output_mean0 = mean_from_output_row(**result, 0);
     const auto output_mean1 = mean_from_output_row(**result, 1);
-    const bool first_is_keep = euclidean_distance(output_mean0, expected_keep) < euclidean_distance(output_mean1, expected_keep);
-    const auto& keep_row = first_is_keep ? output_mean0 : output_mean1;
-    const auto& merge_row = first_is_keep ? output_mean1 : output_mean0;
 
-    expect_vec3_near(keep_row, expected_keep, 1e-5);
-    expect_vec3_near(merge_row, expected_merge.mean, 5e-4);
+    // Determine which output row corresponds to which expected merge by mean proximity
+    const bool first_is_01 = euclidean_distance(output_mean0, expected_merge_01.mean) < euclidean_distance(output_mean0, expected_merge_23.mean);
+    const auto& expected0 = first_is_01 ? expected_merge_01 : expected_merge_23;
+    const auto& expected1 = first_is_01 ? expected_merge_23 : expected_merge_01;
+    const size_t row0 = first_is_01 ? 0 : 1;
+    const size_t row1 = first_is_01 ? 1 : 0;
+
+    expect_vec3_near(mean_from_output_row(**result, row0), expected0.mean, 5e-4);
+    expect_mat3_near(covariance_from_output_row(**result, row0), expected0.sigma, 8e-4);
+    EXPECT_NEAR(opacity_from_output_row(**result, row0), expected0.opacity, 5e-5);
+
+    expect_vec3_near(mean_from_output_row(**result, row1), expected1.mean, 5e-4);
+    expect_mat3_near(covariance_from_output_row(**result, row1), expected1.sigma, 8e-4);
+    EXPECT_NEAR(opacity_from_output_row(**result, row1), expected1.opacity, 5e-5);
+
+    const auto app0 = appearance_row(**result, row0);
+    const auto app1 = appearance_row(**result, row1);
+    ASSERT_EQ(app0.size(), expected0.appearance.size());
+    ASSERT_EQ(app1.size(), expected1.appearance.size());
+    for (size_t i = 0; i < app0.size(); ++i)
+        EXPECT_NEAR(app0[i], expected0.appearance[i], 5e-4);
+    for (size_t i = 0; i < app1.size(); ++i)
+        EXPECT_NEAR(app1[i], expected1.appearance[i], 5e-4);
 }
 
 TEST(SplatSimplify, AllowsOpacityPruneToFinishBelowTarget) {
@@ -873,15 +741,14 @@ TEST(SplatSimplify, AllowsOpacityPruneToFinishBelowTarget) {
 
     auto source = make_test_splat(input, 0);
     SplatSimplifyOptions options;
-    options.ratio = 0.75f;
-    options.knn_k = 16;
+    options.ratio = 0.75;
 
     auto result = lfs::core::simplify_splats(*source, options, {});
     ASSERT_TRUE(result) << result.error();
     ASSERT_EQ((*result)->size(), 2u);
 }
 
-TEST(SplatSimplify, HistoryTracksMultiPassMergeTree) {
+TEST(SplatSimplify, HistoryTracksMultiPassVoxelMergeTree) {
     RefInput input{
         .means = {
             0.00,
@@ -954,9 +821,7 @@ TEST(SplatSimplify, HistoryTracksMultiPassMergeTree) {
 
     auto source = make_test_splat(input, 0);
     SplatSimplifyOptions options;
-    options.ratio = 0.25f;
-    options.knn_k = 16;
-    options.merge_cap = 0.5f;
+    options.ratio = 0.25;
     options.opacity_prune_threshold = 0.0f;
 
     auto result = lfs::core::simplify_splats_with_history(*source, options, {});
@@ -1057,8 +922,7 @@ TEST(SplatSimplify, HistoryTracksOpacityPrunedLeaves) {
 
     auto source = make_test_splat(input, 0);
     SplatSimplifyOptions options;
-    options.ratio = 0.75f;
-    options.knn_k = 16;
+    options.ratio = 0.75;
 
     auto result = lfs::core::simplify_splats_with_history(*source, options, {});
     ASSERT_TRUE(result) << result.error();
@@ -1147,8 +1011,7 @@ TEST(SplatSimplify, UsesNativeBackendProgressStages) {
 
     auto source = make_test_splat(input, 0);
     SplatSimplifyOptions options;
-    options.ratio = 0.5f;
-    options.knn_k = 16;
+    options.ratio = 0.5;
 
     std::vector<std::string> stages;
     auto result = lfs::core::simplify_splats(
@@ -1161,13 +1024,214 @@ TEST(SplatSimplify, UsesNativeBackendProgressStages) {
     ASSERT_TRUE(result) << result.error();
     ASSERT_EQ((*result)->size(), 2u);
     ASSERT_TRUE(std::find(stages.begin(), stages.end(), "Pruning opacity") != stages.end());
-    ASSERT_TRUE(std::find(stages.begin(), stages.end(), "Pass 1: building kNN graph") != stages.end());
-    ASSERT_TRUE(std::find(stages.begin(), stages.end(), "Pass 1: computing edge costs") != stages.end());
-    ASSERT_TRUE(std::find(stages.begin(), stages.end(), "Pass 1: selecting pairs") != stages.end());
+    ASSERT_TRUE(std::find_if(stages.begin(),
+                             stages.end(),
+                             [](const std::string& stage) {
+                                 return stage.starts_with("Pass 1: building voxel grid");
+                             }) != stages.end());
     ASSERT_TRUE(std::find_if(stages.begin(),
                              stages.end(),
                              [](const std::string& stage) {
                                  return stage.starts_with("Pass 1: merging ");
                              }) != stages.end());
     ASSERT_TRUE(std::find(stages.begin(), stages.end(), "Complete") != stages.end());
+}
+
+TEST(SplatSimplify, VolumeBasedWeightsProduceDifferentResultThanAreaBased) {
+    // Two splats with very different isotropic scales (0.5 vs 0.1) and same opacity.
+    // Volume-based weights: 0.5^3 : 0.1^3 = 125 : 1
+    // Area-based weights (sx*sy): 0.5^2 : 0.1^2 = 25 : 1
+    // The merged center should be closer to the large splat than area-based would predict.
+    RefInput input{
+        .means = {
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+        },
+        .scaling_raw = {
+            std::log(0.5),
+            std::log(0.5),
+            std::log(0.5),
+            std::log(0.1),
+            std::log(0.1),
+            std::log(0.1),
+        },
+        .rotation_raw = {
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        },
+        .opacity_raw = {
+            std::log(0.5 / (1.0 - 0.5)),
+            std::log(0.5 / (1.0 - 0.5)),
+        },
+        .appearance = {
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        },
+        .app_dim = 3,
+    };
+
+    auto source = make_test_splat(input, 0);
+    SplatSimplifyOptions options;
+    options.ratio = 0.5;
+
+    auto result = lfs::core::simplify_splats(*source, options, {});
+    ASSERT_TRUE(result) << result.error();
+    ASSERT_EQ((*result)->size(), 1u);
+
+    const auto actual_mean = mean_from_output_row(**result, 0);
+
+    // Compute what the mean would be with area-based weights (alpha * sx * sy)
+    const double alpha = 0.5;
+    const double w0_area = alpha * 0.5 * 0.5;
+    const double w1_area = alpha * 0.1 * 0.1;
+    const double area_based_mean_x = (w0_area * 0.0 + w1_area * 1.0) / (w0_area + w1_area);
+
+    // Volume-based should pull the mean closer to the large splat (x=0) than area-based
+    EXPECT_LT(std::abs(actual_mean[0] - 0.0), std::abs(area_based_mean_x - 0.0));
+    EXPECT_LT(actual_mean[0], area_based_mean_x);
+
+    // Also verify it is very close to the large splat (within ~0.02)
+    EXPECT_LT(actual_mean[0], 0.02);
+}
+
+TEST(SplatSimplify, RealPlySimplifyDoesNotUndershootRequestedTarget) {
+    const std::filesystem::path input_path =
+        std::filesystem::path(PROJECT_ROOT_PATH) / "data" / "kerstbol-isolated-rotated_137502.ply";
+    if (!std::filesystem::exists(input_path)) {
+        GTEST_SKIP() << "Missing simplify regression asset: " << input_path;
+    }
+
+    auto loaded = lfs::io::load_ply(input_path);
+    ASSERT_TRUE(loaded.has_value())
+        << "Failed to load simplify regression asset: " << loaded.error().user_message()
+        << " detail: " << loaded.error().detail();
+    lfs::core::SplatData source = std::move(loaded->value);
+    ASSERT_EQ(source.size(), 137502u);
+
+    SplatSimplifyOptions options;
+    options.ratio = 0.5;
+    options.opacity_prune_threshold = 0.0f;
+    const size_t target_count = static_cast<size_t>(std::ceil(static_cast<double>(source.size()) * options.ratio));
+
+    const auto source_size_before = source.size();
+    auto result = lfs::core::simplify_splats(source, options, {});
+
+    ASSERT_TRUE(result) << result.error();
+    ASSERT_NE(*result, nullptr);
+    EXPECT_EQ(source.size(), source_size_before);
+    EXPECT_EQ((*result)->size(), target_count);
+}
+
+TEST(SplatSimplify, Q16DeletedMaskPreservesCanonicalSH) {
+    using lfs::training::sh_value::apply_shN_value_quant;
+
+    const ShValueQuantGuard quant_guard{true};
+
+    constexpr size_t kN = 64;
+    constexpr int kShDegree = 3;
+    constexpr size_t kRest = 15;
+
+    auto means = Tensor::zeros({kN, size_t{3}}, Device::CUDA, DataType::Float32);
+    auto sh0 = Tensor::zeros({kN, size_t{1}, size_t{3}}, Device::CUDA, DataType::Float32);
+    auto shN_can = Tensor::zeros({kN, kRest, size_t{3}}, Device::CUDA, DataType::Float32);
+    auto scaling = Tensor::zeros({kN, size_t{3}}, Device::CUDA, DataType::Float32);
+    auto rotation = Tensor::zeros({kN, size_t{4}}, Device::CUDA, DataType::Float32);
+    auto opacity = Tensor::zeros({kN, size_t{1}}, Device::CUDA, DataType::Float32);
+
+    {
+        auto means_cpu = means.cpu();
+        auto* m = means_cpu.ptr<float>();
+        for (size_t i = 0; i < kN; ++i) {
+            m[i * 3 + 0] = static_cast<float>(i) * 0.25f;
+        }
+        means = means_cpu.to(Device::CUDA);
+
+        auto shN_cpu = shN_can.cpu();
+        auto* p = shN_cpu.ptr<float>();
+        for (size_t i = 0; i < kN; ++i) {
+            for (size_t c = 0; c < kRest * 3; ++c)
+                p[i * kRest * 3 + c] = static_cast<float>(i) * 0.01f + static_cast<float>(c) * 0.001f;
+        }
+        shN_can = shN_cpu.to(Device::CUDA);
+
+        auto rot_cpu = rotation.cpu();
+        auto* r = rot_cpu.ptr<float>();
+        for (size_t i = 0; i < kN; ++i)
+            r[i * 4] = 1.0f;
+        rotation = rot_cpu.to(Device::CUDA);
+
+        opacity.fill_(2.0f);
+        scaling.fill_(std::log(0.1f));
+    }
+
+    auto source = std::make_unique<SplatData>(
+        kShDegree, means, sh0, shN_can, scaling, rotation, opacity, 1.0f);
+    source->set_active_sh_degree(kShDegree);
+    source->set_max_sh_degree(kShDegree);
+
+    const auto ref = source->shN_canonical().cpu().contiguous();
+    ASSERT_TRUE(apply_shN_value_quant(*source));
+    ASSERT_TRUE(source->shN_value_quantized());
+    ASSERT_EQ(source->shN_raw().dtype(), DataType::Float16);
+
+    std::vector<bool> deleted(kN, false);
+    deleted[1] = true;
+    deleted[17] = true;
+    deleted[63] = true;
+    source->deleted() = Tensor::from_vector(deleted, {deleted.size()}, Device::CPU).to(Device::CUDA);
+    source->refresh_deleted_count();
+    ASSERT_TRUE(source->has_deleted_mask());
+    ASSERT_EQ(source->deleted_count(), 3u);
+
+    SplatSimplifyOptions options;
+    options.ratio = 1.0;
+    options.opacity_prune_threshold = 0.0f;
+
+    auto result = lfs::core::simplify_splats(*source, options, {});
+    ASSERT_TRUE(result) << result.error();
+    ASSERT_NE(*result, nullptr);
+    ASSERT_EQ((*result)->size(), kN - 3);
+
+    const auto got = (*result)->shN_canonical().cpu().contiguous();
+    ASSERT_EQ(got.dtype(), DataType::Float32);
+    ASSERT_EQ(got.ndim(), 3u);
+    ASSERT_EQ(got.size(0), kN - 3);
+    ASSERT_EQ(got.size(1), kRest);
+    ASSERT_EQ(got.size(2), 3u);
+
+    const auto* refp = ref.ptr<float>();
+    const auto* gotp = got.ptr<float>();
+    constexpr size_t kRow = kRest * 3;
+    size_t out = 0;
+    float max_abs = 0.0f;
+    float max_mag = 0.0f;
+    for (size_t i = 0; i < kN; ++i) {
+        if (deleted[i])
+            continue;
+        for (size_t c = 0; c < kRow; ++c) {
+            const float expected = refp[i * kRow + c];
+            const float actual = gotp[out * kRow + c];
+            max_mag = std::max(max_mag, std::abs(expected));
+            max_abs = std::max(max_abs, std::abs(actual - expected));
+            EXPECT_NEAR(actual, expected, 0.05f) << "splat " << i << " coeff " << c;
+        }
+        ++out;
+    }
+    EXPECT_EQ(out, kN - 3);
+    EXPECT_LT(max_abs, 0.05f);
+    EXPECT_GT(max_mag, 0.01f);
 }

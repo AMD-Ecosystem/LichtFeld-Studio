@@ -4,6 +4,7 @@
 
 #include "drag_drop_native.hpp"
 #include "core/logger.hpp"
+#include "native_drag_scheduler.hpp"
 
 // Platform detection and native includes
 #ifdef _WIN32
@@ -15,6 +16,7 @@
 #include <SDL3/SDL.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <utility>
 #else
 #include <SDL3/SDL.h>
 #endif
@@ -56,6 +58,12 @@ namespace lfs::vis::gui {
             (void)pDataObj;
             (void)grfKeyState;
             (void)pt;
+            if (NativeDragScheduler::outgoingDragActive()) {
+                *pdwEffect = DROPEFFECT_NONE;
+                if (owner_)
+                    owner_->setDragHovering(false);
+                return S_OK;
+            }
             *pdwEffect = DROPEFFECT_COPY;
             if (owner_)
                 owner_->setDragHovering(true);
@@ -66,7 +74,7 @@ namespace lfs::vis::gui {
                                            DWORD* pdwEffect) override {
             (void)grfKeyState;
             (void)pt;
-            *pdwEffect = DROPEFFECT_COPY;
+            *pdwEffect = NativeDragScheduler::outgoingDragActive() ? DROPEFFECT_NONE : DROPEFFECT_COPY;
             return S_OK;
         }
 
@@ -78,6 +86,12 @@ namespace lfs::vis::gui {
 
         HRESULT STDMETHODCALLTYPE Drop(IDataObject* const pDataObj, DWORD /*grfKeyState*/,
                                        POINTL /*pt*/, DWORD* const pdwEffect) override {
+            if (NativeDragScheduler::outgoingDragActive()) {
+                *pdwEffect = DROPEFFECT_NONE;
+                if (owner_)
+                    owner_->setDragHovering(false);
+                return S_OK; // Reject before GetData can start our own export.
+            }
             *pdwEffect = DROPEFFECT_COPY;
             LOG_DEBUG("IDropTarget::Drop called");
 
@@ -131,6 +145,33 @@ namespace lfs::vis::gui {
         NativeDragDrop* owner_;
         ULONG ref_count_ = 1;
     };
+
+#ifdef LFS_NATIVE_DRAG_TESTS
+    int nativeSelfDropContract() {
+        DropTarget target(nullptr);
+        NativeDragScheduler scheduler;
+        bool rejected = true;
+        auto future = scheduler.enqueue([&] {
+            DWORD effect = DROPEFFECT_COPY;
+            POINTL point{};
+            // Null data must remain unread: a self-drop must stop before GetData.
+            target.DragEnter(nullptr, 0, point, &effect);
+            rejected &= effect == DROPEFFECT_NONE;
+            effect = DROPEFFECT_COPY;
+            target.DragOver(0, point, &effect);
+            rejected &= effect == DROPEFFECT_NONE;
+            effect = DROPEFFECT_COPY;
+            target.Drop(nullptr, 0, point, &effect);
+            rejected &= effect == DROPEFFECT_NONE;
+            return FileDragResult{FileDragStatus::Cancelled, {}};
+        });
+        scheduler.dispatch();
+        future.get();
+        DWORD effect = DROPEFFECT_NONE;
+        target.DragEnter(nullptr, 0, POINTL{}, &effect);
+        return rejected && effect == DROPEFFECT_COPY && !NativeDragScheduler::outgoingDragActive() ? 0 : 13;
+    }
+#endif
 
     struct NativeDragDrop::PlatformData {
         HWND hwnd = nullptr;
@@ -223,14 +264,77 @@ namespace lfs::vis::gui {
         Atom xdnd_finished = 0;
         Atom xdnd_selection = 0;
         Atom xdnd_type_list = 0;
+        Atom text_uri_list = 0;
 
         Window source_window = 0;
     };
+
+    namespace {
+
+        constexpr long kXdndEnterUseTypeList = 1;
+
+        // SDL 3.4.2 takes the first XDND target it recognises. mutter forwards a
+        // GTK4 (Nautilus) drag with text/plain;charset=utf-8 listed ahead of
+        // text/uri-list, so the drop arrives as SDL_EVENT_DROP_TEXT holding a
+        // bare path instead of SDL_EVENT_DROP_FILE. Rewrite XdndEnter so
+        // text/uri-list is the first offered type whenever the source has it
+        // (upstream fix: SDL commit 1df279a04, after 3.4.2).
+        void preferUriListTarget(Display* const dpy, XClientMessageEvent& msg, const Atom type_list_atom,
+                                 const Atom uri_list) {
+            long* const l = msg.data.l;
+            if ((l[1] & kXdndEnterUseTypeList) == 0) {
+                for (int i = 3; i <= 4; ++i) {
+                    if (static_cast<Atom>(l[i]) == uri_list) {
+                        std::swap(l[2], l[i]);
+                        break;
+                    }
+                }
+                return;
+            }
+
+            Atom actual_type = None;
+            int actual_format = 0;
+            unsigned long count = 0;
+            unsigned long bytes_after = 0;
+            unsigned char* data = nullptr;
+            if (XGetWindowProperty(dpy, static_cast<Window>(l[0]), type_list_atom, 0, 4096, False, XA_ATOM,
+                                   &actual_type, &actual_format, &count, &bytes_after, &data) != Success ||
+                !data) {
+                return;
+            }
+            bool has_uri_list = false;
+            if (actual_type == XA_ATOM && actual_format == 32) {
+                const Atom* const atoms = reinterpret_cast<const Atom*>(data);
+                for (unsigned long i = 0; i < count && !has_uri_list; ++i)
+                    has_uri_list = atoms[i] == uri_list;
+            }
+            XFree(data);
+            if (!has_uri_list)
+                return;
+
+            l[1] &= ~kXdndEnterUseTypeList;
+            l[2] = static_cast<long>(uri_list);
+            l[3] = 0;
+            l[4] = 0;
+        }
+
+    } // namespace
 
     bool NativeDragDrop::init(SDL_Window* window) {
         if (initialized_)
             return true;
         window_ = window;
+
+        if (SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                   SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr)) {
+            // SDL delivers Wayland enter/motion/leave and drop completion events.
+            // File delivery remains on the normal SDL drop path in WindowManager.
+            if (!SDL_AddEventWatch(&NativeDragDrop::waylandEventWatch, this))
+                return false;
+            initialized_ = true;
+            LOG_DEBUG("Native drag-drop initialized (Wayland SDL events)");
+            return true;
+        }
 
         platform_data_ = new PlatformData();
         SDL_PropertiesID props = SDL_GetWindowProperties(window);
@@ -241,6 +345,8 @@ namespace lfs::vis::gui {
 
         if (!platform_data_->display || !platform_data_->xwindow) {
             LOG_ERROR("Failed to get X11 display/window");
+            delete platform_data_;
+            platform_data_ = nullptr;
             return false;
         }
 
@@ -256,6 +362,12 @@ namespace lfs::vis::gui {
         platform_data_->xdnd_finished = XInternAtom(dpy, "XdndFinished", False);
         platform_data_->xdnd_selection = XInternAtom(dpy, "XdndSelection", False);
         platform_data_->xdnd_type_list = XInternAtom(dpy, "XdndTypeList", False);
+        platform_data_->text_uri_list = XInternAtom(dpy, "text/uri-list", False);
+
+        // Observe XDnD traffic inside SDL's own pump. Dequeuing ClientMessages
+        // ourselves (XCheckTypedEvent + XPutBackEvent) reordered them ahead of
+        // the SelectionNotify SDL waits for after XdndDrop.
+        SDL_SetX11EventHook(&NativeDragDrop::x11EventHook, this);
 
         initialized_ = true;
         LOG_DEBUG("Native drag-drop initialized (X11 XDnD)");
@@ -266,7 +378,9 @@ namespace lfs::vis::gui {
         if (!initialized_)
             return;
 
+        SDL_RemoveEventWatch(&NativeDragDrop::waylandEventWatch, this);
         if (platform_data_) {
+            SDL_SetX11EventHook(nullptr, nullptr);
             delete platform_data_;
             platform_data_ = nullptr;
         }
@@ -276,34 +390,41 @@ namespace lfs::vis::gui {
     }
 
     void NativeDragDrop::pollEvents() {
-        if (!initialized_ || !platform_data_)
-            return;
+        // XDnD state is tracked from SDL's event hook, nothing to poll.
+    }
 
-        Display* const dpy = platform_data_->display;
-        if (XPending(dpy) <= 0)
-            return;
+    bool SDLCALL NativeDragDrop::waylandEventWatch(void* userdata, SDL_Event* event) {
+        auto* const self = static_cast<NativeDragDrop*>(userdata);
+        if ((event->type == SDL_EVENT_DROP_BEGIN || event->type == SDL_EVENT_DROP_POSITION ||
+             event->type == SDL_EVENT_DROP_COMPLETE) &&
+            event->drop.windowID == SDL_GetWindowID(self->window_)) {
+            self->setDragHovering(event->type != SDL_EVENT_DROP_COMPLETE);
+        }
+        return true;
+    }
 
-        // Extract all ClientMessage events to find XDnD state changes.
-        // XPeekEvent only checks the first event; XDnD messages may be
-        // buried behind mouse/keyboard/expose events in the queue.
-        XEvent event;
-        std::vector<XEvent> extracted;
-        while (XCheckTypedEvent(dpy, ClientMessage, &event)) {
-            const Atom msg_type = event.xclient.message_type;
-            if (msg_type == platform_data_->xdnd_enter && !drag_hovering_) {
-                platform_data_->source_window = static_cast<Window>(event.xclient.data.l[0]);
-                setDragHovering(true);
-            } else if ((msg_type == platform_data_->xdnd_leave || msg_type == platform_data_->xdnd_drop) && drag_hovering_) {
-                setDragHovering(false);
-                platform_data_->source_window = 0;
-            }
-            extracted.push_back(event);
+    bool NativeDragDrop::x11EventHook(void* userdata, XEvent* xevent) {
+        auto* const self = static_cast<NativeDragDrop*>(userdata);
+        if (!self || !self->platform_data_ || xevent->type != ClientMessage ||
+            xevent->xclient.window != self->platform_data_->xwindow) {
+            return true;
         }
 
-        // Restore events for SDL to process (reverse order preserves queue ordering)
-        for (auto it = extracted.rbegin(); it != extracted.rend(); ++it) {
-            XPutBackEvent(dpy, &*it);
+        PlatformData& pd = *self->platform_data_;
+        XClientMessageEvent& msg = xevent->xclient;
+        if (msg.message_type == pd.xdnd_enter) {
+            LOG_DEBUG("XDnD enter: source=0x{:x} version={} type_list={}", static_cast<unsigned long>(msg.data.l[0]),
+                      msg.data.l[1] >> 24, (msg.data.l[1] & kXdndEnterUseTypeList) != 0);
+            preferUriListTarget(pd.display, msg, pd.xdnd_type_list, pd.text_uri_list);
+            pd.source_window = static_cast<Window>(msg.data.l[0]);
+            self->setDragHovering(true);
+        } else if (msg.message_type == pd.xdnd_drop || msg.message_type == pd.xdnd_leave) {
+            LOG_DEBUG("XDnD {}: source=0x{:x}", msg.message_type == pd.xdnd_drop ? "drop" : "leave",
+                      static_cast<unsigned long>(msg.data.l[0]));
+            self->setDragHovering(false);
+            pd.source_window = 0;
         }
+        return true;
     }
 
 // ============================================================================
@@ -336,19 +457,17 @@ namespace lfs::vis::gui {
     }
 
     void NativeDragDrop::setDragHovering(bool hovering) {
+        if (hovering && NativeDragScheduler::outgoingDragActive())
+            hovering = false;
         if (drag_hovering_ == hovering)
             return;
 
         drag_hovering_ = hovering;
-
-        if (hovering && on_drag_enter_) {
-            on_drag_enter_({});
-        } else if (!hovering && on_drag_leave_) {
-            on_drag_leave_();
-        }
     }
 
     void NativeDragDrop::handleFileDrop(const std::vector<std::string>& paths) {
+        if (NativeDragScheduler::outgoingDragActive())
+            return;
         if (on_file_drop_) {
             on_file_drop_(paths);
         }

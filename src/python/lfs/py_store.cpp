@@ -4,6 +4,7 @@
 #include "py_store.hpp"
 
 #include "core/logger.hpp"
+#include "py_error.hpp"
 #include "python/gil.hpp"
 #include "visualizer/app_store.hpp"
 
@@ -36,6 +37,41 @@ namespace lfs::python {
         std::atomic_uint64_t g_next_subscription_id{1};
         thread_local bool g_test_drain_with_current_gil = false;
 
+        template <typename Invoke>
+        void invoke_python_subscription(
+            const std::weak_ptr<PyStoreSubscription>& weak_subscription,
+            Invoke&& invoke) {
+            const bool can_acquire = can_acquire_gil();
+            const bool use_current_gil =
+                !can_acquire && g_test_drain_with_current_gil && PyGILState_Check();
+            if (!can_acquire && !use_current_gil)
+                return;
+
+            const auto invoke_callback = [&] {
+                // Lock inside the GIL-held scope so self-unsubscription cannot
+                // release the final Python callback reference without the GIL.
+                const auto subscription = weak_subscription.lock();
+                if (!subscription)
+                    return;
+
+                try {
+                    invoke(subscription->callback);
+                } catch (nb::python_error& e) {
+                    (void)contain_python_callback(e, PyCallbackPolicy::WarnAndContinue);
+                } catch (const std::exception& e) {
+                    (void)contain_cxx_callback(e.what(), PyCallbackPolicy::WarnAndContinue);
+                }
+            };
+
+            if (can_acquire) {
+                const GilAcquire gil;
+                invoke_callback();
+            } else {
+                // Test drain already entered from Python with the GIL held.
+                invoke_callback();
+            }
+        }
+
         template <typename Observable>
         std::uint64_t subscribe_observable(Observable& observable, nb::object callback) {
             const auto id = g_next_subscription_id.fetch_add(1, std::memory_order_relaxed);
@@ -43,25 +79,9 @@ namespace lfs::python {
             subscription->callback = std::move(callback);
             const std::weak_ptr<PyStoreSubscription> weak_subscription = subscription;
             subscription->token = observable.subscribe([weak_subscription](const auto& value) {
-                const auto subscription = weak_subscription.lock();
-                if (!subscription)
-                    return;
-                const bool can_acquire = can_acquire_gil();
-                const bool use_current_gil = !can_acquire && g_test_drain_with_current_gil && PyGILState_Check();
-                if (!can_acquire && !use_current_gil)
-                    return;
-                try {
-                    if (can_acquire) {
-                        const GilAcquire gil;
-                        subscription->callback(value);
-                    } else {
-                        subscription->callback(value);
-                    }
-                } catch (const nb::python_error& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
-                }
+                invoke_python_subscription(
+                    weak_subscription,
+                    [&value](const nb::object& callback) { callback(value); });
             });
 
             {
@@ -78,25 +98,9 @@ namespace lfs::python {
             subscription->callback = std::move(callback);
             const std::weak_ptr<PyStoreSubscription> weak_subscription = subscription;
             subscription->token = observable.subscribe([weak_subscription, convert = std::move(convert)](const auto& value) {
-                const auto subscription = weak_subscription.lock();
-                if (!subscription)
-                    return;
-                const bool can_acquire = can_acquire_gil();
-                const bool use_current_gil = !can_acquire && g_test_drain_with_current_gil && PyGILState_Check();
-                if (!can_acquire && !use_current_gil)
-                    return;
-                try {
-                    if (can_acquire) {
-                        const GilAcquire gil;
-                        subscription->callback(convert(value));
-                    } else {
-                        subscription->callback(convert(value));
-                    }
-                } catch (const nb::python_error& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
-                }
+                invoke_python_subscription(
+                    weak_subscription,
+                    [&](const nb::object& callback) { callback(convert(value)); });
             });
 
             {
@@ -156,6 +160,86 @@ namespace lfs::python {
             return state;
         }
 
+        nb::dict account_state_to_dict(const lfs::vis::AppStore::AccountState& value) {
+            nb::dict state;
+            state["signed_in"] = value.signed_in;
+            state["authorized"] = value.authorized;
+            state["linking"] = value.linking;
+            state["disconnecting"] = value.disconnecting;
+            state["error"] = value.error;
+            state["membership_required"] = value.membership_required;
+            state["label"] = value.label;
+            state["email"] = value.email;
+            state["connected_since"] = value.connected_since;
+            state["display_name"] = value.display_name;
+            state["tier"] = value.tier;
+            state["tooltip"] = value.tooltip;
+            return state;
+        }
+
+        lfs::vis::AppStore::AccountState account_state_from_object(const nb::object& value) {
+            if (value.is_none())
+                return {};
+            if (!nb::isinstance<nb::dict>(value))
+                throw nb::type_error("account_state must be a dict");
+
+            const nb::dict dict = nb::cast<nb::dict>(value);
+            lfs::vis::AppStore::AccountState state;
+            state.signed_in = dict_value(dict, "signed_in", false);
+            state.authorized = dict_value(dict, "authorized", false);
+            state.linking = dict_value(dict, "linking", false);
+            state.disconnecting = dict_value(dict, "disconnecting", false);
+            state.error = dict_value(dict, "error", std::string{});
+            state.membership_required = dict_value(dict, "membership_required", false);
+            state.label = dict_value(dict, "label", std::string{});
+            state.email = dict_value(dict, "email", std::string{});
+            state.connected_since = dict_value(dict, "connected_since", std::string{});
+            state.display_name = dict_value(dict, "display_name", std::string{});
+            state.tier = dict_value(dict, "tier", std::string{});
+            state.tooltip = dict_value(dict, "tooltip", std::string{});
+            return state;
+        }
+
+        nb::dict gallery_state_to_dict(const lfs::vis::AppStore::GalleryState& value) {
+            nb::dict state;
+            state["signed_in"] = value.signed_in;
+            state["relink_required"] = value.relink_required;
+            state["active_uploads"] = value.active_uploads;
+            state["active_downloads"] = value.active_downloads;
+            state["paused"] = value.paused;
+            state["attention"] = value.attention;
+            state["percent"] = value.percent;
+            state["label"] = value.label;
+            state["detail"] = value.detail;
+            state["tooltip"] = value.tooltip;
+            state["tone"] = value.tone;
+            state["epoch"] = value.epoch;
+            return state;
+        }
+
+        lfs::vis::AppStore::GalleryState gallery_state_from_object(const nb::object& value) {
+            if (value.is_none())
+                return {};
+            if (!nb::isinstance<nb::dict>(value))
+                throw nb::type_error("gallery_state must be a dict");
+
+            const nb::dict dict = nb::cast<nb::dict>(value);
+            lfs::vis::AppStore::GalleryState state;
+            state.signed_in = dict_value(dict, "signed_in", false);
+            state.relink_required = dict_value(dict, "relink_required", false);
+            state.active_uploads = dict_value(dict, "active_uploads", 0);
+            state.active_downloads = dict_value(dict, "active_downloads", 0);
+            state.paused = dict_value(dict, "paused", 0);
+            state.attention = dict_value(dict, "attention", 0);
+            state.percent = dict_value(dict, "percent", -1);
+            state.label = dict_value(dict, "label", std::string{});
+            state.detail = dict_value(dict, "detail", std::string{});
+            state.tooltip = dict_value(dict, "tooltip", std::string{});
+            state.tone = dict_value(dict, "tone", std::string{"idle"});
+            state.epoch = dict_value(dict, "epoch", std::uint64_t{0});
+            return state;
+        }
+
         nb::dict video_export_overlay_state_to_dict(const lfs::vis::AppStore::VideoExportOverlayState& value) {
             nb::dict state;
             state["active"] = value.active;
@@ -187,8 +271,10 @@ namespace lfs::python {
             state["active"] = value.active;
             state["progress"] = value.progress;
             state["stage"] = value.stage;
+            state["outcome"] = value.outcome;
             state["format"] = value.format;
             state["error"] = value.error;
+            state["warning"] = value.warning;
             state["path"] = value.path;
             return state;
         }
@@ -204,8 +290,10 @@ namespace lfs::python {
             state.active = dict_value(dict, "active", false);
             state.progress = dict_value(dict, "progress", 0.0f);
             state.stage = dict_value(dict, "stage", std::string{});
+            state.outcome = dict_value(dict, "outcome", std::string{"idle"});
             state.format = dict_value(dict, "format", std::string{});
             state.error = dict_value(dict, "error", std::string{});
+            state.warning = dict_value(dict, "warning", std::string{});
             state.path = dict_value(dict, "path", std::string{});
             return state;
         }
@@ -262,12 +350,15 @@ namespace lfs::python {
             else if (field == "eval_ssim")
                 store.eval_ssim.set(value.is_none() ? std::optional<float>{}
                                                     : std::optional<float>{nb::cast<float>(value)});
+            else if (field == "eval_lpips")
+                store.eval_lpips.set(value.is_none() ? std::optional<float>{}
+                                                     : std::optional<float>{nb::cast<float>(value)});
             else if (field == "scene_generation")
                 store.scene_generation.set(nb::cast<std::uint64_t>(value));
+            else if (field == "stored_session_generation")
+                store.stored_session_generation.set(nb::cast<std::uint64_t>(value));
             else if (field == "selection_generation")
                 store.selection_generation.set(nb::cast<std::uint64_t>(value));
-            else if (field == "fps")
-                store.fps.set(nb::cast<float>(value));
             else if (field == "mode_text")
                 store.mode_text.set(nb::cast<std::string>(value));
             else if (field == "active_tool")
@@ -278,8 +369,14 @@ namespace lfs::python {
                 store.transform_space.set(nb::cast<int>(value));
             else if (field == "pivot_mode")
                 store.pivot_mode.set(nb::cast<int>(value));
+            else if (field == "multi_transform_mode")
+                store.multi_transform_mode.set(nb::cast<int>(value));
             else if (field == "import_overlay_state")
                 store.import_overlay_state.set(import_overlay_state_from_object(value));
+            else if (field == "account_state")
+                store.account_state.set(account_state_from_object(value));
+            else if (field == "gallery_state")
+                store.gallery_state.set(gallery_state_from_object(value));
             else if (field == "video_export_overlay_state")
                 store.video_export_overlay_state.set(video_export_overlay_state_from_object(value));
             else if (field == "export_progress_state")
@@ -292,6 +389,8 @@ namespace lfs::python {
                 store.scripts_generation.set(nb::cast<std::uint64_t>(value));
             else if (field == "language_generation")
                 store.language_generation.set(nb::cast<std::uint64_t>(value));
+            else if (field == "render_settings_generation")
+                store.render_settings_generation.set(nb::cast<std::uint64_t>(value));
             else
                 throw_unknown_field(field);
         }
@@ -318,12 +417,14 @@ namespace lfs::python {
                 return nb::cast(store.eval_psnr.get());
             if (field == "eval_ssim")
                 return nb::cast(store.eval_ssim.get());
+            if (field == "eval_lpips")
+                return nb::cast(store.eval_lpips.get());
             if (field == "scene_generation")
                 return nb::cast(store.scene_generation.get());
+            if (field == "stored_session_generation")
+                return nb::cast(store.stored_session_generation.get());
             if (field == "selection_generation")
                 return nb::cast(store.selection_generation.get());
-            if (field == "fps")
-                return nb::cast(store.fps.get());
             if (field == "mode_text")
                 return nb::cast(store.mode_text.get());
             if (field == "active_tool")
@@ -334,8 +435,14 @@ namespace lfs::python {
                 return nb::cast(store.transform_space.get());
             if (field == "pivot_mode")
                 return nb::cast(store.pivot_mode.get());
+            if (field == "multi_transform_mode")
+                return nb::cast(store.multi_transform_mode.get());
             if (field == "import_overlay_state")
                 return import_overlay_state_to_dict(store.import_overlay_state.get());
+            if (field == "account_state")
+                return account_state_to_dict(store.account_state.get());
+            if (field == "gallery_state")
+                return gallery_state_to_dict(store.gallery_state.get());
             if (field == "video_export_overlay_state")
                 return video_export_overlay_state_to_dict(store.video_export_overlay_state.get());
             if (field == "export_progress_state")
@@ -348,6 +455,8 @@ namespace lfs::python {
                 return nb::cast(store.scripts_generation.get());
             if (field == "language_generation")
                 return nb::cast(store.language_generation.get());
+            if (field == "render_settings_generation")
+                return nb::cast(store.render_settings_generation.get());
             throw_unknown_field(field);
         }
 
@@ -373,12 +482,14 @@ namespace lfs::python {
                 return subscribe_observable(store.eval_psnr, std::move(callback));
             if (field == "eval_ssim")
                 return subscribe_observable(store.eval_ssim, std::move(callback));
+            if (field == "eval_lpips")
+                return subscribe_observable(store.eval_lpips, std::move(callback));
             if (field == "scene_generation")
                 return subscribe_observable(store.scene_generation, std::move(callback));
+            if (field == "stored_session_generation")
+                return subscribe_observable(store.stored_session_generation, std::move(callback));
             if (field == "selection_generation")
                 return subscribe_observable(store.selection_generation, std::move(callback));
-            if (field == "fps")
-                return subscribe_observable(store.fps, std::move(callback));
             if (field == "mode_text")
                 return subscribe_observable(store.mode_text, std::move(callback));
             if (field == "active_tool")
@@ -389,9 +500,17 @@ namespace lfs::python {
                 return subscribe_observable(store.transform_space, std::move(callback));
             if (field == "pivot_mode")
                 return subscribe_observable(store.pivot_mode, std::move(callback));
+            if (field == "multi_transform_mode")
+                return subscribe_observable(store.multi_transform_mode, std::move(callback));
             if (field == "import_overlay_state")
                 return subscribe_observable_as(
                     store.import_overlay_state, std::move(callback), import_overlay_state_to_dict);
+            if (field == "account_state")
+                return subscribe_observable_as(
+                    store.account_state, std::move(callback), account_state_to_dict);
+            if (field == "gallery_state")
+                return subscribe_observable_as(
+                    store.gallery_state, std::move(callback), gallery_state_to_dict);
             if (field == "video_export_overlay_state")
                 return subscribe_observable_as(
                     store.video_export_overlay_state, std::move(callback), video_export_overlay_state_to_dict);
@@ -408,6 +527,8 @@ namespace lfs::python {
                 return subscribe_observable(store.scripts_generation, std::move(callback));
             if (field == "language_generation")
                 return subscribe_observable(store.language_generation, std::move(callback));
+            if (field == "render_settings_generation")
+                return subscribe_observable(store.render_settings_generation, std::move(callback));
             throw_unknown_field(field);
         }
 
@@ -441,16 +562,26 @@ namespace lfs::python {
         }
     } // namespace
 
-    void shutdown_store_bridge() {
-        if (!can_acquire_gil())
-            return;
-
-        const GilAcquire gil;
+    void clear_store_subscriptions() {
         std::unordered_map<std::uint64_t, std::shared_ptr<PyStoreSubscription>> subscriptions;
         {
             std::lock_guard lock(g_subscriptions_mutex);
             subscriptions.swap(g_subscriptions);
         }
+    }
+
+    void shutdown_store_bridge() {
+        if (!can_acquire_gil())
+            return;
+
+        const GilAcquire gil;
+        clear_store_subscriptions();
+    }
+
+    void shutdown_store_bridge_at_exit() {
+        // Python invokes atexit handlers with the GIL held. A standalone
+        // extension import never sets the app runtime's GIL-ready flag.
+        clear_store_subscriptions();
     }
 
     void register_store(nb::module_& ui_module) {
@@ -462,6 +593,8 @@ namespace lfs::python {
         store.def("begin_batch", &begin_batch, "Begin a batched app store update");
         store.def("end_batch", &end_batch, "End a batched app store update");
         store.def("_drain_for_tests", &drain_for_tests, "Drain pending app store notifications in tests");
+        nb::module_::import_("atexit").attr("register")(
+            nb::cpp_function(&shutdown_store_bridge_at_exit));
     }
 
 } // namespace lfs::python

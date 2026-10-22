@@ -1,0 +1,1213 @@
+/* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later */
+
+#include "core/alloc_counter.hpp"
+#include "core/cuda/sh_layout.cuh"
+#include "core/error.hpp"
+#include "core/event_bridge/scoped_handler.hpp"
+#include "core/events.hpp"
+#include "core/scene.hpp"
+#include "core/sh_value_quant.hpp"
+#include "core/sh_value_quant_kernels.hpp"
+#include "core/splat_data.hpp"
+#include "core/splat_data_transform.hpp"
+#include "core/tensor.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
+#include "core/uuid.hpp"
+#include "io/formats/ply.hpp"
+#include "io/splat_chapter.hpp"
+#include <cstring>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <cuda_runtime.h>
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cmath>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+using lfs::core::Device;
+using lfs::core::Scene;
+using lfs::core::SplatData;
+using lfs::core::Tensor;
+using lfs::core::Uuid;
+
+namespace {
+
+    // q16 is uniform uint16 over 256-splat [block_min, block_max]. Extract
+    // re-blocks independently of the combined model, so this covers two
+    // encode/decode passes with different alignments (~2 * range / 65535).
+    constexpr float kShNAbsTol = 2e-3f;
+
+    [[nodiscard]] std::filesystem::path bike_ply_path() {
+        return std::filesystem::path(PROJECT_ROOT_PATH) / "tests/data/bike.ply";
+    }
+
+    [[nodiscard]] Tensor range_mask(const size_t n, const size_t start, const size_t count,
+                                    const Device device) {
+        Tensor mask = Tensor::zeros_bool({n}, device);
+        if (count > 0) {
+            mask.slice(0, start, start + count).copy_from(Tensor::ones_bool({count}, device));
+        }
+        return mask;
+    }
+
+    struct CpuAttrs {
+        std::vector<float> means;
+        std::vector<float> sh0;
+        std::vector<float> shN;
+        std::vector<float> scaling;
+        std::vector<float> rotation;
+        std::vector<float> opacity;
+        size_t rows = 0;
+        int max_sh_degree = 0;
+    };
+
+    [[nodiscard]] CpuAttrs snapshot_cpu(const SplatData& model) {
+        CpuAttrs attrs;
+        attrs.rows = static_cast<size_t>(model.size());
+        attrs.max_sh_degree = model.get_max_sh_degree();
+        attrs.means = model.means_raw().to_vector();
+        attrs.sh0 = model.sh0_raw().to_vector();
+        attrs.shN = model.shN_canonical().to_vector();
+        attrs.scaling = model.scaling_raw().to_vector();
+        attrs.rotation = model.rotation_raw().to_vector();
+        attrs.opacity = model.opacity_raw().to_vector();
+        return attrs;
+    }
+
+    void expect_exact(const std::vector<float>& got, const std::vector<float>& expected,
+                      const char* name) {
+        ASSERT_EQ(got.size(), expected.size()) << name;
+        for (size_t i = 0; i < got.size(); ++i) {
+            EXPECT_EQ(got[i], expected[i]) << name << " i=" << i;
+        }
+    }
+
+    void expect_shN_q16(const std::vector<float>& got, const std::vector<float>& expected) {
+        ASSERT_EQ(got.size(), expected.size());
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < got.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(got[i] - expected[i]));
+        }
+        EXPECT_LE(max_abs, kShNAbsTol) << "shN max abs error " << max_abs;
+    }
+
+    void expect_attrs_match(const SplatData& got, const CpuAttrs& expected) {
+        ASSERT_EQ(static_cast<size_t>(got.size()), expected.rows);
+        EXPECT_EQ(got.get_max_sh_degree(), expected.max_sh_degree);
+        expect_exact(got.means_raw().to_vector(), expected.means, "means");
+        expect_exact(got.sh0_raw().to_vector(), expected.sh0, "sh0");
+        expect_exact(got.scaling_raw().to_vector(), expected.scaling, "scaling");
+        expect_exact(got.rotation_raw().to_vector(), expected.rotation, "rotation");
+        expect_exact(got.opacity_raw().to_vector(), expected.opacity, "opacity");
+        expect_shN_q16(got.shN_canonical().to_vector(), expected.shN);
+    }
+
+    struct ThreeNodeScene {
+        Scene scene;
+        Uuid full_uuid;
+        Uuid mid_uuid;
+        Uuid last_uuid;
+        CpuAttrs full_attrs;
+        CpuAttrs mid_attrs;
+        CpuAttrs last_attrs;
+        size_t full_n = 0;
+        size_t mid_n = 0;
+        size_t last_n = 0;
+    };
+
+} // namespace
+
+class SceneConsolidationExtractTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+            GTEST_SKIP() << "CUDA device unavailable";
+        }
+        const auto path = bike_ply_path();
+        if (!std::filesystem::exists(path)) {
+            GTEST_SKIP() << "tests/data/bike.ply is not available";
+        }
+        auto loaded = lfs::io::load_ply(path);
+        ASSERT_TRUE(loaded) << lfs::format_for_developer(loaded.error());
+        bike_ = std::move(loaded->value);
+        ASSERT_GE(static_cast<size_t>(bike_.size()), 32u)
+            << "tests/data/bike.ply is too small for subset copies";
+    }
+
+    void fill_three_node_scene(ThreeNodeScene& built) {
+        const size_t n = static_cast<size_t>(bike_.size());
+        const auto device = bike_.means_raw().device();
+        built.full_n = n;
+        built.mid_n = n / 2;
+        built.last_n = n / 3;
+        ASSERT_GT(built.mid_n, 0u);
+        ASSERT_GT(built.last_n, 0u);
+        ASSERT_NE(built.mid_n, built.last_n);
+
+        auto mid = lfs::core::extract_by_mask(
+            bike_, range_mask(n, 0, built.mid_n, device));
+        auto last = lfs::core::extract_by_mask(
+            bike_, range_mask(n, n - built.last_n, built.last_n, device));
+        ASSERT_EQ(static_cast<size_t>(mid.size()), built.mid_n);
+        ASSERT_EQ(static_cast<size_t>(last.size()), built.last_n);
+
+        built.full_attrs = snapshot_cpu(bike_);
+        built.mid_attrs = snapshot_cpu(mid);
+        built.last_attrs = snapshot_cpu(last);
+
+        const auto full_id =
+            built.scene.addSplat("full", std::make_unique<SplatData>(bike_.clone()));
+        const auto mid_id =
+            built.scene.addSplat("mid", std::make_unique<SplatData>(std::move(mid)));
+        const auto last_id =
+            built.scene.addSplat("last", std::make_unique<SplatData>(std::move(last)));
+        ASSERT_NE(full_id, lfs::core::NULL_NODE);
+        ASSERT_NE(mid_id, lfs::core::NULL_NODE);
+        ASSERT_NE(last_id, lfs::core::NULL_NODE);
+        built.full_uuid = built.scene.getNodeUuid(full_id);
+        built.mid_uuid = built.scene.getNodeUuid(mid_id);
+        built.last_uuid = built.scene.getNodeUuid(last_id);
+    }
+
+    SplatData bike_;
+};
+
+TEST_F(SceneConsolidationExtractTest, ExtractsEachNodeMatchingOriginals) {
+    ThreeNodeScene built;
+    fill_three_node_scene(built);
+    ASSERT_EQ(built.scene.consolidateNodeModels(), 3u);
+    ASSERT_TRUE(built.scene.isConsolidated());
+
+    auto full = built.scene.extractConsolidatedNodeModel(built.full_uuid);
+    auto mid = built.scene.extractConsolidatedNodeModel(built.mid_uuid);
+    auto last = built.scene.extractConsolidatedNodeModel(built.last_uuid);
+    ASSERT_NE(full, nullptr);
+    ASSERT_NE(mid, nullptr);
+    ASSERT_NE(last, nullptr);
+    expect_attrs_match(*full, built.full_attrs);
+    expect_attrs_match(*mid, built.mid_attrs);
+    expect_attrs_match(*last, built.last_attrs);
+
+    auto captured = lfs::io::project::SplatChapterPayload::capture(
+        *full, lfs::io::project::SplatSourceKind::Generated, false);
+    ASSERT_TRUE(captured) << lfs::format_for_developer(captured.error());
+    auto hydrated = captured->hydrate();
+    ASSERT_TRUE(hydrated) << lfs::format_for_developer(hydrated.error());
+    ASSERT_NE(*hydrated, nullptr);
+    EXPECT_EQ(static_cast<size_t>((*hydrated)->size()), built.full_n);
+}
+
+TEST_F(SceneConsolidationExtractTest, SingleVisibleNodeAliasesWithoutAllocatorUse) {
+    Scene scene;
+    const auto id = scene.addSplat("single", std::make_unique<SplatData>(bike_.clone()));
+    ASSERT_NE(id, lfs::core::NULL_NODE);
+
+    std::atomic<size_t> allocator_calls = 0;
+    scene.setCombinedModelAllocator(
+        [&allocator_calls](lfs::core::TensorShape shape,
+                           size_t,
+                           lfs::core::DataType dtype,
+                           std::string_view) {
+            ++allocator_calls;
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        });
+
+    const auto* combined = scene.getCombinedModel();
+    ASSERT_NE(combined, nullptr);
+    const auto* node = scene.getNodeById(id);
+    ASSERT_NE(node, nullptr);
+    ASSERT_NE(node->model, nullptr);
+    EXPECT_EQ(combined, node->model.get());
+    EXPECT_EQ(combined->means_raw().data_ptr(), node->model->means_raw().data_ptr());
+    EXPECT_EQ(combined->sh0_raw().data_ptr(), node->model->sh0_raw().data_ptr());
+    EXPECT_EQ(combined->scaling_raw().data_ptr(), node->model->scaling_raw().data_ptr());
+    EXPECT_EQ(combined->rotation_raw().data_ptr(), node->model->rotation_raw().data_ptr());
+    EXPECT_EQ(combined->opacity_raw().data_ptr(), node->model->opacity_raw().data_ptr());
+    EXPECT_EQ(allocator_calls.load(), 0u);
+}
+
+TEST_F(SceneConsolidationExtractTest, WorkerBuildMatchesSynchronousCombinedModel) {
+    // Scene hands multi-node models above one million visible splats to its
+    // worker, so the synchronous reference must stay below that.
+    const size_t bike_size = static_cast<size_t>(bike_.size());
+    const size_t input_size = std::min(bike_size, size_t{500'000});
+    const auto input = lfs::core::extract_by_mask(
+        bike_, range_mask(bike_size, 0, input_size, bike_.means_raw().device()));
+    auto first = std::make_shared<SplatData>(input.clone());
+    auto second = std::make_shared<SplatData>(input.clone());
+    const size_t first_size = static_cast<size_t>(first->size());
+
+    std::vector<size_t> allocation_shape_rows;
+    std::vector<size_t> allocation_capacities;
+    std::vector<std::string> allocation_names;
+    const auto counting_allocator =
+        [&allocation_shape_rows, &allocation_capacities, &allocation_names](lfs::core::TensorShape shape,
+                                                                            const size_t capacity,
+                                                                            lfs::core::DataType dtype,
+                                                                            std::string_view name) {
+            allocation_shape_rows.push_back(shape[0]);
+            allocation_capacities.push_back(capacity);
+            allocation_names.emplace_back(name);
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        };
+
+    Tensor::trim_memory_pool();
+    const auto allocation_snapshot = lfs::core::alloc_counter::snapshot();
+    std::optional<Scene::CombinedModelBuild> worker_build;
+    std::jthread worker([&] {
+        worker_build = Scene::buildCombinedModelCache(
+            {{first, true, 0}, {second, true, first_size}},
+            first_size + static_cast<size_t>(second->size()),
+            counting_allocator);
+    });
+    worker.join();
+    // The direct concatenator may allocate its six result fields, q16 companion
+    // storage, indices, and transient SH conversion workspaces. It must not add
+    // two full input-model clone sets to that budget.
+    EXPECT_LE(lfs::core::alloc_counter::delta_since(allocation_snapshot), 16u);
+    ASSERT_TRUE(worker_build.has_value());
+    ASSERT_NE(worker_build->model, nullptr);
+    ASSERT_GE(allocation_names.size(), 5u);
+    const size_t total_size = first_size + static_cast<size_t>(second->size());
+    EXPECT_TRUE(std::all_of(allocation_names.begin(), allocation_names.end(),
+                            [](const std::string& name) {
+                                return name == "SplatData.means" ||
+                                       name == "SplatData.sh0" ||
+                                       name == "SplatData.shN" ||
+                                       name == "SplatData.shN_value_bounds" ||
+                                       name == "SplatData.opacity" ||
+                                       name == "SplatData.scaling" ||
+                                       name == "SplatData.rotation";
+                            }));
+    for (size_t i = 0; i < allocation_names.size(); ++i) {
+        if (allocation_names[i] == "SplatData.means" ||
+            allocation_names[i] == "SplatData.sh0" ||
+            allocation_names[i] == "SplatData.opacity" ||
+            allocation_names[i] == "SplatData.scaling" ||
+            allocation_names[i] == "SplatData.rotation") {
+            EXPECT_EQ(allocation_capacities[i], total_size);
+        }
+    }
+    EXPECT_TRUE(std::any_of(allocation_shape_rows.begin(), allocation_shape_rows.end(),
+                            [total_size](const size_t rows) { return rows == total_size; }));
+
+    Scene synchronous;
+    ASSERT_NE(synchronous.addSplat("first", std::make_unique<SplatData>(first->clone())),
+              lfs::core::NULL_NODE);
+    ASSERT_NE(synchronous.addSplat("second", std::make_unique<SplatData>(second->clone())),
+              lfs::core::NULL_NODE);
+    const auto* expected = synchronous.getCombinedModel();
+    ASSERT_NE(expected, nullptr);
+
+    EXPECT_EQ(worker_build->model->means_raw().to_vector(), expected->means_raw().to_vector());
+    EXPECT_EQ(worker_build->model->sh0_raw().to_vector(), expected->sh0_raw().to_vector());
+    EXPECT_EQ(worker_build->model->scaling_raw().to_vector(), expected->scaling_raw().to_vector());
+    EXPECT_EQ(worker_build->model->rotation_raw().to_vector(), expected->rotation_raw().to_vector());
+    EXPECT_EQ(worker_build->model->opacity_raw().to_vector(), expected->opacity_raw().to_vector());
+    expect_shN_q16(worker_build->model->shN_canonical().to_vector(), expected->shN_canonical().to_vector());
+}
+
+// Catches captures drawing the previous combined model while the worker rebuilds it: an export
+// right after showing a model left that model out.
+TEST_F(SceneConsolidationExtractTest, CurrentCombinedModelNeverServesThePreviousScene) {
+    const size_t n = static_cast<size_t>(bike_.size());
+    const size_t visible_copies = 1'000'000 / n + 2;
+    Scene scene;
+    std::vector<lfs::core::NodeId> ids;
+    for (size_t i = 0; i <= visible_copies; ++i) {
+        ids.push_back(scene.addSplat("copy_" + std::to_string(i), std::make_unique<SplatData>(bike_.clone())));
+        ASSERT_NE(ids.back(), lfs::core::NULL_NODE);
+    }
+    scene.setNodeVisibility(ids.back(), false);
+    const auto* before = scene.getCurrentCombinedModel();
+    ASSERT_NE(before, nullptr);
+    ASSERT_EQ(static_cast<size_t>(before->size()), visible_copies * n);
+
+    scene.setNodeVisibility(ids.back(), true);
+    const auto* interactive = scene.getCombinedModel();
+    ASSERT_NE(interactive, nullptr);
+    ASSERT_EQ(static_cast<size_t>(interactive->size()), visible_copies * n)
+        << "the interactive path keeps the previous scene while the worker rebuilds";
+
+    const auto* current = scene.getCurrentCombinedModel();
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(static_cast<size_t>(current->size()), (visible_copies + 1) * n);
+}
+
+TEST_F(SceneConsolidationExtractTest, SceneDestructionJoinsCombinedModelWorker) {
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool allocator_entered = false;
+    bool release_allocator = false;
+
+    std::thread releaser([&] {
+        std::unique_lock lock(gate_mutex);
+        gate_changed.wait(lock, [&] { return allocator_entered; });
+        release_allocator = true;
+        gate_changed.notify_all();
+    });
+
+    {
+        Scene scene;
+        EXPECT_NE(scene.addSplat("first", std::make_unique<SplatData>(bike_.clone())),
+                  lfs::core::NULL_NODE);
+        EXPECT_NE(scene.addSplat("second", std::make_unique<SplatData>(bike_.clone())),
+                  lfs::core::NULL_NODE);
+        scene.setCombinedModelAllocator(
+            [&](lfs::core::TensorShape shape,
+                size_t,
+                lfs::core::DataType dtype,
+                std::string_view) {
+                std::unique_lock lock(gate_mutex);
+                allocator_entered = true;
+                gate_changed.notify_all();
+                gate_changed.wait(lock, [&] { return release_allocator; });
+                return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+            });
+        scene.requestCombinedModelBuild(true);
+    }
+    releaser.join();
+}
+
+TEST_F(SceneConsolidationExtractTest, RemovingNodeRetiresModelUntilWorkerPoll) {
+    Scene scene;
+    const auto removed_id = scene.addSplat("removed", std::make_unique<SplatData>(bike_.clone()));
+    const auto remaining_id = scene.addSplat("remaining", std::make_unique<SplatData>(bike_.clone()));
+    ASSERT_NE(removed_id, lfs::core::NULL_NODE);
+    ASSERT_NE(remaining_id, lfs::core::NULL_NODE);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool allocator_entered = false;
+    bool release_allocator = false;
+    scene.setCombinedModelAllocator(
+        [&](lfs::core::TensorShape shape,
+            size_t,
+            lfs::core::DataType dtype,
+            std::string_view) {
+            std::unique_lock lock(gate_mutex);
+            allocator_entered = true;
+            gate_changed.notify_all();
+            gate_changed.wait(lock, [&] { return release_allocator; });
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        });
+
+    scene.requestCombinedModelBuild(true);
+    {
+        std::unique_lock lock(gate_mutex);
+        gate_changed.wait(lock, [&] { return allocator_entered; });
+    }
+
+    const auto* removed_node = scene.getNodeById(removed_id);
+    ASSERT_NE(removed_node, nullptr);
+    ASSERT_NE(removed_node->model, nullptr);
+    const auto* retired_model = removed_node->model.get();
+    const size_t retired_size = retired_model->size();
+    scene.removeNodeById(removed_id);
+    EXPECT_EQ(scene.getNodeById(removed_id), nullptr);
+    // The pointer is no longer in a SceneNode, but the in-flight registry still
+    // owns it while the held worker can read it.
+    EXPECT_EQ(retired_model->size(), retired_size);
+
+    {
+        std::lock_guard lock(gate_mutex);
+        release_allocator = true;
+    }
+    gate_changed.notify_all();
+
+    const auto* remaining = scene.getNodeById(remaining_id);
+    ASSERT_NE(remaining, nullptr);
+    ASSERT_NE(remaining->model, nullptr);
+    EXPECT_EQ(scene.getCombinedModel(), remaining->model.get());
+}
+
+TEST_F(SceneConsolidationExtractTest, ReplacingNodeModelRetiresPreviousUntilWorkerPoll) {
+    Scene scene;
+    const auto first_id = scene.addSplat("first", std::make_unique<SplatData>(bike_.clone()));
+    const auto second_id = scene.addSplat("second", std::make_unique<SplatData>(bike_.clone()));
+    ASSERT_NE(first_id, lfs::core::NULL_NODE);
+    ASSERT_NE(second_id, lfs::core::NULL_NODE);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool allocator_entered = false;
+    bool release_allocator = false;
+    scene.setCombinedModelAllocator(
+        [&](lfs::core::TensorShape shape,
+            size_t,
+            lfs::core::DataType dtype,
+            std::string_view) {
+            std::unique_lock lock(gate_mutex);
+            allocator_entered = true;
+            gate_changed.notify_all();
+            gate_changed.wait(lock, [&] { return release_allocator; });
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        });
+
+    scene.requestCombinedModelBuild(true);
+    {
+        std::unique_lock lock(gate_mutex);
+        gate_changed.wait(lock, [&] { return allocator_entered; });
+    }
+
+    const auto* first_node = scene.getNodeById(first_id);
+    ASSERT_NE(first_node, nullptr);
+    ASSERT_NE(first_node->model, nullptr);
+    const auto* previous_model = first_node->model.get();
+    const size_t previous_size = previous_model->size();
+    scene.replaceNodeModel("first", std::make_unique<SplatData>(bike_.clone()));
+    const auto* replaced = scene.getNodeById(first_id);
+    ASSERT_NE(replaced, nullptr);
+    ASSERT_NE(replaced->model, nullptr);
+    EXPECT_NE(replaced->model.get(), previous_model);
+    EXPECT_EQ(previous_model->size(), previous_size);
+
+    {
+        std::lock_guard lock(gate_mutex);
+        release_allocator = true;
+    }
+    gate_changed.notify_all();
+
+    // Leave one node so the post-poll cache rebuild is synchronous and avoids
+    // starting another worker while checking that the stale result was
+    // rejected.
+    scene.removeNodeById(second_id);
+    EXPECT_EQ(scene.getCombinedModel(), replaced->model.get());
+    EXPECT_FALSE(scene.combinedModelBuildPending());
+}
+
+TEST_F(SceneConsolidationExtractTest, StaleWorkerGenerationCannotReplaceNewestCache) {
+    Scene scene;
+    const auto first_id = scene.addSplat("first", std::make_unique<SplatData>(bike_.clone()));
+    const auto second_id = scene.addSplat("second", std::make_unique<SplatData>(bike_.clone()));
+    ASSERT_NE(first_id, lfs::core::NULL_NODE);
+    ASSERT_NE(second_id, lfs::core::NULL_NODE);
+
+    auto old_snapshot = scene.captureCombinedModelBuild();
+    auto old_build = Scene::buildCombinedModelCache(
+        old_snapshot.inputs, old_snapshot.full_selection_count,
+        old_snapshot.allocator, old_snapshot.generation);
+    scene.invalidateCache();
+    EXPECT_FALSE(scene.installCombinedModelCache(std::move(old_build)));
+
+    auto newest_snapshot = scene.captureCombinedModelBuild();
+    auto newest_build = Scene::buildCombinedModelCache(
+        std::move(newest_snapshot.inputs), newest_snapshot.full_selection_count,
+        newest_snapshot.allocator, newest_snapshot.generation);
+    EXPECT_TRUE(scene.installCombinedModelCache(std::move(newest_build)));
+    EXPECT_NE(scene.getCombinedModel(), nullptr);
+}
+
+TEST_F(SceneConsolidationExtractTest, OffsetWalksNullSlotAfterMiddleRemove) {
+    ThreeNodeScene built;
+    fill_three_node_scene(built);
+    ASSERT_EQ(built.scene.consolidateNodeModels(), 3u);
+
+    built.scene.removeNodeById(built.scene.getNodeIdByUuid(built.mid_uuid));
+    EXPECT_EQ(built.scene.extractConsolidatedNodeModel(built.mid_uuid), nullptr);
+
+    auto last = built.scene.extractConsolidatedNodeModel(built.last_uuid);
+    ASSERT_NE(last, nullptr);
+    expect_attrs_match(*last, built.last_attrs);
+
+    auto full = built.scene.extractConsolidatedNodeModel(built.full_uuid);
+    ASSERT_NE(full, nullptr);
+    expect_attrs_match(*full, built.full_attrs);
+}
+
+TEST_F(SceneConsolidationExtractTest, SoftDeletedRowsAreExcluded) {
+    ThreeNodeScene built;
+    fill_three_node_scene(built);
+    ASSERT_EQ(built.scene.consolidateNodeModels(), 3u);
+
+    auto* combined = const_cast<SplatData*>(built.scene.getCombinedModel());
+    ASSERT_NE(combined, nullptr);
+    const size_t combined_n = static_cast<size_t>(combined->size());
+    ASSERT_EQ(combined_n, built.full_n + built.mid_n + built.last_n);
+
+    const size_t last_start = built.full_n + built.mid_n;
+    const size_t delete_count = std::min<size_t>(7, built.last_n / 2);
+    ASSERT_GT(delete_count, 0u);
+    const size_t delete_start = last_start + 1;
+    ASSERT_LE(delete_start + delete_count, last_start + built.last_n);
+
+    Tensor del = Tensor::zeros_bool({combined_n}, combined->means_raw().device());
+    del.slice(0, delete_start, delete_start + delete_count).copy_from(Tensor::ones_bool({delete_count}, combined->means_raw().device()));
+    combined->soft_delete(del);
+    ASSERT_TRUE(combined->has_deleted_mask());
+
+    auto extracted = built.scene.extractConsolidatedNodeModel(built.last_uuid);
+    ASSERT_NE(extracted, nullptr);
+    ASSERT_EQ(static_cast<size_t>(extracted->size()), built.last_n - delete_count);
+
+    const size_t drop_lo = 1;
+    const size_t drop_hi = 1 + delete_count;
+    const auto keep_rows = [&](const std::vector<float>& src, const size_t width) {
+        std::vector<float> out;
+        out.reserve((built.last_n - delete_count) * width);
+        for (size_t row = 0; row < built.last_n; ++row) {
+            if (row >= drop_lo && row < drop_hi) {
+                continue;
+            }
+            const float* begin = src.data() + row * width;
+            out.insert(out.end(), begin, begin + static_cast<std::ptrdiff_t>(width));
+        }
+        return out;
+    };
+
+    CpuAttrs expected;
+    expected.rows = built.last_n - delete_count;
+    expected.max_sh_degree = built.last_attrs.max_sh_degree;
+    expected.means = keep_rows(built.last_attrs.means, 3);
+    expected.sh0 = keep_rows(built.last_attrs.sh0, 3);
+    expected.scaling = keep_rows(built.last_attrs.scaling, 3);
+    expected.rotation = keep_rows(built.last_attrs.rotation, 4);
+    expected.opacity = keep_rows(built.last_attrs.opacity, 1);
+    if (!built.last_attrs.shN.empty()) {
+        const size_t shN_width = built.last_attrs.shN.size() / built.last_n;
+        expected.shN = keep_rows(built.last_attrs.shN, shN_width);
+    }
+    expect_attrs_match(*extracted, expected);
+}
+
+TEST_F(SceneConsolidationExtractTest, ReturnsNullWhenNotConsolidatedOrUnknown) {
+    Scene scene;
+    EXPECT_EQ(scene.extractConsolidatedNodeModel(lfs::core::generate_uuid_v4()), nullptr);
+
+    const auto id = scene.addSplat("one", std::make_unique<SplatData>(bike_.clone()));
+    ASSERT_NE(id, lfs::core::NULL_NODE);
+    const auto uuid = scene.getNodeUuid(id);
+    EXPECT_FALSE(scene.isConsolidated());
+    EXPECT_EQ(scene.extractConsolidatedNodeModel(uuid), nullptr);
+
+    ThreeNodeScene built;
+    fill_three_node_scene(built);
+    ASSERT_EQ(built.scene.consolidateNodeModels(), 3u);
+    EXPECT_EQ(built.scene.extractConsolidatedNodeModel(lfs::core::generate_uuid_v4()),
+              nullptr);
+    const auto group = built.scene.addGroup("folder");
+    ASSERT_NE(group, lfs::core::NULL_NODE);
+    EXPECT_EQ(built.scene.extractConsolidatedNodeModel(built.scene.getNodeUuid(group)),
+              nullptr);
+}
+
+TEST(SceneActiveShTest, SourceRetentionPreservesEditableModelsAndResetsForNewScene) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+        GTEST_SKIP() << "CUDA device unavailable";
+    auto model = SplatData(1,
+                           Tensor::zeros({2, 3}, Device::CUDA),
+                           Tensor::zeros({2, 1, 3}, Device::CUDA),
+                           Tensor::ones({2, 3, 3}, Device::CUDA),
+                           Tensor::zeros({2, 3}, Device::CUDA),
+                           Tensor::from_vector(std::vector<float>{1, 0, 0, 0, 1, 0, 0, 0}, {2, 4}, Device::CUDA),
+                           Tensor::zeros({2, 1}, Device::CUDA), 1.0f);
+    Scene scene;
+    scene.preserveSourceModels();
+    for (int i = 0; i < 2; ++i)
+        scene.addSplat(std::to_string(i), std::make_unique<SplatData>(model.clone()));
+    EXPECT_EQ(scene.consolidateNodeModels(), 0u);
+    for (const auto* node : scene.getNodes()) {
+        ASSERT_NE(node->model, nullptr);
+        expect_exact(node->model->shN_canonical().to_vector(), model.shN_canonical().to_vector(), "source SH");
+    }
+    scene.clear();
+    for (int i = 0; i < 2; ++i)
+        scene.addSplat(std::to_string(i), std::make_unique<SplatData>(model.clone()));
+    EXPECT_EQ(scene.consolidateNodeModels(), 2u);
+}
+
+TEST(SceneActiveShTest, PreservesInactiveDataAndNodeLimitsThroughConsolidationAndCompaction) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+    Scene scene;
+    std::vector<Uuid> uuids;
+    std::vector<CpuAttrs> attributes;
+    const std::vector<int> degrees{3, 0, 1};
+    for (size_t slot = 0; slot < degrees.size(); ++slot) {
+        const size_t count = 5 + slot * 2;
+        std::vector<float> coefficients(count * 45);
+        for (size_t i = 0; i < coefficients.size(); ++i)
+            coefficients[i] = 0.2f * std::sin(static_cast<float>(i) + slot);
+        std::vector<float> rotation(count * 4, 0.0f);
+        for (size_t i = 0; i < count; ++i)
+            rotation[i * 4] = 1.0f;
+        auto model = std::make_unique<SplatData>(
+            3,
+            Tensor::zeros({count, 3}, Device::CUDA),
+            Tensor::zeros({count, 1, 3}, Device::CUDA),
+            Tensor::from_vector(coefficients, {count, 15, 3}, Device::CUDA),
+            Tensor::zeros({count, 3}, Device::CUDA),
+            Tensor::from_vector(rotation, {count, 4}, Device::CUDA),
+            Tensor::zeros({count, 1}, Device::CUDA),
+            1.0f);
+        model->set_active_sh_degree(degrees[slot]);
+        attributes.push_back(snapshot_cpu(*model));
+        uuids.push_back(scene.getNodeUuid(scene.addSplat(std::to_string(slot), std::move(model))));
+    }
+    EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), degrees);
+    EXPECT_EQ(scene.getVisibleNodeTransforms().size(), 3u);
+    scene.setNodeVisibility(scene.getNodeIdByUuid(uuids[0]), false);
+    EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), (std::vector<int>{0, 1}));
+    EXPECT_EQ(scene.getVisibleNodeTransforms().size(), 2u);
+    scene.setNodeVisibility(scene.getNodeIdByUuid(uuids[0]), true);
+    EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), degrees);
+    EXPECT_EQ(scene.getVisibleNodeTransforms().size(), 3u);
+    auto original_snapshot = scene.snapshotVisibleSplats();
+    ASSERT_EQ(original_snapshot.size(), 3u);
+    for (size_t i = 0; i < original_snapshot.size(); ++i) {
+        auto model = original_snapshot[i].materialize();
+        expect_attrs_match(*model, attributes[i]);
+        EXPECT_EQ(model->get_active_sh_degree(), degrees[i]);
+        EXPECT_NE(model->means_raw().data_ptr(), scene.getNodeByUuid(uuids[i])->model->means_raw().data_ptr());
+    }
+    ASSERT_EQ(scene.consolidateNodeModels(), 3u);
+    EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), degrees);
+    const auto check_models = [&] {
+        for (size_t slot = 0; slot < degrees.size(); ++slot) {
+            if (!scene.getNodeByUuid(uuids[slot]))
+                continue;
+            auto model = scene.extractConsolidatedNodeModel(uuids[slot]);
+            ASSERT_NE(model, nullptr);
+            EXPECT_EQ(model->get_active_sh_degree(), degrees[slot]);
+            // Inactive coefficients must remain available for later edits/export.
+            expect_attrs_match(*model, attributes[slot]);
+        }
+    };
+    check_models();
+    auto consolidated_snapshot = scene.snapshotVisibleSplats();
+    ASSERT_EQ(consolidated_snapshot.size(), 3u);
+    EXPECT_EQ(consolidated_snapshot[0].data, consolidated_snapshot[1].data);
+    EXPECT_EQ(consolidated_snapshot[1].data, consolidated_snapshot[2].data);
+    scene.removeNodeById(scene.getNodeIdByUuid(uuids[0]));
+    EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), degrees); // Transform slot retained until compaction.
+    EXPECT_EQ(scene.extractConsolidatedNodeModel(uuids[0]), nullptr);
+    // A removed first node leaves a storage hole. Hidden nodes still occupy
+    // ranges, but neither removed nor hidden geometry may enter the snapshot.
+    auto surviving_snapshot = scene.snapshotVisibleSplats();
+    ASSERT_EQ(surviving_snapshot.size(), 2u);
+    for (size_t i = 0; i < surviving_snapshot.size(); ++i)
+        expect_attrs_match(*surviving_snapshot[i].materialize(), attributes[i + 1]);
+    scene.setNodeVisibility(scene.getNodeIdByUuid(uuids[1]), false);
+    auto visible_snapshot = scene.snapshotVisibleSplats();
+    ASSERT_EQ(visible_snapshot.size(), 1u);
+    expect_attrs_match(*visible_snapshot[0].materialize(), attributes[2]);
+    scene.setNodeVisibility(scene.getNodeIdByUuid(uuids[1]), true);
+    check_models();
+    const auto snapshot = scene.captureConsolidatedCompaction();
+    ASSERT_TRUE(snapshot.has_value());
+    std::vector<Scene::ConsolidatedNodeSlot> slots;
+    const auto compacted = Scene::compactConsolidatedSnapshot(*snapshot, slots);
+    ASSERT_NE(compacted, nullptr);
+    ASSERT_EQ(slots.size(), 2u);
+    for (size_t slot = 0; slot < slots.size(); ++slot)
+        EXPECT_EQ(slots[slot].active_sh_degree, degrees[slot + 1]);
+    ASSERT_TRUE(scene.installConsolidatedCompaction(compacted, slots, snapshot->generation));
+    EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), (std::vector<int>{0, 1}));
+    check_models();
+    scene.clear();
+    // Snapshots retain their original ordering and data after later live-scene
+    // deletion, compaction and destruction, including all inactive SH bands.
+    for (const auto* snapshots : {&original_snapshot, &consolidated_snapshot}) {
+        for (size_t i = 0; i < snapshots->size(); ++i) {
+            auto model = (*snapshots)[i].materialize();
+            expect_attrs_match(*model, attributes[i]);
+            EXPECT_EQ(model->get_active_sh_degree(), degrees[i]);
+        }
+    }
+}
+
+namespace {
+    [[nodiscard]] std::unique_ptr<SplatData> make_alias_test_model(float x) {
+        return std::make_unique<SplatData>(
+            1,
+            Tensor::from_vector(std::vector<float>{x, 0.0f, 0.0f, x + 1.0f, 0.0f, 0.0f}, {2, 3}, Device::CPU),
+            Tensor::zeros({2, 1, 3}, Device::CPU),
+            Tensor::zeros({2, 3, 3}, Device::CPU),
+            Tensor::zeros({2, 3}, Device::CPU),
+            Tensor::from_vector(std::vector<float>{1, 0, 0, 0, 1, 0, 0, 0}, {2, 4}, Device::CPU),
+            Tensor::zeros({2, 1}, Device::CPU), 1.0f);
+    }
+} // namespace
+
+TEST(SceneSingleNodeAliasTest, ClearAndSwapDropTheAlias) {
+    Scene scene;
+    ASSERT_NE(scene.addSplat("single", make_alias_test_model(0.0f)), lfs::core::NULL_NODE);
+    ASSERT_NE(scene.getCombinedModel(), nullptr);
+    auto previous = scene.swapNodeModel("single", make_alias_test_model(5.0f));
+    ASSERT_NE(previous, nullptr);
+    EXPECT_NE(scene.peekCombinedModel(), previous.get());
+    previous.reset();
+    (void)scene.getCombinedModel();
+    scene.clear();
+    EXPECT_EQ(scene.peekCombinedModel(), nullptr);
+}
+
+namespace {
+    void checkFrozenMaster(const std::string& name, const Tensor& tensor, const size_t element_size) {
+        const auto cpu = tensor.cpu();
+        const auto* data = static_cast<const unsigned char*>(cpu.data_ptr());
+        const size_t bytes = cpu.numel() * element_size;
+        uint64_t hash = 14695981039346656037ull;
+        for (size_t i = 0; i < bytes; ++i)
+            hash = (hash ^ data[i]) * 1099511628211ull;
+        const auto checksums = std::filesystem::path(PROJECT_ROOT_PATH) / "tests/data/q16_master_checksums.txt";
+        const char* directory = std::getenv("LFS_Q16_MASTER_FIXTURES");
+        if (std::getenv("LFS_Q16_FREEZE")) {
+            ASSERT_NE(directory, nullptr);
+            std::filesystem::create_directories(directory);
+            std::ofstream output(std::filesystem::path(directory) / (name + ".bin"), std::ios::binary);
+            output.write(reinterpret_cast<const char*>(data), bytes);
+            ASSERT_TRUE(output.good());
+            std::ofstream manifest(checksums, std::ios::app);
+            manifest << name << ' ' << bytes << ' ' << hash << '\n';
+            return;
+        }
+        std::ifstream manifest(checksums);
+        ASSERT_TRUE(manifest.good()) << checksums;
+        std::string label;
+        size_t expected_bytes;
+        uint64_t expected_hash;
+        bool found = false;
+        while (manifest >> label >> expected_bytes >> expected_hash) {
+            if (label != name)
+                continue;
+            found = true;
+            EXPECT_EQ(bytes, expected_bytes) << name;
+            EXPECT_EQ(hash, expected_hash) << name;
+            break;
+        }
+        ASSERT_TRUE(found) << name;
+        // Local qualification uses the actual frozen bytes, not a decoder built
+        // with this branch. The committed checksums retain that regression gate.
+        if (directory) {
+            std::ifstream input(std::filesystem::path(directory) / (name + ".bin"), std::ios::binary);
+            ASSERT_TRUE(input.good()) << name;
+            std::vector<unsigned char> expected(bytes);
+            input.read(reinterpret_cast<char*>(expected.data()), bytes);
+            ASSERT_EQ(input.gcount(), bytes);
+            EXPECT_EQ(std::memcmp(data, expected.data(), bytes), 0) << name;
+        }
+    }
+} // namespace
+
+TEST(SceneCombinedEncode, CpuDecodeMatchesFrozenMasterForEveryCode) {
+    std::vector<std::pair<float, float>> bounds;
+    const std::vector<float> grid{-100.f, -1.f, -0.1f, 0.f, 0.1f, 0.9f, 1.f, 100.f};
+    for (const auto lo : grid)
+        for (const auto hi : grid)
+            if (lo <= hi)
+                bounds.emplace_back(lo, hi);
+    std::mt19937 random(2615);
+    for (size_t i = 0; i < 64; ++i) {
+        const float lo = static_cast<int32_t>(random()) / 65536.f;
+        const float hi = static_cast<int32_t>(random()) / 65536.f;
+        bounds.emplace_back(std::min(lo, hi), std::max(lo, hi));
+    }
+    constexpr size_t count = 65536;
+    SplatData model(1, Tensor::zeros({count, 3}, Device::CUDA),
+                    Tensor::zeros({count, 1, 3}, Device::CUDA), Tensor::zeros({count, 3, 3}, Device::CUDA),
+                    Tensor::zeros({count, 3}, Device::CUDA), Tensor::ones({count, 4}, Device::CUDA),
+                    Tensor::zeros({count, 1}, Device::CUDA), 1.f);
+    ASSERT_TRUE(model.apply_shN_value_quant());
+    auto codes = model.shN_raw().cpu();
+    for (size_t row = 0; row < count; ++row)
+        for (size_t c = 0; c < 9; ++c)
+            static_cast<uint16_t*>(codes.data_ptr())[(row / 32) * 9 * 32 + c * 32 + row % 32] = row;
+    model.shN_raw() = codes.cuda();
+    for (size_t i = 0; i < bounds.size(); ++i) {
+        auto limits = model.shN_value_bounds().cpu();
+        for (size_t j = 0; j < limits.numel(); j += 2) {
+            limits.ptr<float>()[j] = bounds[i].first;
+            limits.ptr<float>()[j + 1] = bounds[i].second;
+        }
+        model.shN_value_bounds() = limits.cuda();
+        checkFrozenMaster("decode_" + std::to_string(i), model.shN_canonical_cpu(), sizeof(float));
+        // Exercise the same GPU range decoder used by bands against the frozen
+        // production host bytes, independently of the branch's CPU decoder.
+        cudaStream_t stream{};
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        {
+            lfs::core::CUDAStreamGuard guard(stream);
+            auto decoded = Tensor::empty_exact({lfs::core::sh_swizzled_float_count(count, 3)});
+            lfs::core::sh_value_quant::decode_shN_u16_range_to_float4(
+                static_cast<const uint16_t*>(model.shN_raw().data_ptr()),
+                model.shN_value_bounds().ptr<float>(), decoded.ptr<float>(),
+                0, count, count, 3, stream, true);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            SplatData expanded(1, model.means_raw(), model.sh0_raw(), std::move(decoded),
+                               model.scaling_raw(), model.rotation_raw(), model.opacity_raw(), 1.f,
+                               SplatData::ShNLayout::Swizzled);
+            checkFrozenMaster("decode_" + std::to_string(i), expanded.shN_canonical_cpu(), sizeof(float));
+        }
+        lfs::core::CudaMemoryPool::instance().release_stream(stream);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    }
+}
+
+TEST(SceneCombinedEncode, QuantizedBandsMatchMasterEncodedBytesAndBounds) {
+    const auto allocator = [](lfs::core::TensorShape shape, size_t, lfs::core::DataType dtype, std::string_view) {
+        // Master leaves unused swizzle-tail cells unwritten. Give both paths
+        // identical initial bytes so the comparison includes that padding too.
+        auto result = Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        const size_t bytes = result.numel() * (dtype == lfs::core::DataType::Float16 ? 2 : 4);
+        if (cudaMemsetAsync(result.data_ptr(), 0, bytes, lfs::core::getCurrentCUDAStream()) != cudaSuccess)
+            throw std::runtime_error("Could not initialize identity-test allocation");
+        return result;
+    };
+    const auto bytes_equal = [](const Tensor& actual, const Tensor& expected, size_t element_size, const char* label) {
+        SCOPED_TRACE(label);
+        ASSERT_EQ(actual.dtype(), expected.dtype());
+        ASSERT_EQ(actual.numel(), expected.numel());
+        const auto a = actual.cpu();
+        const auto b = expected.cpu();
+        const auto* left = static_cast<const unsigned char*>(a.data_ptr());
+        const auto* right = static_cast<const unsigned char*>(b.data_ptr());
+        size_t first = 0;
+        while (first < a.numel() * element_size && left[first] == right[first])
+            ++first;
+        EXPECT_EQ(first, a.numel() * element_size) << "first differing byte " << first;
+    };
+    cudaStream_t build_stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&build_stream, cudaStreamNonBlocking), cudaSuccess);
+    cudaStream_t producers[2]{};
+    for (auto& stream : producers)
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    for (const size_t total : {65535u, 65536u, 65537u, 131079u, 327693u}) {
+        SCOPED_TRACE(total);
+        for (const bool include_hidden : {false, true}) {
+            SCOPED_TRACE(include_hidden);
+            for (int source_mode = 0; source_mode < 4; ++source_mode) {
+                SCOPED_TRACE(source_mode); // float, q16, mixed, and the contraction regression
+                Scene scene;
+                for (int degree = 0; degree <= 3; ++degree) {
+                    const size_t prefix = source_mode == 3 ? 255 : 515;
+                    const size_t count = degree == 0 ? prefix : degree == 3 ? total - prefix - 516 - (include_hidden ? 517 : 0)
+                                                                            : 515 + degree;
+                    const size_t rest = (degree + 1) * (degree + 1) - 1;
+                    std::vector<float> coefficients(count * rest * 3);
+                    for (size_t i = 0; i < coefficients.size(); ++i)
+                        coefficients[i] = float(int(i % 199) - 99) / 17.0f;
+                    lfs::core::CUDAStreamGuard producer_guard(producers[degree % 2]);
+                    auto model = std::make_unique<SplatData>(
+                        degree, Tensor::full({count, 3}, float(degree), Device::CUDA),
+                        Tensor::zeros({count, 1, 3}, Device::CUDA),
+                        Tensor::from_vector(coefficients, {count, rest, 3}, Device::CUDA),
+                        Tensor::zeros({count, 3}, Device::CUDA), Tensor::ones({count, 4}, Device::CUDA),
+                        Tensor::zeros({count, 1}, Device::CUDA), 1.0f);
+                    if (rest && (source_mode == 1 || (source_mode >= 2 && degree % 2)))
+                        ASSERT_TRUE(model->apply_shN_value_quant());
+                    if (source_mode == 3 && degree == 1) {
+                        auto codes = model->shN_raw().cpu();
+                        std::fill_n(static_cast<uint16_t*>(codes.data_ptr()), codes.numel(), uint16_t{173});
+                        model->shN_raw() = codes.cuda();
+                        auto bounds = model->shN_value_bounds().cpu();
+                        for (size_t i = 0; i < bounds.numel(); i += 2) {
+                            bounds.ptr<float>()[i] = 0.1f;
+                            bounds.ptr<float>()[i + 1] = 0.9f;
+                        }
+                        model->shN_value_bounds() = bounds.cuda();
+                    }
+                    const auto id = scene.addSplat(std::to_string(degree), std::move(model));
+                    scene.setNodeTransform(id, glm::translate(glm::mat4(1.0f), glm::vec3(degree, degree * 2, -degree)));
+                    if (degree == 2)
+                        scene.setNodeVisibility(id, false);
+                }
+                {
+                    lfs::core::CUDAStreamGuard build_guard(build_stream);
+                    const auto captured = scene.captureCombinedModelBuild(include_hidden);
+                    auto actual = Scene::buildCombinedModelCache(captured.inputs, captured.full_selection_count,
+                                                                 allocator, captured.generation, include_hidden);
+                    // Master decodes each source into one full float aggregate, then
+                    // encodes that aggregate once. No allocator selects that exact path.
+                    auto reference = Scene::buildCombinedModelCache(captured.inputs, captured.full_selection_count,
+                                                                    {}, captured.generation, include_hidden);
+                    ASSERT_FALSE(reference.model->shN_value_quantized());
+                    reference.model->set_tensor_allocator(allocator);
+                    ASSERT_TRUE(reference.model->apply_shN_value_quant());
+                    ASSERT_TRUE(actual.model->shN_value_quantized());
+                    ASSERT_EQ(actual.model->size(), total);
+                    const auto label = "combined_" + std::to_string(total) + "_" + std::to_string(include_hidden) + "_" + std::to_string(source_mode);
+                    checkFrozenMaster(label + "_codes", actual.model->shN_raw(), sizeof(uint16_t));
+                    checkFrozenMaster(label + "_bounds", actual.model->shN_value_bounds(), sizeof(float));
+                    bytes_equal(actual.model->shN_raw(), reference.model->shN_raw(), sizeof(uint16_t), "encoded cells");
+                    bytes_equal(actual.model->shN_value_bounds(), reference.model->shN_value_bounds(), sizeof(float), "bounds");
+                    if (source_mode == 3) {
+                        const auto bounds = actual.model->shN_value_bounds().cpu();
+                        EXPECT_EQ(std::bit_cast<uint32_t>(bounds.ptr<float>()[1]), 0x3dd12005u);
+                    }
+                    bytes_equal(actual.model->means_raw(), reference.model->means_raw(), sizeof(float), "means");
+                    bytes_equal(*actual.transform_indices, *reference.transform_indices, sizeof(int), "transforms");
+                    ASSERT_EQ(bool(actual.visible_selection_indices), bool(reference.visible_selection_indices));
+                    if (actual.visible_selection_indices)
+                        bytes_equal(*actual.visible_selection_indices, *reference.visible_selection_indices, sizeof(int), "selection");
+                    EXPECT_EQ(scene.getNode("2")->visible, false);
+                    EXPECT_EQ(scene.getNode("3")->local_transform.get()[3], glm::vec4(3, 6, -3, 1));
+                }
+            }
+        }
+    }
+    for (auto stream : producers) {
+        lfs::core::CudaMemoryPool::instance().release_stream(stream);
+        EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    }
+    lfs::core::CudaMemoryPool::instance().release_stream(build_stream);
+    EXPECT_EQ(cudaStreamDestroy(build_stream), cudaSuccess);
+}
+
+TEST(SceneCombinedBuild, AllNodeCacheKeepsVisibilityAndSlotMetadataWithoutRebuilding) {
+    for (bool use_worker : {false, true}) {
+        SCOPED_TRACE(use_worker);
+        Scene scene;
+        const auto group = scene.addGroup("group");
+        std::vector<lfs::core::NodeId> ids;
+        for (int i = 0; i < 3; ++i) {
+            auto model = make_alias_test_model(static_cast<float>(i));
+            model->set_active_sh_degree(i % 2);
+            ids.push_back(scene.addSplat(std::to_string(i), std::move(model)));
+            scene.setNodeTransform(std::to_string(i), glm::translate(glm::mat4(1), glm::vec3(i, 0, 0)));
+        }
+        ASSERT_TRUE(scene.reparent(ids[0], group));
+        scene.setNodeVisibility(group, false);
+        std::atomic<int> allocations{0};
+        scene.setCombinedModelAllocator([&](lfs::core::TensorShape shape, size_t, lfs::core::DataType dtype, std::string_view) {
+            ++allocations;
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        });
+        if (use_worker) {
+            scene.requestCombinedModelBuild(true);
+            while (scene.combinedModelBuildPending()) {
+                (void)scene.combinedModelBuildError();
+                std::this_thread::yield();
+            }
+        } else {
+            auto inputs = scene.captureCombinedModelBuild(true);
+            auto built = Scene::buildCombinedModelCache(std::move(inputs.inputs), inputs.full_selection_count,
+                                                        inputs.allocator, inputs.generation, true);
+            ASSERT_TRUE(scene.installCombinedModelCache(std::move(built)));
+        }
+        const auto* combined = scene.getCombinedModel();
+        ASSERT_NE(combined, nullptr);
+        ASSERT_EQ(combined->size(), 6u);
+        const auto indices = scene.getTransformIndices();
+        const auto selection_indices = scene.getVisibleSelectionIndices();
+        const int initial_allocations = allocations.load();
+        EXPECT_FALSE(scene.isConsolidated());
+        for (bool shown : {false, true, false, true}) {
+            scene.setNodeVisibility(group, shown);
+            EXPECT_EQ(scene.getCombinedModel(), combined);
+            EXPECT_FALSE(scene.combinedModelBuildPending());
+            EXPECT_EQ(allocations.load(), initial_allocations);
+            EXPECT_EQ(scene.getTransformIndices(), indices);
+            EXPECT_EQ(scene.getVisibleSelectionIndices(), selection_indices);
+            EXPECT_EQ(scene.getNodeVisibilityMask(), (std::vector<bool>{shown, true, true}));
+            EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), (std::vector<int>{0, 1, 0}));
+            const auto transforms = scene.getVisibleNodeTransforms();
+            ASSERT_EQ(transforms.size(), 3u);
+            for (int i = 0; i < 3; ++i) {
+                EXPECT_EQ(transforms[i][3].x, i);
+                EXPECT_NE(scene.getNodeById(ids[i])->model, nullptr);
+            }
+            const auto slots = scene.getVisibleSplatNodeSlots();
+            ASSERT_EQ(slots.size(), shown ? 3u : 2u);
+            EXPECT_EQ(slots.back().slot_index, 2u);
+            EXPECT_EQ(scene.getVisibleNodeIndex(ids[2]), 2);
+            EXPECT_EQ(scene.getVisibleNodeIndex("2"), 2);
+            EXPECT_EQ(scene.getVisibleNodeIndex(ids[0]), shown ? 0 : -1);
+            EXPECT_EQ(scene.getSelectedNodeMask(std::string("2")), (std::vector<bool>{false, false, true}));
+            EXPECT_EQ(scene.getSelectedNodeMask(std::vector<std::string>{"group", "2"}), (std::vector<bool>{true, false, true}));
+            EXPECT_EQ(scene.getSelectedNodeMask(std::string{}), (std::vector<bool>{false, false, false}));
+        }
+        // A pending replacement must not omit newly added source payloads from exports.
+        std::atomic<bool> release_worker{false};
+        scene.setCombinedModelAllocator([&](lfs::core::TensorShape shape, size_t, lfs::core::DataType dtype, std::string_view) {
+            while (!release_worker.load())
+                std::this_thread::yield();
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        });
+        scene.addSplat("new", make_alias_test_model(3.0f));
+        scene.requestCombinedModelBuild(true);
+        EXPECT_EQ(scene.getVisibleSplatNodeSlots().size(), 4u);
+        release_worker.store(true);
+        while (scene.combinedModelBuildPending()) {
+            (void)scene.combinedModelBuildError();
+            std::this_thread::yield();
+        }
+    }
+}
+
+TEST(SceneCombinedImport, FailedBuildReportsOnceAndAllowsExplicitRetry) {
+    Scene scene;
+    scene.setImportValidation(true);
+    scene.addSplat("first", make_alias_test_model(0.0f));
+    scene.addSplat("second", make_alias_test_model(1.0f));
+    std::atomic<bool> fail{true};
+    scene.setCombinedModelAllocator([&](lfs::core::TensorShape shape, size_t, lfs::core::DataType dtype, std::string_view) -> Tensor {
+        if (fail.load())
+            throw std::runtime_error("allocation failed");
+        return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+    });
+    int failures = 0;
+    std::atomic<int> ready{0};
+    lfs::event::ScopedHandler handler;
+    handler.subscribe<lfs::core::events::state::CombinedModelBuildReady>([&](const auto& event) {
+        if (event.scene == &scene)
+            ++ready;
+    });
+    handler.subscribe<lfs::core::events::state::CombinedModelBuildFailed>([&](const auto&) { ++failures; });
+    scene.requestCombinedModelBuild(true);
+    while (scene.combinedModelBuildPending()) {
+        (void)scene.combinedModelBuildError();
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(failures, 1);
+    EXPECT_EQ(ready.load(), 1);
+    EXPECT_NE(scene.combinedModelBuildError(), "");
+    EXPECT_EQ(scene.getCombinedModel(), nullptr);
+    EXPECT_EQ(scene.getCombinedModel(), nullptr);
+    EXPECT_EQ(failures, 1);
+    fail.store(false);
+    scene.requestCombinedModelBuild(true);
+    while (scene.combinedModelBuildPending()) {
+        (void)scene.combinedModelBuildError();
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(scene.combinedModelBuildError(), "");
+    EXPECT_GE(ready.load(), 2);
+    ASSERT_NE(scene.getCombinedModel(), nullptr);
+    EXPECT_EQ(scene.getCombinedModel()->size(), 4);
+
+    fail.store(true);
+    scene.invalidateCache();
+    scene.requestCombinedModelBuild(true);
+    while (scene.combinedModelBuildPending()) {
+        (void)scene.combinedModelBuildError();
+        std::this_thread::yield();
+    }
+    ASSERT_EQ(failures, 2);
+    ASSERT_EQ(scene.getCombinedModel(), nullptr);
+    fail.store(false);
+    scene.setNodeTransform("first", glm::translate(glm::mat4(1.0f), glm::vec3(1, 2, 3)));
+    EXPECT_EQ(scene.combinedModelBuildError(), "");
+    EXPECT_GE(ready.load(), 2);
+    ASSERT_NE(scene.getCombinedModel(), nullptr);
+    EXPECT_EQ(scene.getCombinedModel()->size(), 4);
+    EXPECT_EQ(failures, 2);
+}
+
+TEST(SceneCombinedImport, OrdinaryBuildFailuresKeepAutomaticRetry) {
+    Scene scene;
+    scene.addSplat("first", make_alias_test_model(0.0f));
+    scene.addSplat("second", make_alias_test_model(1.0f));
+    bool fail = true;
+    scene.setCombinedModelAllocator([&](lfs::core::TensorShape shape, size_t, lfs::core::DataType dtype, std::string_view) -> Tensor {
+        if (fail)
+            throw std::runtime_error("allocation failed");
+        return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+    });
+    scene.requestCombinedModelBuild(true);
+    while (scene.combinedModelBuildPending()) {
+        (void)scene.combinedModelBuildError();
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(scene.combinedModelBuildError().empty());
+    fail = false;
+    ASSERT_NE(scene.getCombinedModel(), nullptr);
+    EXPECT_EQ(scene.getCombinedModel()->size(), 4u);
+}
+
+// Catches a worker that stays silent outside imports: a large multi-node edit such as
+// deleting a node left the viewport without splats until the next input event.
+TEST(SceneCombinedBuild, WorkerCompletionOutsideImportAnnouncesReadyModel) {
+    Scene scene;
+    scene.addSplat("first", make_alias_test_model(0.0f));
+    scene.addSplat("second", make_alias_test_model(1.0f));
+    std::atomic<int> ready{0};
+    lfs::event::ScopedHandler handler;
+    handler.subscribe<lfs::core::events::state::CombinedModelBuildReady>([&](const auto& event) {
+        if (event.scene == &scene)
+            ++ready;
+    });
+    scene.requestCombinedModelBuild(true);
+    while (scene.combinedModelBuildPending()) {
+        (void)scene.combinedModelBuildError();
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(ready.load(), 1);
+    ASSERT_NE(scene.getCombinedModel(), nullptr);
+    EXPECT_EQ(scene.getCombinedModel()->size(), 4);
+}
+
+TEST(SceneCombinedEncode, QuantizedStorageCoversReservedModelCapacity) {
+    using lfs::core::DataType;
+    using lfs::core::TensorShape;
+    for (const size_t total : {1025u, 196615u}) {
+        SCOPED_TRACE(total); // small aggregate and multi-band aggregate
+        Scene scene;
+        for (int i = 0; i < 2; ++i) {
+            const size_t count = i == 0 ? 257 : total - 257;
+            std::vector<float> sh(count * 15 * 3);
+            for (size_t cell = 0; cell < sh.size(); ++cell)
+                sh[cell] = float(int(cell % 127) - 63) / 13.f;
+            auto model = std::make_unique<SplatData>(
+                3, Tensor::zeros({count, 3}, Device::CUDA),
+                Tensor::zeros({count, 1, 3}, Device::CUDA),
+                Tensor::from_vector(sh, {count, 15, 3}, Device::CUDA),
+                Tensor::zeros({count, 3}, Device::CUDA),
+                Tensor::ones({count, 4}, Device::CUDA),
+                Tensor::zeros({count, 1}, Device::CUDA), 1.f);
+            if (i == 0)
+                ASSERT_TRUE(model->apply_shN_value_quant());
+            scene.addSplat(std::to_string(i), std::move(model));
+        }
+        const auto allocate = [](TensorShape shape, size_t capacity, DataType dtype, std::string_view) {
+            return Tensor::zeros_direct(std::move(shape), capacity, Device::CUDA, dtype);
+        };
+        const auto over_reserve = [&](TensorShape shape, size_t capacity, DataType dtype, std::string_view name) {
+            if (name == "SplatData.means")
+                capacity += 65537;
+            return allocate(std::move(shape), capacity, dtype, name);
+        };
+        const auto snapshot = scene.captureCombinedModelBuild();
+        const auto reference = Scene::buildCombinedModelCache(snapshot.inputs, total, allocate);
+        Scene::CombinedModelBuild actual;
+        ASSERT_NO_THROW(actual = Scene::buildCombinedModelCache(snapshot.inputs, total, over_reserve));
+        ASSERT_NE(actual.model, nullptr);
+        ASSERT_TRUE(actual.model->shN_value_quantized());
+        EXPECT_EQ(actual.model->size(), total);
+        const size_t capacity = actual.model->means_raw().capacity();
+        ASSERT_GE(capacity, total + 65537);
+        EXPECT_GE(actual.model->shN_raw().capacity(), lfs::core::sh_value_quant::sh_value_u16_count(capacity, 15));
+        EXPECT_GE(actual.model->shN_value_bounds().capacity(), lfs::core::sh_value_quant::n_bounds_for_prims(capacity) * 2);
+        EXPECT_EQ(actual.model->shN_raw().numel(), lfs::core::sh_value_quant::sh_value_u16_count(total, 15));
+        EXPECT_EQ(actual.model->shN_value_bounds().numel(), lfs::core::sh_value_quant::n_bounds_for_prims(total) * 2);
+        const auto codes = actual.model->shN_raw().cpu();
+        const auto expected_codes = reference.model->shN_raw().cpu();
+        EXPECT_EQ(std::memcmp(codes.data_ptr(), expected_codes.data_ptr(), codes.numel() * sizeof(uint16_t)), 0);
+        const auto bounds = actual.model->shN_value_bounds().cpu();
+        const auto expected_bounds = reference.model->shN_value_bounds().cpu();
+        EXPECT_EQ(std::memcmp(bounds.data_ptr(), expected_bounds.data_ptr(), bounds.numel() * sizeof(float)), 0);
+    }
+}

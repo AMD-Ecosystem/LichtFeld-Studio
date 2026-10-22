@@ -8,11 +8,13 @@
 #include "gui/panel_registry.hpp"
 #include "rml_im_mode_layout.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <nanobind/nanobind.h>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace nb = nanobind;
 
@@ -27,30 +29,46 @@ namespace lfs::vis::gui {
         RmlPythonPanelAdapter(void* manager, nb::object panel_instance,
                               const std::string& context_name, const std::string& rml_path,
                               const std::string& style = {}, bool has_poll = false,
-                              int height_mode = 0, bool has_draw = false);
+                              int height_mode = 0, bool has_draw = false, bool floating = false);
         ~RmlPythonPanelAdapter() override;
 
+        bool onViewportDrop(const std::string& type, const std::string& data) override;
         void draw(const PanelDrawContext& ctx) override;
         bool poll(const PanelDrawContext& ctx) override;
+        void setPollVisibility(bool visible) override;
+        bool isVisibleForAnimation() const override;
+        void on_visibility_changed(bool visible) override;
+        void on_layout_changed() override;
+        void on_content_changed() override;
         void preload(const PanelDrawContext& ctx) override;
-        void preloadDirect(float w, float h, const PanelDrawContext& ctx,
-                           float clip_y_min, float clip_y_max,
-                           const PanelInputState* input) override;
-        bool supportsDirectDraw() const override { return true; }
-        void drawDirect(float x, float y, float w, float h, const PanelDrawContext& ctx) override;
-        bool drawDirectCached(float x, float y, float w, float h,
-                              const PanelDrawContext& ctx) override;
-        float getDirectDrawHeight() const override;
-        void setInputClipY(float y_min, float y_max) override;
-        void setInput(const PanelInputState* input) override;
-        void setForcedHeight(float h) override;
-        bool wantsKeyboard() const override;
+        PanelRenderCapabilities renderCapabilities() const override {
+            return {.direct = true};
+        }
+        PanelDirectRenderResult renderDirect(const PanelDirectRenderRequest& request,
+                                             const PanelDrawContext& ctx) override;
         bool needsAnimationFrame() const override;
-        bool wantsExternalFloatingShadow() const override { return !foreground_; }
+        bool needsImmediateAnimationFrame() const override;
+        std::string animationDemandDescription() const override;
+        std::optional<double> nextScheduledAnimationDelay() const override;
         void reloadRmlResources() override;
+        [[nodiscard]] std::string captureChromeJson() const override;
+        void applyChromeJson(std::string_view json) override;
         void setForeground(bool fg);
+        SDL_Window* nativeWindow() const override;
+        bool detachToDesktop(float x, float y, float w, float h) override;
+        bool restoreDesktopWindow() override;
+        void releaseDesktopWindow() override;
+        void resetDesktopRestoreState() override {
+            desktop_reopen_bounds_.reset();
+            desktop_restore_checked_ = false;
+        }
+        [[nodiscard]] nb::object panelInstance() const { return panel_instance_; }
 
     private:
+        bool detachHost(float x, float y, float w, float h, bool desktop_coordinates);
+        bool desktop_restore_checked_ = false;
+        std::optional<std::array<float, 4>> desktop_reopen_bounds_;
+        std::optional<float> desktop_reopen_scroll_;
         enum class LifecycleState : uint8_t {
             AwaitingModelBind,
             BindingModel,
@@ -71,6 +89,17 @@ namespace lfs::vis::gui {
         void setLifecycleState(LifecycleState next_state);
         void resetLifecycle();
         void syncDirectLayout(float w, float h);
+        void preloadDirect(float w, float h, const PanelDrawContext& ctx,
+                           float clip_y_min, float clip_y_max,
+                           const PanelInputState* input);
+        void drawDirect(float x, float y, float w, float h, const PanelDrawContext& ctx);
+        bool drawDirectCached(float x, float y, float w, float h,
+                              const PanelDrawContext& ctx);
+        float getDirectDrawHeight() const;
+        void setInput(const PanelInputState* input);
+        void setInputClipY(float y_min, float y_max);
+        void setForcedHeight(float h);
+        void setPanelSpace(PanelSpace space);
         void drawImmediateLayout(Rml::ElementDocument* doc, const PanelDrawContext* ctx);
         Rml::ElementDocument* prepareForRender(const PanelDrawContext* ctx);
         std::chrono::milliseconds updateInterval() const;
@@ -88,9 +117,16 @@ namespace lfs::vis::gui {
         bool has_draw_ = false;
         int height_mode_ = 0;
         bool foreground_ = false;
+        bool floating_ = false;
+        bool poll_visible_ = true;
+        bool enabled_visible_ = true;
         uint64_t last_scene_gen_ = 0;
         uint64_t last_prepare_frame_ = 0;
-        bool content_dirty_ = false;
+        bool content_dirty_ = true;
+        float layout_width_ = -1.0f;
+        float layout_height_ = -1.0f;
+        float layout_scale_ = -1.0f;
+        float layout_forced_height_ = -1.0f;
         bool has_update_interval_ = false;
         bool dirty_driven_updates_ = false;
         bool warned_non_bool_scene_changed_ = false;
@@ -98,6 +134,7 @@ namespace lfs::vis::gui {
         int update_interval_ms_ = 100;
         std::chrono::steady_clock::time_point next_update_at_{};
         std::string last_language_;
+        std::uint64_t last_language_generation_ = 0;
         lfs::python::RmlImModeLayout layout_;
         std::optional<PanelInputState> current_input_;
         float prev_mouse_x_ = 0.0f;

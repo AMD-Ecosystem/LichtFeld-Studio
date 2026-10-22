@@ -18,6 +18,30 @@
 #define TILE_WIDTH 16
 #define TILE_SIZE (TILE_HEIGHT*TILE_WIDTH)
 
+#define RASTER_BATCH_SIZE 1024u
+#define RASTER_DENSE_TILE_THRESHOLD RASTER_BATCH_SIZE
+
+// HiGS macro-tile pipeline. Mirrors config.h; the tile count per macro tile
+// must equal SUBGROUP_SIZE (ballot transpose carries one tile per lane).
+// The HiGS chain rasterizes 8x8 px render tiles (the paper's preferred
+// geometry; macro tile = 64x32 px) independent of the legacy 16x16 grid.
+#define HIGS_MACRO_TILE_WIDTH_TILES 8u
+#define HIGS_MACRO_TILE_HEIGHT_TILES 4u
+#define HIGS_MACRO_TILE_SIZE_TILES (HIGS_MACRO_TILE_WIDTH_TILES * HIGS_MACRO_TILE_HEIGHT_TILES)
+#define HIGS_TILE_WIDTH 8u
+#define HIGS_TILE_HEIGHT 8u
+#define HIGS_TILE_SIZE (HIGS_TILE_WIDTH * HIGS_TILE_HEIGHT)
+#define HIGS_DEPTH_SAMPLE_TILE_SIZE 4
+#define HIGS_REPLAY_MASK_WORDS_PER_BATCH ((RASTER_BATCH_SIZE / SUBGROUP_SIZE) * HIGS_MACRO_TILE_SIZE_TILES)
+// Macro-tile extent in legacy 16px-tile units (projection rects use that grid).
+#define HIGS_MACRO_T16_W ((HIGS_MACRO_TILE_WIDTH_TILES * HIGS_TILE_WIDTH) / TILE_WIDTH)
+#define HIGS_MACRO_T16_H ((HIGS_MACRO_TILE_HEIGHT_TILES * HIGS_TILE_HEIGHT) / TILE_HEIGHT)
+#define HIGS_RASTER_WAVE_BATCHES 16384u
+#define HIGS_RASTER_MAX_WAVES 64u
+// Drain ring buffer: per-warp shared queue of compacted splat indices,
+// blended in dense batches of this size (reference Bd = 64).
+#define HIGS_DRAIN_BATCH 64u
+
 // 0: none
 // 1: gsplat
 // 2: all nonzero
@@ -65,18 +89,9 @@
 #define MAX_RAW_SCALE 20.0f
 
 // subtile culling in rasterization
-#if TILE_HEIGHT >= 16 && TILE_WIDTH >= 16
-    #define SUBTILE_HEIGHT 4
-    #define SUBTILE_WIDTH 8
-#else
-    #define SUBTILE_HEIGHT 0
-    #define SUBTILE_WIDTH 0
-#endif
+#define SUBTILE_HEIGHT 0
+#define SUBTILE_WIDTH 0
 #define SUBTILE_SIZE (SUBTILE_HEIGHT*SUBTILE_WIDTH)
-
-
-// optional, not in Inria or GSplat
-#define NORMALIZE_QUATS_IN_OPTIMIZER 0
 
 
 static const float M_PI = 3.14159265358979;

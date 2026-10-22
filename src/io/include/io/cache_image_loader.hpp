@@ -6,6 +6,7 @@
 
 #include "core/export.hpp"
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,7 @@ namespace lfs::core {
 } // namespace lfs::core
 
 namespace lfs::io {
+    struct MaskedImageFill;
 
     // Memory info
     std::size_t get_total_physical_memory();
@@ -34,7 +36,6 @@ namespace lfs::io {
     inline constexpr float DEFAULT_MIN_FREE_GB = 1.0f;
     inline constexpr int DEFAULT_PRINT_STATUS_FREQ = 500;
     inline constexpr int DEFAULT_DECODER_POOL_SIZE = 8;
-    inline constexpr std::string_view CACHE_PREFIX = "lfs_cache_";
 
     struct LoadParams {
         int resize_factor = 1;
@@ -42,7 +43,36 @@ namespace lfs::io {
         void* cuda_stream = nullptr;
         const lfs::core::UndistortParams* undistort = nullptr;
         bool output_uint8 = false;
+        bool skip_blob_cache = false;
+        // Keeps 16-bit samples for this request even when the loader decodes 8-bit by default.
+        bool decode_16bit = false;
+        // Keeps floating-point files (EXR, float TIFF) at float precision instead of an integer decode.
+        bool decode_float = false;
+        bool mask_grayscale = false;
+        // Cold staging only; never stored in queued requests or cache entries.
+        const MaskedImageFill* masked_fill = nullptr;
     };
+
+    // CPU decode at native resolution, then the same GPU Lanczos downscale the nvImageCodec
+    // path uses. Returns [3, H, W] in the requested dtype; decode_16bit keeps 16-bit samples
+    // until the GPU conversion.
+    LFS_IO_API lfs::core::Tensor load_rgb_image_cpu_decoded(
+        const std::filesystem::path& path, const LoadParams& params, bool decode_16bit = false);
+    // Standard mask luminance uses bytes; TIFF keeps source precision until the
+    // same downstream byte-grid step used by Camera and the training pipeline.
+    // Returns Float32 [1,H,W].
+    LFS_IO_API lfs::core::Tensor load_mask_image_cpu_decoded(
+        const std::filesystem::path& path, const LoadParams& params);
+    // The upload and resize half of load_rgb_image_cpu_decoded, for RGB pixels already decoded on the host by
+    // lfs::core::load_image (8-bit) or lfs::core::load_image_u16 (16-bit).
+    LFS_IO_API lfs::core::Tensor upload_rgb_image(const unsigned char* data, int width, int height, int channels,
+                                                  const LoadParams& params);
+    LFS_IO_API lfs::core::Tensor upload_rgb_image(const std::uint16_t* data, int width, int height, int channels,
+                                                  const LoadParams& params);
+    // Same for RGBA sources; returns float32 [4, H, W] with alpha in [0, 1].
+    LFS_IO_API lfs::core::Tensor load_rgba_image_cpu_decoded(
+        const std::filesystem::path& path, int resize_factor, int max_width, void* cuda_stream = nullptr,
+        bool decode_16bit = false, bool exact_mask_alpha = false, const MaskedImageFill* masked_fill = nullptr);
 
     struct CachedImageData {
         std::shared_ptr<lfs::core::Tensor> tensor;
@@ -65,8 +95,7 @@ namespace lfs::io {
     public:
         enum class CacheMode { Undetermined,
                                NoCache,
-                               CPU_memory,
-                               FileSystem };
+                               CPU_memory };
         enum class NvImageCodecMode { Undetermined,
                                       Available,
                                       UnAvailable };
@@ -74,31 +103,25 @@ namespace lfs::io {
         CacheLoader(const CacheLoader&) = delete;
         CacheLoader& operator=(const CacheLoader&) = delete;
 
-        static CacheLoader& getInstance(bool use_cpu_memory, bool use_fs_cache);
+        static CacheLoader& getInstance(bool use_cpu_memory);
         static CacheLoader& getInstance();
         static bool hasInstance() { return instance_ != nullptr; }
 
         [[nodiscard]] lfs::core::Tensor load_cached_image(const std::filesystem::path& path, const LoadParams& params);
 
-        void create_new_cache_folder();
         void reset_cache();
-        void clean_cache_folders();
         void clear_cpu_cache();
 
-        void update_cache_params(bool use_cpu_memory, bool use_fs_cache, int num_expected_images,
+        void update_cache_params(bool use_cpu_memory, int num_expected_images,
                                  float min_cpu_free_GB, float min_cpu_free_memory_ratio,
                                  bool print_cache_status, int print_status_freq_num);
 
         [[nodiscard]] CacheMode get_cache_mode() const { return cache_mode_; }
-        void set_num_expected_images(int num_expected_images) { num_expected_images_ = num_expected_images; }
-
-        static std::string to_string(CacheMode mode);
 
     private:
-        CacheLoader(bool use_cpu_memory, bool use_fs_cache);
+        explicit CacheLoader(bool use_cpu_memory);
 
         [[nodiscard]] lfs::core::Tensor load_cached_image_from_cpu(const std::filesystem::path& path, const LoadParams& params);
-        [[nodiscard]] lfs::core::Tensor load_cached_image_from_fs(const std::filesystem::path& path, const LoadParams& params);
         [[nodiscard]] lfs::core::Tensor load_jpeg_with_hardware_decode(const std::filesystem::path& path, const LoadParams& params);
 
         [[nodiscard]] std::string generate_cache_key(
@@ -134,12 +157,6 @@ namespace lfs::io {
         std::mutex jpeg_blob_mutex_;
         std::set<std::string> jpeg_being_loaded_;
 
-        // FS cache
-        std::filesystem::path cache_folder_;
-        bool use_fs_cache_;
-        std::mutex cache_mutex_;
-        std::set<std::string> image_being_saved_;
-
         // Status
         mutable std::mutex counter_mutex_;
         bool print_cache_status_ = true;
@@ -147,6 +164,7 @@ namespace lfs::io {
         int print_status_freq_num_ = DEFAULT_PRINT_STATUS_FREQ;
 
         CacheMode cache_mode_ = CacheMode::Undetermined;
+        std::mutex cache_mode_mutex_;
         int num_expected_images_ = 0;
         NvImageCodecMode nv_image_codec_available_ = NvImageCodecMode::Undetermined;
         std::mutex nvcodec_mutex_;

@@ -11,15 +11,18 @@
 
 #include "formats/nurec_usdz.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
+#include "core/provenance.hpp"
 #include "core/tensor.hpp"
+#include "formats/archive_member_names.hpp"
+#include "formats/usd_flat/half.hpp"
 #include "io/atomic_output.hpp"
 #include "io/error.hpp"
 #include "io/exporter.hpp"
 #include <archive.h>
 #include <archive_entry.h>
 #include <nlohmann/json.hpp>
-#include <pxr/base/gf/half.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -30,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -83,7 +87,7 @@ namespace lfs::io {
         };
 
         std::string normalized_extension(const std::filesystem::path& path) {
-            auto extension = path.extension().string();
+            auto extension = lfs::core::path_to_utf8(path.extension());
             std::transform(extension.begin(), extension.end(), extension.begin(), [](const unsigned char c) {
                 return static_cast<char>(std::tolower(c));
             });
@@ -95,6 +99,28 @@ namespace lfs::io {
                 return "0";
             }
             return std::format("{:.9g}", value);
+        }
+
+        std::string escape_usda_string(const std::string_view input) {
+            std::string out;
+            out.reserve(input.size() + 8);
+            for (const char ch : input) {
+                if (ch == '\\' || ch == '"')
+                    out.push_back('\\');
+                out.push_back(ch);
+            }
+            return out;
+        }
+
+        void write_custom_layer_data(std::ostringstream& out,
+                                     const std::optional<std::string>& provenance_json) {
+            out << "    customLayerData = {\n";
+            out << kRenderSettingsBlock;
+            if (provenance_json) {
+                out << "        string lichtfeld_provenance = \""
+                    << escape_usda_string(*provenance_json) << "\"\n";
+            }
+            out << "    }\n";
         }
 
         std::expected<std::vector<uint8_t>, std::string> gzip_compress(const std::vector<uint8_t>& input) {
@@ -164,8 +190,7 @@ namespace lfs::io {
             Json::binary_t bytes;
             bytes.resize(cpu.numel() * sizeof(uint16_t));
             for (size_t index = 0; index < cpu.numel(); ++index) {
-                const pxr::GfHalf half(values[index]);
-                const uint16_t bits = half.bits();
+                const uint16_t bits = usd_flat::float_to_half(values[index]);
                 bytes[index * 2 + 0] = static_cast<std::uint8_t>(bits & 0xFFu);
                 bytes[index * 2 + 1] = static_cast<std::uint8_t>((bits >> 8u) & 0xFFu);
             }
@@ -328,13 +353,11 @@ namespace lfs::io {
             return payload;
         }
 
-        std::string render_default_usda() {
+        std::string render_default_usda(const std::optional<std::string>& provenance_json = {}) {
             std::ostringstream out;
             out << "#usda 1.0\n";
             out << "(\n";
-            out << "    customLayerData = {\n";
-            out << kRenderSettingsBlock;
-            out << "    }\n";
+            write_custom_layer_data(out, provenance_json);
             out << "    defaultPrim = \"World\"\n";
             out << "    metersPerUnit = 1\n";
             out << "    upAxis = \"Z\"\n";
@@ -352,13 +375,12 @@ namespace lfs::io {
 
         std::string render_gauss_usda(const std::string& nurec_filename,
                                       const std::array<float, 3>& min_bounds,
-                                      const std::array<float, 3>& max_bounds) {
+                                      const std::array<float, 3>& max_bounds,
+                                      const std::optional<std::string>& provenance_json = {}) {
             std::ostringstream out;
             out << "#usda 1.0\n";
             out << "(\n";
-            out << "    customLayerData = {\n";
-            out << kRenderSettingsBlock;
-            out << "    }\n";
+            write_custom_layer_data(out, provenance_json);
             out << "    defaultPrim = \"World\"\n";
             out << "    metersPerUnit = 1\n";
             out << "    upAxis = \"Z\"\n";
@@ -411,7 +433,7 @@ namespace lfs::io {
             archive_read_support_filter_all(archive);
 
 #ifdef _WIN32
-            const int open_result = archive_read_open_filename_w(archive, filepath.wstring().c_str(), 10240);
+            const int open_result = archive_read_open_filename_w(archive, lfs::core::native_fs::native_path(filepath.wstring().c_str()).c_str(), 10240);
 #else
             const int open_result = archive_read_open_filename(archive, filepath.c_str(), 10240);
 #endif
@@ -424,7 +446,7 @@ namespace lfs::io {
             UsdzEntries entries;
             struct archive_entry* entry = nullptr;
             while (archive_read_next_header(archive, &entry) == ARCHIVE_OK) {
-                const char* entry_name = archive_entry_pathname(entry);
+                const char* entry_name = archive_member_name(entry);
                 if (!entry_name) {
                     archive_read_free(archive);
                     return std::unexpected("USDZ archive entry is missing a path name");
@@ -456,7 +478,8 @@ namespace lfs::io {
                 }
 
                 archive_write_add_filter_none(archive_);
-                if (archive_write_set_format_zip(archive_) != ARCHIVE_OK) {
+                if (archive_write_set_format_zip(archive_) != ARCHIVE_OK ||
+                    !use_utf8_zip_member_names(archive_)) {
                     const std::string error = archive_error_string(archive_) ? archive_error_string(archive_) : "unknown error";
                     archive_write_free(archive_);
                     archive_ = nullptr;
@@ -465,7 +488,7 @@ namespace lfs::io {
                 archive_write_set_options(archive_, "zip:compression=store");
 
 #ifdef _WIN32
-                const int open_result = archive_write_open_filename_w(archive_, output_path.wstring().c_str());
+                const int open_result = archive_write_open_filename_w(archive_, lfs::core::native_fs::native_path(output_path.wstring().c_str()).c_str());
 #else
                 const int open_result = archive_write_open_filename(archive_, output_path.c_str());
 #endif
@@ -507,7 +530,7 @@ namespace lfs::io {
                     return std::unexpected("Failed to allocate archive entry");
                 }
 
-                archive_entry_set_pathname(entry, filename.c_str());
+                set_archive_member_name(entry, filename.c_str());
                 archive_entry_set_size(entry, static_cast<la_int64_t>(data.size()));
                 archive_entry_set_filetype(entry, AE_IFREG);
                 archive_entry_set_perm(entry, 0644);
@@ -539,7 +562,7 @@ namespace lfs::io {
         std::expected<std::string, std::string> find_nurec_entry(const UsdzEntries& entries) {
             std::vector<std::string> candidates;
             for (const auto& [name, _] : entries.files) {
-                const auto extension = normalized_extension(std::filesystem::path(name));
+                const auto extension = normalized_extension(lfs::core::utf8_to_path(name));
                 if (extension == ".nurec") {
                     candidates.push_back(name);
                 }
@@ -639,9 +662,7 @@ namespace lfs::io {
             for (size_t index = 0; index < element_count; ++index) {
                 const uint16_t bits = static_cast<uint16_t>(binary[index * 2 + 0]) |
                                       (static_cast<uint16_t>(binary[index * 2 + 1]) << 8u);
-                pxr::GfHalf half_value;
-                half_value.setBits(bits);
-                output[index] = static_cast<float>(half_value);
+                output[index] = usd_flat::half_to_float(bits);
             }
             return output;
         }
@@ -752,7 +773,7 @@ namespace lfs::io {
 
         size_t match_count = 0;
         for (const auto& [name, _] : entries->files) {
-            if (normalized_extension(std::filesystem::path(name)) == ".nurec") {
+            if (normalized_extension(lfs::core::utf8_to_path(name)) == ".nurec") {
                 ++match_count;
                 if (match_count > 1) {
                     return std::unexpected("USDZ archive contains multiple .nurec payloads");
@@ -791,7 +812,12 @@ namespace lfs::io {
         return build_splat_from_payload(*payload);
     }
 
-    Result<void> save_nurec_usdz(const SplatData& splat_data, const NurecUsdzSaveOptions& options) {
+    Result<void> save_nurec_usdz(const SplatData& splat_data, const NurecUsdzSaveOptions& options_in) {
+        NurecUsdzSaveOptions options = options_in;
+        if (!options.provenance) {
+            options.provenance = core::make_minimal_provenance_stamp();
+        }
+
         if (!report_export_progress(options.progress_callback, 0.0f, "Preparing USDZ")) {
             return make_error(ErrorCode::CANCELLED, "NuRec USDZ export cancelled", options.output_path);
         }
@@ -861,9 +887,13 @@ namespace lfs::io {
             }
         }
 
-        const std::string nurec_filename = std::format("{}.nurec", options.output_path.stem().string());
-        const std::string default_usda = render_default_usda();
-        const std::string gauss_usda = render_gauss_usda(nurec_filename, min_bounds, max_bounds);
+        const std::string nurec_filename = std::format("{}.nurec", lfs::core::path_to_utf8(options.output_path.stem()));
+        std::optional<std::string> provenance_json;
+        if (options.provenance) {
+            provenance_json = core::provenance_to_json(*options.provenance);
+        }
+        const std::string default_usda = render_default_usda(provenance_json);
+        const std::string gauss_usda = render_gauss_usda(nurec_filename, min_bounds, max_bounds, provenance_json);
 
         const std::uintmax_t estimated_size = default_usda.size() + gauss_usda.size() + nurec_bytes->size() + 4096;
         if (auto space_check = check_disk_space(options.output_path, estimated_size, 1.05f); !space_check) {

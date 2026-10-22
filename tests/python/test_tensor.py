@@ -46,6 +46,60 @@ class TestTensorCreation:
         assert not t.is_cuda
 
 
+class TestTensorRuntimePrimitives:
+    """Tensor behaviors used by NumPy-free Python and UI workflows."""
+
+    def test_sort_returns_values_and_int64_indices(self, lf):
+        values = lf.Tensor.zeros([5], dtype="float32", device="cpu")
+        for index, value in enumerate([3.0, 1.0, 4.0, 1.5, 2.0]):
+            values[index] = value
+
+        sorted_values, sorted_indices = values.sort(0, False)
+
+        assert sorted_values.dtype == "float32"
+        assert sorted_indices.dtype == "int64"
+        assert sorted_values.shape == (5,)
+        assert sorted_indices.shape == (5,)
+        assert [sorted_values[i].item() for i in range(5)] == [
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+        ]
+        assert [sorted_indices[i].int_() for i in range(5)] == [1, 3, 4, 0, 2]
+
+    def test_uint8_selection_assignment_from_bool_mask(self, lf):
+        mask = lf.Tensor.zeros([5], dtype="bool", device="cpu")
+        mask[1] = 1
+        mask[3] = 1
+        selection = lf.Tensor.zeros([5], dtype="uint8", device="cpu")
+
+        selection[mask] = 2
+
+        assert selection.tolist() == [0, 2, 0, 2, 0]
+
+    def test_tolist_and_count_nonzero(self, lf):
+        values = lf.Tensor.zeros([4], dtype="int32", device="cpu")
+        values[0] = 2
+        values[2] = 5
+
+        assert values.tolist() == [2, 0, 5, 0]
+        assert values.count_nonzero() == 2
+
+    def test_index_add_counts_occurrences(self, lf):
+        counts = lf.Tensor.zeros([4], dtype="int32", device="cpu")
+        indices = lf.Tensor.zeros([4], dtype="int32", device="cpu")
+        for index, value in enumerate([0, 2, 2, 3]):
+            indices[index] = value
+
+        counts.index_add_(
+            0, indices, lf.Tensor.ones([4], dtype="int32", device="cpu")
+        )
+
+        assert counts.tolist() == [1, 0, 2, 1]
+
+
 class TestTensorArithmetic:
     """Tests for tensor arithmetic operations."""
 
@@ -259,6 +313,34 @@ class TestTensorNumpy:
         as_array = numpy.asarray(t)
         numpy.testing.assert_allclose(as_array, arr)
 
+    @pytest.mark.parametrize("shape", [(3,), (2, 3), (2, 2, 2)])
+    @pytest.mark.parametrize("copy", [True, False], ids=["copy", "zero-copy"])
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_float16_numpy_export(self, lf, numpy, gpu_available, shape, copy, device):
+        if device == "cuda" and not gpu_available:
+            pytest.skip("GPU not available")
+
+        values = numpy.arange(1, numpy.prod(shape) + 1, dtype=numpy.float32).reshape(shape)
+        tensor = lf.Tensor.from_numpy(values).to("float16")
+        if device == "cuda":
+            tensor = tensor.cuda()
+
+        result = tensor.numpy(copy=copy)
+
+        assert result.shape == shape
+        assert result.dtype == numpy.float16
+        numpy.testing.assert_array_equal(result, values.astype(numpy.float16))
+
+    @pytest.mark.parametrize("copy", [True, False], ids=["copy", "zero-copy"])
+    def test_numpy_exports_bool_dtype(self, lf, numpy, copy):
+        values = numpy.array([False, True, True])
+        tensor = lf.Tensor.from_numpy(values)
+
+        result = tensor.numpy(copy=copy)
+
+        assert result.dtype == numpy.dtype(numpy.bool_)
+        numpy.testing.assert_array_equal(result, values)
+
 
 class TestTensorElementwise:
     """Tests for elementwise operations."""
@@ -379,3 +461,22 @@ class TestTensorGPU:
         expected = numpy.array([4.0, 6.0], dtype=numpy.float32)
 
         numpy.testing.assert_allclose(result.cpu().numpy(), expected)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+def test_half_clamp_preserves_dtype_and_values(lf, numpy, device, request):
+    if device == "cuda" and not request.getfixturevalue("gpu_available"):
+        pytest.skip("GPU not available")
+    values = numpy.array([-numpy.inf, -2, 0.5, 2, numpy.inf, numpy.nan], dtype=numpy.float32)
+    tensor = lf.Tensor.from_numpy(values).to("float16")
+    if device == "cuda":
+        tensor = tensor.cuda()
+    result = tensor.clamp(-1, 1)
+    assert result.dtype == "float16"
+    numpy.testing.assert_equal(
+        result.to("float32").cpu().numpy(),
+        numpy.array([-1, -1, 0.5, 1, 1, numpy.nan], dtype=numpy.float16),
+    )
+    numpy.testing.assert_equal(tensor.to("float32").cpu().numpy(), values)

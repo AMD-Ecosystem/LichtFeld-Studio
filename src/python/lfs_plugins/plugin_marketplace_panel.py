@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
+from _lfs_path_io import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import lichtfeld as lf
@@ -18,20 +18,25 @@ from .marketplace import (
     MarketplacePluginEntry,
     PluginMarketplaceCatalog,
 )
+from .localization import localized_count, safe_format
+from .marketplace_preferences import (
+    read_preferences as read_marketplace_preferences,
+    set_preference as set_marketplace_preference,
+)
 from .plugin import PluginInfo, PluginState
 from .types import Panel
+from .panels import panel_class
+from .rml_keys import KI_ESCAPE, KI_RETURN
 from .ui import RuntimeState
 
 __lfs_panel_classes__ = ["PluginMarketplacePanel"]
 __lfs_panel_ids__ = ["lfs.plugin_marketplace"]
 
-MAX_OUTPUT_LINES = 100
 SUCCESS_DISMISS_SEC = 3.0
 ERROR_DISMISS_SEC = 5.0
 _CARD_GAP_DP = 12
 _CARD_MIN_WIDTH_DP = 220
-_GRID_SIDE_MARGIN_DP = 20
-_SCROLLBAR_GUTTER_DP = 16
+_MAX_CARD_DESCRIPTION_CHARS = 90
 
 _PHASE_MILESTONES: List[Tuple[str, float]] = [
     ("cloning", 0.05),
@@ -57,28 +62,23 @@ class CardOpPhase(Enum):
     IN_PROGRESS = "in_progress"
     SUCCESS = "success"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 @dataclass
 class CardOpState:
     phase: CardOpPhase = CardOpPhase.IDLE
     message: str = ""
+    warning: str = ""
     progress: float = 0.0
-    output_lines: List[str] = field(default_factory=list)
     finished_at: float = 0.0
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    cancellable: bool = False
 
 
+@panel_class("plugin_marketplace")
 class PluginMarketplacePanel(Panel):
     """Floating plugin window for browsing, installing, and managing plugins."""
-
-    id = "lfs.plugin_marketplace"
-    label = "Plugin Marketplace"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 91
-    template = "rmlui/plugin_marketplace.rml"
-    height_mode = lf.ui.PanelHeightMode.FILL
-    size = (770, 560)
-    update_policy = "dirty"
 
     def __init__(self):
         self._catalog = PluginMarketplaceCatalog()
@@ -87,12 +87,14 @@ class PluginMarketplacePanel(Panel):
         self._install_filter_idx = 0
         self._sort_idx = 2
         self._git_available = shutil.which("git") is not None
-        self._git_checkout_selected: Dict[str, bool] = {}
 
         self._card_ops: Dict[str, CardOpState] = {}
         self._lock = threading.RLock()
         self._pending_uninstall_name = ""
         self._pending_uninstall_card_id = ""
+        self._confirm_is_open = False
+        self._confirm_restore_manual_focus = False
+        self._manual_url_focused = False
 
         self._discover_cache: Optional[List[PluginInfo]] = None
 
@@ -100,24 +102,30 @@ class PluginMarketplacePanel(Panel):
         self._handle = None
         self._last_card_phases: Dict[str, Tuple] = {}
         self._entries_dirty = True
+        self._installed_state_dirty = False
         self._needs_resort = True
         self._prev_snapshot_key: Optional[Tuple] = None
         self._cached_entries: List[MarketplacePluginEntry] = []
         self._cached_card_records: List[Dict[str, object]] = []
         self._cached_card_ids: List[str] = []
-        self._cached_installed_lookup: Dict[str, str] = {}
-        self._cached_installed_versions: Dict[str, str] = {}
-        self._cached_installed_names: Set[str] = set()
         self._formats_open = False
+        self._manual_open = False
         self._expanded_list_rows: Set[str] = set()
         self._collapsed_auto_list_rows: Set[str] = set()
-        self._view_mode = _VIEW_MODE_LIST
+        self._view_mode = read_marketplace_preferences()["view"]
         self._last_lang = ""
         self._last_grid_signature: Optional[Tuple] = None
+        self._last_catalog_status_signature: Optional[Tuple[str, str]] = None
+        self._pending_scroll_restore = None
         self._escape_revert = w.EscapeRevertController()
         self._reactive_unsubscribers = []
         self._model_update_scheduled = False
         self._dismiss_timers = {}
+
+        from .manager import PluginManager
+
+        self._plugin_manager = PluginManager.instance()
+        self._manager_callbacks_registered = False
 
         set_catalog_on_change = getattr(self._catalog, "set_on_change", None)
         if callable(set_catalog_on_change):
@@ -150,11 +158,13 @@ class PluginMarketplacePanel(Panel):
             self._set_sort_idx,
         )
 
+        model.bind_func("view_is_card", lambda: self._view_mode == _VIEW_MODE_CARD)
+        model.bind_func("view_is_list", lambda: self._view_mode == _VIEW_MODE_LIST)
+        model.bind_event("view_cards", lambda *_: self._select_view_mode(_VIEW_MODE_CARD))
+        model.bind_event("view_list", lambda *_: self._select_view_mode(_VIEW_MODE_LIST))
         model.bind_event("do_install_url", self._on_manual_form_submit)
         model.bind_event("confirm_yes", self._on_confirm_yes)
         model.bind_event("confirm_no", self._on_confirm_no)
-        model.bind_event("view_cards", self._on_view_cards)
-        model.bind_event("view_list", self._on_view_list)
 
         self._handle = model.get_handle()
 
@@ -178,19 +188,33 @@ class PluginMarketplacePanel(Panel):
             self._sort_idx = idx
             self._entries_dirty = True
             self._needs_resort = True
+            self._ensure_loaded()
             self._request_model_update()
 
     # ── Lifecycle ─────────────────────────────────────────────
 
     def on_mount(self, doc):
         super().on_mount(doc)
+        self._subscribe_manager_callbacks()
         self._doc = doc
         self._last_lang = lf.ui.get_current_language()
         self._entries_dirty = True
+        # Plugin lifecycle events are not observed while the panel is closed.
+        self._discover_cache = None
+        self._installed_state_dirty = True
         self._last_card_phases.clear()
         self._last_grid_signature = None
-        self._stable_layout_width = None
+        self._last_catalog_status_signature = None
+        self._pending_scroll_restore = None
         self._escape_revert.clear()
+
+        manual_header = doc.get_element_by_id("manual-header")
+        if manual_header:
+            manual_header.add_event_listener("click", self._on_toggle_manual)
+            manual_content = doc.get_element_by_id("manual-content")
+            if manual_content:
+                w.sync_section_state(manual_content, self._manual_open,
+                                     manual_header, doc.get_element_by_id("manual-arrow"))
 
         formats_header = doc.get_element_by_id("formats-header")
         if formats_header:
@@ -206,6 +230,11 @@ class PluginMarketplacePanel(Panel):
             grid_el.add_event_listener("click", self._on_card_click)
             grid_el.add_event_listener("change", self._on_card_change)
 
+        doc.add_event_listener("keydown", self._on_keydown)
+        confirm_overlay = doc.get_element_by_id("confirm-overlay")
+        if confirm_overlay:
+            confirm_overlay.add_event_listener("click", self._on_confirm_overlay_click)
+
         manual_form = doc.get_element_by_id("manual-install-form")
         if manual_form:
             manual_form.add_event_listener("submit", self._on_manual_form_submit)
@@ -214,24 +243,52 @@ class PluginMarketplacePanel(Panel):
         manual_url_input = doc.get_element_by_id("manual-url-input")
         if manual_url_input:
             w.bind_select_all_on_focus(manual_url_input)
+            manual_url_input.add_event_listener(
+                "focus", lambda _event: setattr(self, "_manual_url_focused", True)
+            )
+            manual_url_input.add_event_listener(
+                "blur", lambda _event: setattr(self, "_manual_url_focused", False)
+            )
             self._escape_revert.bind(
                 manual_url_input,
                 "manual_url",
                 lambda: str(self._manual_url or ""),
                 self._restore_manual_url,
             )
-        self._sync_view_mode_controls(doc)
+        self.reload_marketplace_preferences()
         self._subscribe_reactive_state()
+        self._ensure_loaded()
         self._request_model_update()
 
     def on_unmount(self, doc):
+        self._unsubscribe_manager_callbacks()
         self._unsubscribe_reactive_state()
         self._cancel_dismiss_timers()
         self._escape_revert.clear()
+        self._confirm_is_open = False
+        self._confirm_restore_manual_focus = False
+        self._manual_url_focused = False
+        self._pending_scroll_restore = None
         self._doc = None
         self._handle = None
         if doc:
             doc.remove_data_model("plugin_marketplace")
+
+    def _subscribe_manager_callbacks(self):
+        if self._manager_callbacks_registered:
+            return
+        self._plugin_manager.on_plugin_loaded(self._on_manager_plugin_changed)
+        self._plugin_manager.on_plugin_unloaded(self._on_manager_plugin_changed)
+        self._plugin_manager.on_plugin_changed(self._on_manager_plugin_changed)
+        self._manager_callbacks_registered = True
+
+    def _unsubscribe_manager_callbacks(self):
+        if not self._manager_callbacks_registered:
+            return
+        self._plugin_manager.remove_plugin_loaded_callback(self._on_manager_plugin_changed)
+        self._plugin_manager.remove_plugin_unloaded_callback(self._on_manager_plugin_changed)
+        self._plugin_manager.remove_plugin_changed_callback(self._on_manager_plugin_changed)
+        self._manager_callbacks_registered = False
 
     def _subscribe_reactive_state(self):
         if self._reactive_unsubscribers:
@@ -314,6 +371,10 @@ class PluginMarketplacePanel(Panel):
         from .manager import PluginManager
 
         mgr = PluginManager.instance()
+        self._restore_pending_scroll(doc)
+        # Dirty-driven updates are event-driven, so this guard handles a sort
+        # change that arrives while the initial catalog fetch is in flight
+        # without reintroducing an idle polling loop.
         self._ensure_loaded()
 
         current_lang = lf.ui.get_current_language()
@@ -323,8 +384,9 @@ class PluginMarketplacePanel(Panel):
             self._last_card_phases.clear()
 
         entries_raw, is_loading, registry_loaded = self._catalog.snapshot()
-        self._update_catalog_status(doc, len(entries_raw), is_loading, registry_loaded)
-        self._sync_view_mode_controls(doc)
+        self._update_catalog_status(
+            doc, len(entries_raw), is_loading, registry_loaded, entries_raw
+        )
 
         snapshot_key = (tuple(entries_raw), is_loading, registry_loaded)
         if snapshot_key != self._prev_snapshot_key:
@@ -359,9 +421,6 @@ class PluginMarketplacePanel(Panel):
                 for i, entry in enumerate(entries)
             ]
             self._cached_card_ids = card_ids
-            self._cached_installed_lookup = installed_lookup
-            self._cached_installed_versions = installed_versions
-            self._cached_installed_names = installed_names
             self._last_card_phases.clear()
             self._render_entry_layout(doc, records, force=True)
 
@@ -374,11 +433,11 @@ class PluginMarketplacePanel(Panel):
         else:
             self._render_entry_layout(doc, self._cached_card_records)
 
-        self._update_card_states(
-            doc, self._cached_entries, self._cached_card_ids, mgr,
-            self._cached_installed_lookup, self._cached_installed_versions,
-            self._cached_installed_names,
-        )
+        if self._installed_state_dirty:
+            self._refresh_all_card_records(doc, mgr)
+            self._installed_state_dirty = False
+
+        self._update_card_states(doc, self._cached_card_ids, mgr)
         self._update_manual_feedback(doc)
 
     # ── Card record building ──────────────────────────────────
@@ -414,7 +473,10 @@ class PluginMarketplacePanel(Panel):
                 if p.name == plugin_name:
                     desc = p.description
                     break
-        description = self._truncate_text(desc or tr("plugin_marketplace.no_description"), 90)
+        # Keep the full copy for expanded list rows, while card view receives a
+        # bounded preview that ends in an explicit ellipsis.
+        description = desc or tr("plugin_marketplace.no_description")
+        card_description = self._truncate_text(description, _MAX_CARD_DESCRIPTION_CHARS)
 
         version_label = ""
         has_version = False
@@ -426,8 +488,6 @@ class PluginMarketplacePanel(Panel):
 
         metrics = []
         if not is_local_only:
-            if entry.stars > 0:
-                metrics.append(f"{tr('plugin_marketplace.stars')}: {entry.stars}")
             if entry.downloads > 0:
                 metrics.append(f"{tr('plugin_marketplace.downloads')}: {entry.downloads}")
         metrics_text = "  |  ".join(metrics)
@@ -438,7 +498,15 @@ class PluginMarketplacePanel(Panel):
         status_text = ""
         status_class = "status-muted"
         if is_installed:
-            state_str = plugin_state.value if plugin_state else tr("plugin_manager.status_not_loaded")
+            state_keys = {
+                PluginState.UNLOADED: "plugin_manager.status_not_loaded",
+                PluginState.INSTALLING: "plugin_manager.status_installing",
+                PluginState.LOADING: "plugin_manager.status_loading",
+                PluginState.ACTIVE: "plugin_manager.status_active",
+                PluginState.ERROR: "plugin_manager.status_error",
+                PluginState.DISABLED: "plugin_manager.status_disabled",
+            }
+            state_str = tr(state_keys.get(plugin_state, "plugin_manager.status_not_loaded"))
             status_text = f"{tr('plugin_manager.status')}: {state_str}"
             if plugin_state == PluginState.ACTIVE:
                 status_class = "status-success"
@@ -460,6 +528,7 @@ class PluginMarketplacePanel(Panel):
             "repo_label": repo_label,
             "has_metrics": bool(metrics_text),
             "metrics_text": metrics_text,
+            "stars": entry.stars,
             "has_tags": bool(tags_text),
             "tags_text": tags_text,
             "is_local": is_local,
@@ -468,18 +537,11 @@ class PluginMarketplacePanel(Panel):
             "status_class": status_class,
             "has_error": bool(entry.error),
             "description": description,
-            "info_action": "open-url" if has_github else "",
+            "card_description": card_description,
             "github_url": entry.github_url or "",
             "plugin_name": plugin_name or "",
             "show_install": (not buttons_busy) and not is_installed and not is_local_only and not entry.error,
-            "show_git_checkout": (
-                self._git_available
-                and (not buttons_busy)
-                and not is_installed
-                and not is_local_only
-                and not entry.error
-            ),
-            "git_checkout_selected": self._git_checkout_selected.get(card_id, False),
+            "show_cancel": buttons_busy and card_state.cancellable,
             "show_load": (not buttons_busy) and is_installed and plugin_state != PluginState.ACTIVE,
             "show_unload": (not buttons_busy) and is_installed and plugin_state == PluginState.ACTIVE,
             "show_reload": (not buttons_busy) and is_remote_installed and plugin_state == PluginState.ACTIVE,
@@ -488,8 +550,6 @@ class PluginMarketplacePanel(Panel):
             "show_startup": show_startup,
             "startup_checked": startup_checked,
             "summary_status_text": status_text,
-            "summary_marker": "●" if (is_local and not has_github) else "★",
-            "summary_marker_class": "plugin-list-marker--local" if (is_local and not has_github) else "plugin-list-marker--remote",
         }
 
     def _render_entry_layout(self, doc, records: List[Dict[str, object]], force: bool = False):
@@ -498,6 +558,7 @@ class PluginMarketplacePanel(Panel):
             return
 
         grid_el.set_class("card-grid--list", self._view_mode == _VIEW_MODE_LIST)
+        chrome = self._capture_panel_chrome(doc)
 
         if self._view_mode == _VIEW_MODE_LIST:
             card_ids = tuple(str(r.get("card_id", "")) for r in records)
@@ -506,59 +567,175 @@ class PluginMarketplacePanel(Panel):
                 return
             self._last_grid_signature = signature
             grid_el.set_inner_rml("".join(self._build_list_markup(record) for record in records))
+            self._restore_panel_chrome(doc, chrome)
             return
 
         viewport_width = self._grid_viewport_width(doc, grid_el)
-        layout_width = self._stabilize_layout_width(viewport_width)
-        columns, row_width = self._compute_grid_layout(layout_width)
+        columns, row_width = self._compute_grid_layout(viewport_width)
+        card_slot_width = max(
+            float(_CARD_MIN_WIDTH_DP),
+            (float(row_width) - float(max(0, columns - 1) * _CARD_GAP_DP)) / float(columns),
+        )
         card_ids = tuple(str(r.get("card_id", "")) for r in records)
-        signature = (self._view_mode, card_ids, columns, row_width)
+        signature = (
+            self._view_mode,
+            card_ids,
+            columns,
+            row_width,
+            round(card_slot_width, 2),
+        )
         if not force and signature == self._last_grid_signature:
             return
         self._last_grid_signature = signature
 
         if not records:
             grid_el.set_inner_rml("")
+            self._restore_panel_chrome(doc, chrome)
             return
 
-        rows: List[str] = []
-        for i in range(0, len(records), columns):
-            chunk = list(records[i:i + columns])
-            row_class = "card-row card-row--single" if columns == 1 else "card-row"
-            row_parts = [
-                f'<div class="{row_class}" style="width: {row_width}dp; margin-left: {_GRID_SIDE_MARGIN_DP}dp; margin-right: {_GRID_SIDE_MARGIN_DP}dp;">'
-            ]
-            for record in chunk:
-                row_parts.append(self._build_card_markup(record))
-            for _ in range(columns - len(chunk)):
-                row_parts.append(
-                    f'<div class="plugin-card plugin-card--placeholder" style="width: {_CARD_MIN_WIDTH_DP}dp;"></div>'
-                )
-            row_parts.append("</div>")
-            rows.append("".join(row_parts))
-        grid_el.set_inner_rml("".join(rows))
+        # Match the Asset Manager gallery: the viewport determines the slot
+        # width, and the flex container wraps cards naturally as it resizes.
+        # This avoids fixed rows/placeholders fighting the panel scrollbar and
+        # keeps every row aligned to the available content width.
+        card_width = f"{card_slot_width:.2f}dp"
+        parts = [f'<div class="card-grid-window" style="width: {row_width}dp;">']
+        for record in records:
+            parts.append(
+                f'<div class="card-slot" style="width: {card_width};">'
+                f'{self._build_card_markup(record, width="100%")}'
+                "</div>"
+            )
+        parts.append("</div>")
+        grid_el.set_inner_rml("".join(parts))
+        self._restore_panel_chrome(doc, chrome)
+
+    def _capture_panel_chrome(self, doc):
+        """Capture state outside the card grid before a required rebuild."""
+        main_area = doc.get_element_by_id("main-area")
+        scroll_top = None
+        if main_area is not None:
+            try:
+                scroll_top = float(main_area.scroll_top)
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        manual_input = doc.get_element_by_id("manual-url-input")
+        manual_value = None
+        if manual_input is not None:
+            try:
+                input_value = manual_input.get_attribute("value", "")
+                manual_value = str(input_value or self._manual_url or "")
+            except Exception:
+                manual_value = str(self._manual_url or "")
+
+        overlay = doc.get_element_by_id("confirm-overlay")
+        overlay_hidden = None
+        if overlay is not None:
+            try:
+                overlay_hidden = overlay.is_class_set("hidden")
+            except AttributeError:
+                try:
+                    overlay_hidden = "hidden" in overlay.get_attribute("class", "").split()
+                except Exception:
+                    pass
+
+        return scroll_top, manual_value, self._manual_url_focused, overlay_hidden
+
+    def _restore_panel_chrome(self, doc, chrome) -> None:
+        scroll_top, manual_value, was_manual_focused, overlay_hidden = chrome
+        if scroll_top is not None:
+            self._defer_scroll_restore(doc, scroll_top)
+
+        manual_input = doc.get_element_by_id("manual-url-input")
+        if manual_input is not None:
+            if manual_value is not None and manual_value != str(self._manual_url or ""):
+                self._manual_url = str(manual_value)
+            if was_manual_focused:
+                focus = getattr(manual_input, "focus", None)
+                if callable(focus):
+                    focus()
+
+        overlay = doc.get_element_by_id("confirm-overlay")
+        if overlay is not None and overlay_hidden is not None:
+            overlay.set_class("hidden", bool(overlay_hidden))
+
+    @staticmethod
+    def _scroll_height(element):
+        try:
+            return float(element.scroll_height)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _defer_scroll_restore(self, doc, scroll_top: float) -> None:
+        main_area = doc.get_element_by_id("main-area")
+        if main_area is None:
+            return
+        height = self._scroll_height(main_area)
+        if height is None:
+            # Lightweight hosts without layout metrics retain the historical
+            # synchronous behavior; real RML elements expose scroll_height.
+            try:
+                main_area.scroll_top = scroll_top
+            except (AttributeError, TypeError, ValueError):
+                pass
+            return
+        self._pending_scroll_restore = (doc, float(scroll_top), height)
+        self._schedule_model_update()
+
+    def _restore_pending_scroll(self, doc) -> None:
+        pending = self._pending_scroll_restore
+        if pending is None:
+            return
+        pending_doc, scroll_top, previous_height = pending
+        if pending_doc is not doc:
+            self._pending_scroll_restore = None
+            return
+
+        main_area = doc.get_element_by_id("main-area")
+        if main_area is None:
+            self._pending_scroll_restore = None
+            return
+        height = self._scroll_height(main_area)
+        if height is None:
+            self._pending_scroll_restore = None
+            try:
+                main_area.scroll_top = scroll_top
+            except (AttributeError, TypeError, ValueError):
+                pass
+            return
+
+        # A newly assigned grid can report its old height for one update. Wait
+        # until the reported content height stops changing, then restore the
+        # exact captured position after RML has performed its clamp.
+        if (abs(height - previous_height) > 0.01
+                or (scroll_top > 0.0 and height <= 0.0)):
+            self._pending_scroll_restore = (doc, scroll_top, height)
+            self._schedule_model_update()
+            return
+        self._pending_scroll_restore = None
+        try:
+            main_area.scroll_top = scroll_top
+        except (AttributeError, TypeError, ValueError):
+            pass
 
     def _grid_viewport_width(self, doc, grid_el) -> int:
-        dp_ratio = max(1.0, lf.ui.get_ui_scale())
-
-        main_area_el = doc.get_element_by_id("main-area")
-        if main_area_el and getattr(main_area_el, "client_width", 0):
-            return int(max(0.0, float(main_area_el.client_width or 0.0) / dp_ratio))
-
-        content_el = doc.get_element_by_id("content")
-        if content_el and getattr(content_el, "client_width", 0):
-            return int(max(0.0, float(content_el.client_width or 0.0) / dp_ratio))
-
-        return int(max(0.0, float(grid_el.client_width or 0.0) / dp_ratio))
-
-    def _stabilize_layout_width(self, width: int) -> int:
-        return max(0, width - _SCROLLBAR_GUTTER_DP)
+        # The grid and the manual-install section are siblings in #main-area;
+        # measuring the grid itself keeps their outer edges identical.
+        dp_ratio = max(1.0, float(lf.ui.get_ui_scale() or 1.0))
+        for element in (
+            grid_el,
+            doc.get_element_by_id("main-area"),
+            doc.get_element_by_id("content"),
+        ):
+            if element and getattr(element, "client_width", 0):
+                return int(max(0.0, float(element.client_width or 0.0) / dp_ratio))
+        return 0
 
     def _compute_grid_layout(self, width: int) -> Tuple[int, int]:
         if width <= 0:
             return 1, _CARD_MIN_WIDTH_DP
 
-        usable_width = max(0, width - (2 * _GRID_SIDE_MARGIN_DP))
+        usable_width = max(0, width)
         if usable_width <= 0:
             return 1, _CARD_MIN_WIDTH_DP
 
@@ -585,13 +762,6 @@ class PluginMarketplacePanel(Panel):
         def text_span(condition_key: str, body: str) -> str:
             return body if record.get(condition_key) else ""
 
-        info_attrs = []
-        if record.get("info_action"):
-            info_attrs.append(f'data-action="{esc("info_action")}"')
-        if record.get("github_url"):
-            info_attrs.append(f'data-url="{esc("github_url")}"')
-        info_attr_text = (" " + " ".join(info_attrs)) if info_attrs else ""
-
         status_span = ""
         if record.get("is_installed"):
             status_span = (
@@ -606,7 +776,11 @@ class PluginMarketplacePanel(Panel):
         description = (
             ""
             if record.get("has_error")
-            else f'<span class="card-description text-disabled">{esc("description")}</span>'
+            else (
+                '<span class="card-description text-disabled">'
+                f'{escape(str(record.get("card_description") or record.get("description", "")), quote=True)}'
+                '</span>'
+            )
         )
         version_span = text_span(
             "has_version",
@@ -618,7 +792,7 @@ class PluginMarketplacePanel(Panel):
         )
         metrics_span = text_span(
             "has_metrics",
-            f'<span class="card-metrics mp-warning-text">{esc("metrics_text")}</span>',
+            f'<span class="card-metrics mp-warning-note">{esc("metrics_text")}</span>',
         )
         tags_span = text_span(
             "has_tags",
@@ -631,9 +805,12 @@ class PluginMarketplacePanel(Panel):
         )
 
         return (
-            f'<div class="card-info"{info_attr_text}>'
-            f'<span class="card-name">{esc("name")}</span>'
+            '<div class="card-info">'
+            '<div class="card-title-row">'
+            f'{self._build_project_title_markup(record, "card-name")}'
             f'{version_span}'
+            f'{self._build_star_count_markup(record)}'
+            '</div>'
             f'{repo_span}'
             f'{metrics_span}'
             f'{tags_span}'
@@ -644,18 +821,18 @@ class PluginMarketplacePanel(Panel):
             '<div class="separator"></div>'
             '</div>'
             f'{self._build_feedback_markup(record)}'
-            f'{self._build_git_row(record)}'
             f'{self._build_startup_row(record)}'
             f'<div class="card-buttons" id="btns-{esc("card_id")}">{self._build_action_buttons_markup(record)}</div>'
         )
 
-    def _build_card_markup(self, record: Dict[str, object]) -> str:
+    def _build_card_markup(self, record: Dict[str, object], width: Optional[str] = None) -> str:
         def esc(key: str) -> str:
             return escape(str(record.get(key, "")), quote=True)
 
+        card_width = escape(str(width or f"{_CARD_MIN_WIDTH_DP}dp"), quote=True)
         return (
             f'<div class="plugin-card" id="card-{esc("card_id")}" data-card-id="{esc("card_id")}" '
-            f'style="width: {_CARD_MIN_WIDTH_DP}dp;">'
+            f'style="width: {card_width};">'
             f'{self._build_card_inner_markup(record)}'
             '</div>'
         )
@@ -684,14 +861,9 @@ class PluginMarketplacePanel(Panel):
 
         detail_meta_parts: List[str] = []
         if record.get("has_repo"):
-            if record.get("github_url"):
-                detail_meta_parts.append(
-                    f'<button type="button" class="plugin-list-link" data-action="open-url" data-url="{esc("github_url")}">{esc("repo_label")}</button>'
-                )
-            else:
-                detail_meta_parts.append(f'<span class="plugin-list-meta-item text-disabled">{esc("repo_label")}</span>')
+            detail_meta_parts.append(f'<span class="plugin-list-meta-item text-disabled">{esc("repo_label")}</span>')
         if record.get("has_metrics"):
-            detail_meta_parts.append(f'<span class="plugin-list-meta-item mp-warning-text">{esc("metrics_text")}</span>')
+            detail_meta_parts.append(f'<span class="plugin-list-meta-item mp-warning-note">{esc("metrics_text")}</span>')
         if record.get("has_tags"):
             detail_meta_parts.append(f'<span class="plugin-list-meta-item text-disabled">{esc("tags_text")}</span>')
         if record.get("is_local"):
@@ -712,17 +884,17 @@ class PluginMarketplacePanel(Panel):
 
         return (
             '<div class="plugin-list-summary">'
-            f'<button type="button" class="plugin-list-disclosure" data-action="toggle-expand" data-card-id="{esc("card_id")}">{disclosure}</button>'
-            f'<button type="button" class="plugin-list-name-btn" data-action="toggle-expand" data-card-id="{esc("card_id")}">'
-            f'<span class="plugin-list-name">{esc("name")}</span>'
+            f'<button type="button" class="plugin-list-disclosure" id="disclosure-{esc("card_id")}" data-action="toggle-expand" data-card-id="{esc("card_id")}">{disclosure}</button>'
+            '<div class="plugin-list-title-row">'
+            f'{self._build_project_title_markup(record, "plugin-list-name")}'
             f'{version_span}'
-            '</button>'
+            '</div>'
             '<div class="plugin-list-summary-right">'
             f'{summary_status}'
-            f'<span class="plugin-list-marker {esc("summary_marker_class")}">{esc("summary_marker")}</span>'
+            f'{self._build_star_count_markup(record)}'
             '</div>'
             '</div>'
-            f'<div class="plugin-list-details{expanded_class}">'
+            f'<div class="plugin-list-details{expanded_class}" id="details-{esc("card_id")}">'
             f'{detail_meta}'
             f'{detail_text}'
             f'{self._build_feedback_markup(record, extra_class="plugin-list-feedback")}'
@@ -743,6 +915,31 @@ class PluginMarketplacePanel(Panel):
             '</div>'
         )
 
+    @staticmethod
+    def _build_star_count_markup(record: Dict[str, object]) -> str:
+        if not record.get("github_url"):
+            return ""
+        stars = record.get("stars")
+        count = str(stars) if stars is not None else "—"
+        tooltip = escape(f"{lf.ui.tr('plugin_marketplace.stars')}: {count}", quote=True)
+        return (
+            f'<span class="mp-stars" title="{tooltip}">'
+            '<span class="mp-star-icon">★</span>'
+            f'<span class="mp-star-count">{escape(count)}</span></span>'
+        )
+
+    @staticmethod
+    def _build_project_title_markup(record: Dict[str, object], name_class: str) -> str:
+        label = escape(str(record.get("name", "")))
+        url = str(record.get("github_url") or "")
+        if not url:
+            return f'<span class="{name_class}">{label}</span>'
+        escaped_url = escape(url, quote=True)
+        return (
+            f'<a class="{name_class} mp-project-link" href="{escaped_url}" '
+            f'title="{escaped_url}" data-action="open-url" data-url="{escaped_url}"><span>{label}</span></a>'
+        )
+
     def _build_action_buttons_markup(self, record: Dict[str, object]) -> str:
         tr = lf.ui.tr
 
@@ -750,35 +947,40 @@ class PluginMarketplacePanel(Panel):
             return escape(str(record.get(key, "")), quote=True)
 
         buttons: List[str] = []
+        if record.get("show_cancel"):
+            buttons.append(
+                f'<button class="btn btn--warning" data-action="cancel" data-card-id="{esc("card_id")}">'
+                f'<span>{escape(tr("plugin_marketplace.cancel"))}</span></button>'
+            )
         if record.get("show_install"):
             buttons.append(
                 f'<button class="btn btn--success" data-action="install" data-card-id="{esc("card_id")}">'
-                f'{escape(tr("plugin_marketplace.button.install"))}</button>'
+                f'<span>{escape(tr("plugin_marketplace.button.install"))}</span></button>'
             )
         if record.get("show_load"):
             buttons.append(
                 f'<button class="btn btn--success" data-action="load" data-card-id="{esc("card_id")}" '
-                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.load"))}</button>'
+                f'data-plugin="{esc("plugin_name")}"><span>{escape(tr("plugin_manager.button.load"))}</span></button>'
             )
         if record.get("show_unload"):
             buttons.append(
                 f'<button class="btn btn--warning" data-action="unload" data-card-id="{esc("card_id")}" '
-                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.unload"))}</button>'
+                f'data-plugin="{esc("plugin_name")}"><span>{escape(tr("plugin_manager.button.unload"))}</span></button>'
             )
         if record.get("show_reload"):
             buttons.append(
                 f'<button class="btn btn--primary" data-action="reload" data-card-id="{esc("card_id")}" '
-                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.reload"))}</button>'
+                f'data-plugin="{esc("plugin_name")}"><span>{escape(tr("plugin_manager.button.reload"))}</span></button>'
             )
         if record.get("show_update"):
             buttons.append(
                 f'<button class="btn btn--primary" data-action="update" data-card-id="{esc("card_id")}" '
-                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.update"))}</button>'
+                f'data-plugin="{esc("plugin_name")}"><span>{escape(tr("plugin_manager.button.update"))}</span></button>'
             )
         if record.get("show_uninstall"):
             buttons.append(
                 f'<button class="btn btn--error" data-action="uninstall" data-card-id="{esc("card_id")}" '
-                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.uninstall"))}</button>'
+                f'data-plugin="{esc("plugin_name")}"><span>{escape(tr("plugin_manager.button.uninstall"))}</span></button>'
             )
         return "".join(buttons)
 
@@ -791,6 +993,7 @@ class PluginMarketplacePanel(Panel):
             f'<span class="card-progress-text hidden" id="feedback-{card_id}-progress-text"></span>'
             f'<span class="status-text status-success hidden" id="feedback-{card_id}-success"></span>'
             f'<span class="status-text status-error hidden" id="feedback-{card_id}-error"></span>'
+            f'<span class="status-text status-info hidden" id="feedback-{card_id}-cancelled"></span>'
             '</div>'
         )
 
@@ -817,30 +1020,7 @@ class PluginMarketplacePanel(Panel):
             '</label></div>'
         )
 
-    def _build_git_row(
-        self,
-        record: Dict[str, object],
-        row_class: str = "card-git-row",
-        label_class: str = "card-startup-label text-disabled",
-    ) -> str:
-        if not record.get("show_git_checkout"):
-            return ""
-
-        tr = lf.ui.tr
-        checked = ' checked="checked"' if record.get("git_checkout_selected") else ""
-        card_id = escape(str(record.get("card_id", "")), quote=True)
-        return (
-            f'<div class="{row_class}"><label>'
-            f'<input type="checkbox"{checked} data-action="git-checkout" '
-            f'data-card-id="{card_id}" />'
-            f'<span class="{label_class}">{escape(tr("plugin_marketplace.install_as_git_checkout"))}</span>'
-            '</label></div>'
-        )
-
-    # ── Card state updates (per-frame, minimal DOM touches) ───
-
-    def _update_card_states(self, doc, entries, card_ids, mgr,
-                            installed_lookup, installed_versions, installed_names):
+    def _update_card_states(self, doc, card_ids, mgr):
         import lichtfeld as lf
 
         tr = lf.ui.tr
@@ -864,6 +1044,7 @@ class PluginMarketplacePanel(Panel):
             card_el.set_class("card--in-progress", state.phase == CardOpPhase.IN_PROGRESS)
             card_el.set_class("card--success", state.phase == CardOpPhase.SUCCESS)
             card_el.set_class("card--error", state.phase == CardOpPhase.ERROR)
+            card_el.set_class("card--cancelled", state.phase == CardOpPhase.CANCELLED)
             self._sync_feedback_state(doc, f"feedback-{card_id}", state, tr("plugin_manager.working"))
 
     def _refresh_card_record(self, doc, card_id: str, mgr):
@@ -877,10 +1058,6 @@ class PluginMarketplacePanel(Panel):
         installed_versions = self._get_installed_plugin_versions(mgr)
         installed_names = set(installed_lookup.values())
 
-        self._cached_installed_lookup = installed_lookup
-        self._cached_installed_versions = installed_versions
-        self._cached_installed_names = installed_names
-
         record = self._build_card_record(
             entry,
             card_id,
@@ -889,16 +1066,47 @@ class PluginMarketplacePanel(Panel):
             installed_versions,
             installed_names,
         )
+        if record == self._cached_card_records[idx]:
+            self._sync_list_row_expansion(doc, card_id)
+            return
         self._cached_card_records[idx] = record
 
         card_el = doc.get_element_by_id(f"card-{card_id}")
         if not card_el:
             return
 
+        # Keep the row or card node in place so list disclosure state and the
+        # surrounding panel chrome survive, while rebuilding the inner markup
+        # when operation state changes the available install options.
         if self._view_mode == _VIEW_MODE_LIST:
             card_el.set_inner_rml(self._build_list_inner_markup(record))
         else:
             card_el.set_inner_rml(self._build_card_inner_markup(record))
+
+    def _refresh_all_card_records(self, doc, mgr):
+        """Refresh installed-state chrome without replacing the result grid."""
+        chrome = self._capture_panel_chrome(doc)
+        installed_lookup = self._get_installed_plugin_lookup(mgr)
+        installed_versions = self._get_installed_plugin_versions(mgr)
+        installed_names = set(installed_lookup.values())
+
+        for idx, card_id in enumerate(self._cached_card_ids):
+            record = self._build_card_record(
+                self._cached_entries[idx], card_id, mgr,
+                installed_lookup, installed_versions, installed_names,
+            )
+            if record == self._cached_card_records[idx]:
+                self._sync_list_row_expansion(doc, card_id)
+                continue
+            self._cached_card_records[idx] = record
+            card_el = doc.get_element_by_id(f"card-{card_id}")
+            if not card_el:
+                continue
+            if self._view_mode == _VIEW_MODE_LIST:
+                card_el.set_inner_rml(self._build_list_inner_markup(record))
+            else:
+                card_el.set_inner_rml(self._build_card_inner_markup(record))
+        self._restore_panel_chrome(doc, chrome)
 
     def _update_manual_feedback(self, doc):
         card_id = "__manual_url__"
@@ -931,27 +1139,49 @@ class PluginMarketplacePanel(Panel):
             if self._handle:
                 self._handle.dirty("manual_url")
 
-    def _update_catalog_status(self, doc, entry_count: int, is_loading: bool, registry_loaded: bool):
+    def _update_catalog_status(
+        self, doc, entry_count: int, is_loading: bool, registry_loaded: bool,
+        entries=None,
+    ):
         status_el = doc.get_element_by_id("catalog-status")
         if not status_el:
             return
 
         if is_loading and entry_count == 0:
-            text = "Fetching plugin registry..."
+            text = lf.ui.tr("plugin_marketplace.loading")
             tone = "status-info"
         elif registry_loaded:
-            noun = "plugin" if entry_count == 1 else "plugins"
-            text = f"Registry loaded: {entry_count} {noun} in the marketplace catalog."
+            text = localized_count("plugin_marketplace.registry_loaded", entry_count)
             tone = "status-success" if entry_count > 0 else "status-info"
         else:
-            noun = "plugin" if entry_count == 1 else "plugins"
-            text = f"Registry unavailable: showing {entry_count} fallback {noun}."
+            text = localized_count("plugin_marketplace.registry_unavailable", entry_count)
             tone = "status-warning"
+
+        popularity_unavailable = any(
+            getattr(entry, "github_enrichment_failed", False)
+            for entry in (entries or ())
+        )
+        if popularity_unavailable:
+            text = (
+                f"{text} {lf.ui.tr('plugin_marketplace.popularity_unavailable')}"
+            )
+            tone = "status-warning"
+
+        signature = (text, tone)
+        if signature == self._last_catalog_status_signature:
+            return
+        self._last_catalog_status_signature = signature
 
         status_el.set_text(text)
         status_el.set_class("status-info", tone == "status-info")
         status_el.set_class("status-success", tone == "status-success")
         status_el.set_class("status-warning", tone == "status-warning")
+
+        dot_el = doc.get_element_by_id("catalog-status-dot")
+        if dot_el:
+            dot_el.set_class("status-info", tone == "status-info")
+            dot_el.set_class("status-success", tone == "status-success")
+            dot_el.set_class("status-warning", tone == "status-warning")
 
     def _sync_feedback_state(self, doc, element_prefix: str, state: CardOpState, working_text: str):
         feedback_el = doc.get_element_by_id(element_prefix)
@@ -961,13 +1191,15 @@ class PluginMarketplacePanel(Panel):
         show_progress = state.phase == CardOpPhase.IN_PROGRESS
         show_success = state.phase == CardOpPhase.SUCCESS
         show_error = state.phase == CardOpPhase.ERROR
+        show_cancelled = state.phase == CardOpPhase.CANCELLED
 
         progress_el = doc.get_element_by_id(f"{element_prefix}-progress")
         progress_text_el = doc.get_element_by_id(f"{element_prefix}-progress-text")
         success_el = doc.get_element_by_id(f"{element_prefix}-success")
         error_el = doc.get_element_by_id(f"{element_prefix}-error")
+        cancelled_el = doc.get_element_by_id(f"{element_prefix}-cancelled")
 
-        feedback_el.set_class("hidden", not (show_progress or show_success or show_error))
+        feedback_el.set_class("hidden", not (show_progress or show_success or show_error or show_cancelled))
 
         if progress_el:
             progress_el.set_class("hidden", not show_progress)
@@ -980,10 +1212,24 @@ class PluginMarketplacePanel(Panel):
             success_el.set_class("hidden", not show_success)
             success_el.set_text(state.message if show_success else "")
         if error_el:
-            error_el.set_class("hidden", not show_error)
-            error_el.set_text(state.message if show_error else "")
+            show_error_text = show_error or (show_cancelled and not cancelled_el)
+            error_el.set_class("hidden", not show_error_text)
+            error_el.set_class("status-info", show_cancelled and not cancelled_el)
+            error_el.set_text(state.message if show_error_text else "")
+        if cancelled_el:
+            cancelled_el.set_class("hidden", not show_cancelled)
+            cancelled_el.set_text(state.message if show_cancelled else "")
 
     # ── Event handlers ────────────────────────────────────────
+
+    def _on_toggle_manual(self, _ev):
+        self._manual_open = not self._manual_open
+        if self._doc:
+            content = self._doc.get_element_by_id("manual-content")
+            if content:
+                w.animate_section_toggle(content, self._manual_open,
+                                         self._doc.get_element_by_id("manual-arrow"),
+                                         header_element=self._doc.get_element_by_id("manual-header"))
 
     def _on_toggle_formats(self, _ev):
         self._formats_open = not self._formats_open
@@ -1024,34 +1270,78 @@ class PluginMarketplacePanel(Panel):
         mgr = PluginManager.instance()
         name = self._pending_uninstall_name
         card_id = self._pending_uninstall_card_id
-        self._pending_uninstall_name = ""
-        self._pending_uninstall_card_id = ""
-        overlay = self._doc.get_element_by_id("confirm-overlay")
-        if overlay:
-            overlay.set_class("hidden", True)
+        self._close_confirm()
         if name:
             if mgr.get_state(name) == PluginState.ACTIVE:
                 # Unload on the UI thread before handing off to the background worker.
                 # Unloading in a background thread can crash when plugin callbacks
                 # (e.g. remove_draw_handler) touch UI state from the wrong thread.
                 lf.log.info(f"Plugin '{name}' was loaded. Unloading before uninstall.")
-                mgr.unload(name)
+                if not mgr.unload(name):
+                    with self._lock:
+                        state = self._card_ops.setdefault(card_id, CardOpState())
+                        state.phase = CardOpPhase.ERROR
+                        state.message = lf.ui.tr("plugin_manager.status.unload_failed")
+                        state.finished_at = time.monotonic()
+                    self._schedule_card_dismiss(card_id, CardOpPhase.ERROR)
+                    self._schedule_model_update()
+                    return
             self._uninstall_plugin(mgr, name, card_id)
 
     def _on_confirm_no(self, handle, event, args):
+        self._close_confirm()
+
+    def _close_confirm(self):
         self._pending_uninstall_name = ""
         self._pending_uninstall_card_id = ""
-        overlay = self._doc.get_element_by_id("confirm-overlay")
+        restore_manual_focus = self._confirm_restore_manual_focus
+        self._confirm_restore_manual_focus = False
+        self._confirm_is_open = False
+        overlay = self._doc.get_element_by_id("confirm-overlay") if self._doc else None
         if overlay:
             overlay.set_class("hidden", True)
+        if restore_manual_focus and self._doc:
+            manual_input = self._doc.get_element_by_id("manual-url-input")
+            focus = getattr(manual_input, "focus", None) if manual_input else None
+            if callable(focus):
+                focus()
 
-    def _on_view_cards(self, *_args):
-        self._set_view_mode(_VIEW_MODE_CARD)
+    def _on_keydown(self, event):
+        key = int(event.get_parameter("key_identifier", "0"))
+        if not self._confirm_is_open:
+            target = event.target()
+            if key == KI_RETURN and target is not None and target.tag_name == "a":
+                if target.get_attribute("data-action", "") == "open-url":
+                    self._on_card_click(event)
+                    event.stop_propagation()
+            return
+        if key in (KI_ESCAPE, KI_RETURN):
+            # Enter is consumed as a safe no-op; it must never turn keyboard
+            # focus into an implicit destructive uninstall confirmation.
+            if key == KI_ESCAPE:
+                self._close_confirm()
+            event.stop_propagation()
 
-    def _on_view_list(self, *_args):
-        self._set_view_mode(_VIEW_MODE_LIST)
+    def _on_confirm_overlay_click(self, event):
+        if not self._confirm_is_open:
+            return
+        target = event.target()
+        dialog = self._doc.get_element_by_id("confirm-dialog") if self._doc else None
+        inside_dialog = False
+        while target is not None:
+            if target is dialog:
+                inside_dialog = True
+                break
+            target = target.parent()
+        if not inside_dialog:
+            self._close_confirm()
+        event.stop_propagation()
 
     def _on_card_click(self, ev):
+        if self._confirm_is_open:
+            ev.stop_propagation()
+            return
+
         import lichtfeld as lf
         from .manager import PluginManager
 
@@ -1081,6 +1371,10 @@ class PluginMarketplacePanel(Panel):
         if not card_id:
             return
 
+        if action == "cancel":
+            self._cancel_card_operation(card_id)
+            return
+
         entry = None
         for i, e in enumerate(self._cached_entries):
             eid = e.registry_id or e.name or str(i)
@@ -1101,7 +1395,21 @@ class PluginMarketplacePanel(Panel):
         elif action == "uninstall" and plugin_name:
             self._request_uninstall_confirmation(plugin_name, card_id, ev)
 
+    def _cancel_card_operation(self, card_id: str):
+        import lichtfeld as lf
+
+        with self._lock:
+            state = self._card_ops.get(card_id)
+            if state is None or state.phase != CardOpPhase.IN_PROGRESS:
+                return
+            state.cancel_event.set()
+            state.message = lf.ui.tr("plugin_marketplace.cancelling")
+        self._schedule_model_update()
+
     def _on_card_change(self, ev):
+        if self._confirm_is_open:
+            ev.stop_propagation()
+            return
         target = ev.target()
         if target is None:
             return
@@ -1110,8 +1418,6 @@ class PluginMarketplacePanel(Panel):
         if action == "startup" and plugin_name:
             self._set_startup_preference(target, plugin_name)
             return
-        if action == "git-checkout" and card_id:
-            self._set_git_checkout_preference(target, card_id)
 
     def _find_card_action(self, element):
         while element is not None:
@@ -1148,41 +1454,38 @@ class PluginMarketplacePanel(Panel):
             return
 
         prefs.set("load_on_startup", checked)
-        self._entries_dirty = True
         self._request_model_update()
 
-    def _set_git_checkout_preference(self, element, card_id: str):
-        cb_el = self._find_element_with_attr(element, "type", "checkbox")
-        checked = cb_el.has_attribute("checked") if cb_el else False
-        if self._git_checkout_selected.get(card_id, False) == checked:
-            return
-        self._git_checkout_selected[card_id] = checked
-        self._request_model_update()
+    def reload_marketplace_preferences(self):
+        self._set_view_mode(read_marketplace_preferences()["view"])
+
+    def _select_view_mode(self, view_mode: str):
+        set_marketplace_preference("view", view_mode)
+        self._set_view_mode(view_mode)
 
     def _set_view_mode(self, view_mode: str):
-        if view_mode not in _VALID_VIEW_MODES:
-            return
-        if view_mode == self._view_mode:
-            if self._doc:
-                self._sync_view_mode_controls(self._doc)
+        if view_mode not in _VALID_VIEW_MODES or view_mode == self._view_mode:
             return
         self._view_mode = view_mode
+        if self._handle:
+            self._handle.dirty("view_is_card")
+            self._handle.dirty("view_is_list")
         self._entries_dirty = True
         self._last_grid_signature = None
-        if self._doc:
-            self._sync_view_mode_controls(self._doc)
         self._request_model_update()
 
-    def _sync_view_mode_controls(self, doc):
-        tr = lf.ui.tr
-        cards_btn = doc.get_element_by_id("view-cards-btn")
-        list_btn = doc.get_element_by_id("view-list-btn")
-        if cards_btn:
-            cards_btn.set_class("selected", self._view_mode == _VIEW_MODE_CARD)
-            cards_btn.set_attribute("title", tr("plugin_marketplace.view.grid"))
-        if list_btn:
-            list_btn.set_class("selected", self._view_mode == _VIEW_MODE_LIST)
-            list_btn.set_attribute("title", tr("plugin_marketplace.view.list"))
+    def _sync_list_row_expansion(self, doc, card_id: str):
+        """Expansion can change without a metadata change when an error expires."""
+        if self._view_mode != _VIEW_MODE_LIST:
+            return
+        details = doc.get_element_by_id(f"details-{card_id}")
+        disclosure = doc.get_element_by_id(f"disclosure-{card_id}")
+        if details is None or disclosure is None:
+            return
+        expanded = self._is_list_row_expanded(card_id)
+        if details.is_class_set("hidden") != (not expanded):
+            details.set_class("hidden", not expanded)
+            disclosure.set_text("▼" if expanded else "▶")
 
     def _is_list_row_expanded(self, card_id: str) -> bool:
         if card_id in self._expanded_list_rows:
@@ -1217,15 +1520,20 @@ class PluginMarketplacePanel(Panel):
             if not changed:
                 return
 
-        self._last_grid_signature = None
         if rerender and self._doc and self._view_mode == _VIEW_MODE_LIST:
-            self._render_entry_layout(self._doc, self._cached_card_records, force=True)
+            card_el = self._doc.get_element_by_id(f"card-{card_id}")
+            if card_el:
+                try:
+                    idx = self._cached_card_ids.index(card_id)
+                except ValueError:
+                    return
+                card_el.set_inner_rml(self._build_list_inner_markup(self._cached_card_records[idx]))
 
     def _toggle_list_row(self, card_id: str):
         self._set_list_row_expanded(card_id, not self._is_list_row_expanded(card_id), rerender=True)
 
-    def _selected_install_transport(self, card_id: str) -> str:
-        if self._git_available and self._git_checkout_selected.get(card_id, False):
+    def _selected_install_transport(self) -> str:
+        if self._git_available and read_marketplace_preferences()["git_checkout"]:
             return "git"
         return "archive"
 
@@ -1236,6 +1544,8 @@ class PluginMarketplacePanel(Panel):
             return
         self._pending_uninstall_name = name
         self._pending_uninstall_card_id = card_id
+        self._confirm_is_open = True
+        self._confirm_restore_manual_focus = self._manual_url_focused
 
         tr = lf.ui.tr
         doc = self._doc
@@ -1246,18 +1556,28 @@ class PluginMarketplacePanel(Panel):
         overlay = doc.get_element_by_id("confirm-overlay")
         if overlay:
             overlay.set_class("hidden", False)
+        dialog = doc.get_element_by_id("confirm-dialog")
+        if dialog:
+            focus = getattr(dialog, "focus", None)
+            if callable(focus):
+                focus()
 
     # ── Business logic (unchanged) ────────────────────────────
 
     def _ensure_loaded(self):
-        # Alphabetical sorting only needs registry metadata. Popularity sorting depends on
-        # GitHub enrichment for curated entries, so defer that extra fetch until requested.
+        # Star badges need the existing cached GitHub metadata in every sort mode.
+        # Stars may use cached metadata. Only an explicit popularity sort
+        # requests GitHub lookups; opening the panel must not spend API quota.
         self._catalog.refresh_async(require_github_enrichment=self._sort_idx in (0, 1))
 
     def _invalidate_discover_cache(self):
         self._discover_cache = None
-        self._entries_dirty = True
+        self._installed_state_dirty = True
         self._schedule_model_update()
+
+    def _on_manager_plugin_changed(self, _info):
+        """Reflect lifecycle changes made by startup or external plugin APIs."""
+        self._invalidate_discover_cache()
 
     def _get_discovered_plugins(self, mgr) -> List[PluginInfo]:
         cache = self._discover_cache
@@ -1271,7 +1591,7 @@ class PluginMarketplacePanel(Panel):
             state = self._card_ops.get(card_id)
             if state is None:
                 return CardOpState()
-            if state.phase in (CardOpPhase.SUCCESS, CardOpPhase.ERROR) and state.finished_at > 0:
+            if state.phase in (CardOpPhase.SUCCESS, CardOpPhase.ERROR, CardOpPhase.CANCELLED) and state.finished_at > 0:
                 dismiss_after = (
                     SUCCESS_DISMISS_SEC
                     if state.phase == CardOpPhase.SUCCESS
@@ -1281,14 +1601,13 @@ class PluginMarketplacePanel(Panel):
                     state.phase = CardOpPhase.IDLE
                     state.message = ""
                     state.progress = 0.0
-                    state.output_lines.clear()
                     state.finished_at = 0.0
             return CardOpState(
                 phase=state.phase,
                 message=state.message,
                 progress=state.progress,
-                output_lines=list(state.output_lines),
                 finished_at=state.finished_at,
+                cancellable=state.cancellable,
             )
 
     def _filter_and_sort_entries(
@@ -1313,7 +1632,8 @@ class PluginMarketplacePanel(Panel):
 
     def _sort_entries(self, entries: List[MarketplacePluginEntry]) -> List[MarketplacePluginEntry]:
         def popularity(e):
-            return (e.stars + e.downloads, e.name.lower())
+            stars = e.stars if e.stars is not None else 0
+            return (stars + e.downloads, e.name.lower())
 
         if self._sort_idx == 1:
             return sorted(entries, key=popularity)
@@ -1355,27 +1675,38 @@ class PluginMarketplacePanel(Panel):
         if remaining > 0.01:
             state.progress += remaining * _NUDGE_FRACTION
 
-    def _run_async(self, card_id: str, operation, success_msg: str, error_prefix: str):
+    def _run_async(
+        self,
+        card_id: str,
+        operation,
+        success_msg: str,
+        error_prefix: str,
+        cancellable: bool = False,
+    ):
         with self._lock:
             existing = self._card_ops.get(card_id)
             if existing and existing.phase == CardOpPhase.IN_PROGRESS:
                 return
-            state = CardOpState(phase=CardOpPhase.IN_PROGRESS)
+            state = CardOpState(
+                phase=CardOpPhase.IN_PROGRESS,
+                cancellable=cancellable or getattr(operation, "_cancellable", False),
+            )
             self._card_ops[card_id] = state
         self._schedule_model_update()
+
+        unverified_warning = lf.ui.tr("plugin_marketplace.warning.unverified_source")
 
         def on_progress(msg: str):
             with self._lock:
                 self._advance_progress(state, msg)
                 state.message = msg
-                state.output_lines.append(msg)
-                if len(state.output_lines) > MAX_OUTPUT_LINES:
-                    state.output_lines = state.output_lines[-MAX_OUTPUT_LINES:]
+                if msg == unverified_warning:
+                    state.warning = msg
             self._schedule_model_update()
 
         def worker():
             try:
-                result = operation(on_progress)
+                result = operation(on_progress, state.cancel_event.is_set)
                 if result is False:
                     raise RuntimeError(error_prefix)
                 with self._lock:
@@ -1384,20 +1715,33 @@ class PluginMarketplacePanel(Panel):
                         state.message = success_msg.format(result)
                     else:
                         state.message = success_msg
+                    if state.warning:
+                        state.message = safe_format(
+                            lf.ui.tr("plugin_marketplace.success_with_warning"),
+                            success=state.message,
+                            warning=state.warning,
+                        )
                     state.phase = CardOpPhase.SUCCESS
                     state.finished_at = time.monotonic()
                 self._schedule_card_dismiss(card_id, CardOpPhase.SUCCESS)
                 self._schedule_model_update()
             except Exception as e:
+                from .errors import PluginLoadCancelled
+
                 detail = str(e).strip()
                 with self._lock:
-                    if detail:
+                    if isinstance(e, PluginLoadCancelled):
+                        state.message = lf.ui.tr("plugin_marketplace.installation_cancelled")
+                        state.phase = CardOpPhase.CANCELLED
+                    elif detail:
                         state.message = f"{error_prefix}: {detail}"
+                        state.phase = CardOpPhase.ERROR
                     else:
                         state.message = error_prefix
-                    state.phase = CardOpPhase.ERROR
+                        state.phase = CardOpPhase.ERROR
                     state.finished_at = time.monotonic()
-                self._schedule_card_dismiss(card_id, CardOpPhase.ERROR)
+                self._invalidate_discover_cache()
+                self._schedule_card_dismiss(card_id, state.phase)
                 self._schedule_model_update()
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1406,17 +1750,19 @@ class PluginMarketplacePanel(Panel):
         import lichtfeld as lf
 
         tr = lf.ui.tr
-        transport = self._selected_install_transport(card_id)
+        transport = self._selected_install_transport()
 
-        def do_install(on_progress):
+        def do_install(on_progress, should_cancel=None):
             if entry.registry_id:
-                name = mgr.install_from_registry(
-                    entry.registry_id,
-                    on_progress=on_progress,
-                    transport=transport,
-                )
+                kwargs = {"on_progress": on_progress, "transport": transport}
+                if should_cancel is not None:
+                    kwargs["should_cancel"] = should_cancel
+                name = mgr.install_from_registry(entry.registry_id, **kwargs)
             else:
-                name = mgr.install(entry.source_url, on_progress=on_progress, transport=transport)
+                kwargs = {"on_progress": on_progress, "transport": transport}
+                if should_cancel is not None:
+                    kwargs["should_cancel"] = should_cancel
+                name = mgr.install(entry.source_url, **kwargs)
             if mgr.get_state(name) == PluginState.ERROR:
                 err = mgr.get_error(name) or tr("plugin_manager.status.load_failed")
                 raise RuntimeError(err)
@@ -1427,6 +1773,7 @@ class PluginMarketplacePanel(Panel):
             self._invalidate_discover_cache()
             return name
 
+        do_install._cancellable = True
         self._run_async(
             card_id,
             do_install,
@@ -1450,8 +1797,13 @@ class PluginMarketplacePanel(Panel):
             self._schedule_model_update()
             return
 
-        def do_install(on_progress):
-            name = mgr.install(clean_url, on_progress=on_progress)
+        transport = self._selected_install_transport()
+
+        def do_install(on_progress, should_cancel=None):
+            kwargs = {"on_progress": on_progress, "transport": transport}
+            if should_cancel is not None:
+                kwargs["should_cancel"] = should_cancel
+            name = mgr.install(clean_url, **kwargs)
             if mgr.get_state(name) == PluginState.ERROR:
                 err = mgr.get_error(name) or tr("plugin_manager.status.load_failed")
                 raise RuntimeError(err)
@@ -1460,6 +1812,7 @@ class PluginMarketplacePanel(Panel):
             self._invalidate_discover_cache()
             return name
 
+        do_install._cancellable = True
         self._run_async(
             card_id,
             do_install,
@@ -1474,8 +1827,11 @@ class PluginMarketplacePanel(Panel):
         if mgr.get_state(name) == PluginState.ACTIVE:
             return
 
-        def do_load(on_progress):
-            ok = mgr.load(name, on_progress=on_progress)
+        def do_load(on_progress, should_cancel=None):
+            kwargs = {"on_progress": on_progress}
+            if should_cancel is not None:
+                kwargs["should_cancel"] = should_cancel
+            ok = mgr.load(name, **kwargs)
             if not ok:
                 err = mgr.get_error(name) or tr("plugin_manager.status.load_failed")
                 raise RuntimeError(err)
@@ -1536,8 +1892,11 @@ class PluginMarketplacePanel(Panel):
             self._schedule_model_update()
             return
 
-        def do_load(on_progress):
-            ok = mgr.load(name, on_progress=on_progress)
+        def do_load(on_progress, should_cancel=None):
+            kwargs = {"on_progress": on_progress}
+            if should_cancel is not None:
+                kwargs["should_cancel"] = should_cancel
+            ok = mgr.load(name, **kwargs)
             if not ok:
                 err = mgr.get_error(name) or tr("plugin_manager.status.reload_failed")
                 raise RuntimeError(err)
@@ -1555,7 +1914,7 @@ class PluginMarketplacePanel(Panel):
 
         tr = lf.ui.tr
 
-        def do_update(on_progress):
+        def do_update(on_progress, _should_cancel):
             mgr.update(name, on_progress=on_progress)
             self._invalidate_discover_cache()
             return True
@@ -1572,7 +1931,7 @@ class PluginMarketplacePanel(Panel):
 
         tr = lf.ui.tr
 
-        def do_uninstall(on_progress):
+        def do_uninstall(on_progress, _should_cancel):
             on_progress(tr("plugin_manager.status.uninstalling").format(name=name))
             if not mgr.uninstall(name):
                 raise RuntimeError(tr("plugin_manager.status.uninstall_failed"))

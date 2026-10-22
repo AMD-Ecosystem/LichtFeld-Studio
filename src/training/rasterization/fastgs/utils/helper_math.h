@@ -51,13 +51,8 @@ typedef unsigned short ushort;
 #define EXIT_WAIVED 2
 #endif
 
-// Host implementations of the scalar CUDA math builtins (fminf/fmaxf/min/max/
-// rsqrtf). Needed on any HOST compile pass (plain g++/clang for .cpp, and the
-// HIP/CUDA host pass of a .cu) where these are not compiler builtins; skipped on
-// the device pass where they ARE builtins. Keyed on the device-compile macro so
-// it is correct in BOTH passes of a .cu (HIP: __HIP_DEVICE_COMPILE__, CUDA:
-// __CUDA_ARCH__) -- not on USE_HIP, which would wrongly drop them on the HIP host.
-#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+// HIP does not define __CUDACC__; its device headers provide these.
+#if !defined(__CUDACC__) && !defined(__HIP__)
 #include <math.h>
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -72,15 +67,6 @@ inline float fmaxf(float a, float b) {
     return a > b ? a : b;
 }
 
-#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
-// On the HIP host pass, defining a global int min/max(int,int) redefines the
-// ones the HIP runtime headers already provide. Bring std::min/std::max into the
-// global namespace via using-declarations instead (no redefinition), so the
-// unqualified min/max(int,int) calls in the vector helpers below still resolve.
-#include <algorithm>
-using std::max;
-using std::min;
-#else
 inline int max(int a, int b) {
     return a > b ? a : b;
 }
@@ -88,7 +74,6 @@ inline int max(int a, int b) {
 inline int min(int a, int b) {
     return a < b ? a : b;
 }
-#endif
 
 inline float rsqrtf(float x) {
     return 1.0f / sqrtf(x);

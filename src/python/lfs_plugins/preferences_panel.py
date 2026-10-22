@@ -1,0 +1,1800 @@
+# SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Application-level appearance and language preferences."""
+
+import lichtfeld as lf
+import threading
+import shutil
+
+from .asset_index import AssetIndex, resolve_asset_manager_storage_path, resolve_default_asset_directory
+from .asset_watch import scan_all_asset_folders, scan_asset_folder
+
+from .keymap_bindings import KeymapBindingsSection
+from .scrub_fields import ScrubFieldController, ScrubFieldSpec
+from .types import Panel
+from .rendering_defaults import RenderingDefaultsSection, vignette_value, set_vignette_value
+from .ui import PanelStateBinding, RuntimeState
+from .panels import panel_class
+from .marketplace_preferences import (
+    read_preferences as read_marketplace_preferences,
+    reset_preferences as reset_marketplace_preferences,
+    set_preference as set_marketplace_preference,
+)
+from .project_manager_preferences import (
+    read_preferences as read_project_manager_preferences,
+    reset_preferences as reset_project_manager_preferences,
+    set_preference as set_project_manager_preference,
+)
+from .portal_connection_ui import connection_action, connection_state
+
+__lfs_panel_classes__ = ["PreferencesPanel"]
+__lfs_panel_ids__ = ["lfs.preferences"]
+
+
+def draft_change_handler(set_draft, commit):
+    """Change handler for a text field that keeps a draft and commits it on Enter."""
+
+    def on_change(_handle, event, args):
+        if args:
+            set_draft(args[0])
+        if event.get_bool_parameter("linebreak", False):
+            commit()
+
+    return on_change
+
+
+@panel_class("preferences")
+class PreferencesPanel(Panel):
+    """Floating home for application-level preferences."""
+
+    SCALE_OPTIONS = (
+        (0.0, "menu.view.ui_scale.auto"),
+        (1.0, "100%"),
+        (1.25, "125%"),
+        (1.5, "150%"),
+        (1.75, "175%"),
+        (2.0, "200%"),
+    )
+
+    NAVIGATION_OPTIONS = (
+        ("orbit", "preferences.navigation_orbit"),
+        ("trackball", "preferences.navigation_trackball"),
+        ("fpv", "preferences.navigation_fpv"),
+        ("drone", "preferences.navigation_drone"),
+    )
+
+    PROGRESS_BAR_OPTIONS = (
+        ("classic", "preferences.progress_bar_classic"),
+        ("miner", "preferences.progress_bar_miner"),
+    )
+
+    VIEWPORT_CHROME_OPTIONS = (
+        ("solid", "preferences.viewport_chrome_solid"),
+        ("translucent", "preferences.viewport_chrome_translucent"),
+        ("frosted", "preferences.viewport_chrome_frosted"),
+    )
+
+    VIEWPORT_TOOLBAR_POSITION_OPTIONS = (
+        ("top", "preferences.viewport_toolbar_position_top"),
+        ("centered", "preferences.viewport_toolbar_position_centered"),
+        ("free", "preferences.viewport_toolbar_position_free"),
+    )
+
+    SPEED_SCRUB_FIELD_DEFS = {
+        "zoom_speed": ScrubFieldSpec(1.0, 100.0, 1.0, "%d", data_type=int),
+        "navigation_speed": ScrubFieldSpec(1.0, 100.0, 1.0, "%d", data_type=int),
+        **{f"theme_vignette_{name}": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f")
+           for name in ("intensity", "radius", "softness")},
+    }
+
+    EXPANDABLE_SECTIONS = (
+        "language",
+        "project_location",
+        "project_manager",
+        "project_folders",
+        "gallery",
+        "appearance",
+        "scene_rendering",
+        "navigation",
+        "view_snap",
+        "key_bindings",
+        "interface",
+        "scene_graph",
+        "file_associations",
+        "mcp",
+        "portal",
+    )
+
+    def __init__(self):
+        self._rendering_defaults = RenderingDefaultsSection()
+        self._handle = None
+        self._scene_upscaler_catalog = []
+        self._scene_upscaler_presets = {}
+        self._keymap = KeymapBindingsSection()
+        self._theme_catalog = []
+        self._theme_families = []
+        self._language_catalog = []
+        self._last_state = None
+        self._marketplace_git_available = shutil.which("git") is not None
+        self._section = "general"
+        self._expanded_sections = set(self.EXPANDABLE_SECTIONS)
+        self._mcp_enabled = True
+        self._mcp_expose_network = False
+        self._camera_repeat_rate_draft = None
+        self._mcp_port = "45677"
+        self._mcp_applied_port = 45677
+        self._mcp_request_logging = False
+        self._mcp_safe_mode = False
+        self._last_mcp_runtime_config = None
+        self._project_location = ""
+        self._project_folders_index = None
+        self._project_folders_signature = None
+        self._applied_project_location = ""
+        self._document = None
+        self._file_associations = []
+        self._mount_count = 0
+        self._portal_state_binding = PanelStateBinding()
+        self._scrub_fields = ScrubFieldController(
+            self.SPEED_SCRUB_FIELD_DEFS,
+            self._get_scrub_value,
+            self._set_scrub_value,
+            commit_value=self._commit_scrub_value,
+        )
+
+    @property
+    def mount_count(self):
+        """Number of RML document mounts; closing retains the current mount."""
+        return self._mount_count
+
+    def on_bind_model(self, ctx):
+        self._read_mcp_preferences()
+        self._read_project_location()
+        model = ctx.create_data_model("preferences")
+        if model is None:
+            return
+
+        from .gallery_preferences import DEFAULTS, read_preferences
+        for key in DEFAULTS:
+            model.bind("gallery_" + key, lambda k=key: read_preferences()[k],
+                       lambda value, k=key: self._set_gallery_preference(k, value))
+        model.bind_func("gallery_preferences_error", lambda: getattr(self, "_gallery_preferences_error", ""))
+        self._rendering_defaults.bind(model)
+        model.bind_func("show_viewport", lambda: self._section == "viewport")
+        model.bind_event("show_viewport", lambda *_: self._set_section("viewport"))
+        model.bind_func("panel_label", lambda: lf.ui.tr("preferences.title"))
+        model.bind_func("marketplace_git_available", lambda: self._marketplace_git_available)
+        model.bind_func("show_marketplace", lambda: self._section == "marketplace")
+        model.bind_event("show_marketplace", lambda *_: self._set_section("marketplace"))
+        for key in ("view", "git_checkout"):
+            model.bind("marketplace_" + key, lambda k=key: read_marketplace_preferences()[k],
+                       lambda value, k=key: self._set_marketplace_preference(k, value))
+        model.bind_func("show_general", lambda: self._section == "general")
+        model.bind_func("show_appearance", lambda: self._section == "appearance")
+        model.bind_func("show_input", lambda: self._section == "input")
+        model.bind_func("show_interface", lambda: self._section == "interface")
+        model.bind_func("show_file_associations", self._show_file_associations)
+        model.bind_func("has_file_associations", self._has_file_associations)
+        model.bind_func("show_mcp", lambda: self._section == "mcp")
+        model.bind_func("show_portal", lambda: self._section == "portal")
+        for name, getter in (
+            ("portal_connection_status", self._portal_connection_status),
+            ("portal_connection_since", self._portal_connection_since),
+            ("portal_user_code", self._portal_user_code),
+            ("portal_verification_qr", self._portal_verification_qr),
+            ("portal_qr_alt", lambda: lf.ui.tr("portal.preferences.qr_alt")),
+            ("portal_connect_visible", lambda: self._portal_connection_action() == "connect"),
+            ("portal_turn_on_visible", lambda: self._portal_connection_action() == "turn_on"),
+            ("portal_disconnect_visible", lambda: self._portal_connection_state() == "connected"),
+            ("portal_linking", lambda: self._portal_connection_snapshot().linking),
+            ("portal_code_visible", lambda: bool(self._portal_user_code())),
+        ):
+            model.bind_func(name, getter)
+        model.bind_func("show_section_reset", self._show_section_reset)
+        model.bind_func("reset_section_label", self._reset_section_label)
+        for section in self.EXPANDABLE_SECTIONS:
+            model.bind_func(
+                f"{section}_expanded",
+                lambda section=section: section in self._expanded_sections,
+            )
+        model.bind("theme_family_idx", self._theme_family_index, self._set_theme_family_index)
+        model.bind_func("theme_has_variants", self._theme_has_variants)
+        model.bind("progress_bar_idx", self._progress_bar_index, self._set_progress_bar_index)
+        model.bind(
+            "viewport_chrome_idx",
+            self._viewport_chrome_index,
+            self._set_viewport_chrome_index,
+        )
+        model.bind(
+            "viewport_toolbar_position_idx",
+            self._viewport_toolbar_position_index,
+            self._set_viewport_toolbar_position_index,
+        )
+        model.bind("scale_idx", self._scale_index, self._set_scale_index)
+        model.bind("native_floating_windows", lf.ui.get_native_floating_windows,
+                   lambda value: lf.ui.set_native_floating_windows(bool(value)))
+        model.bind(
+            "scene_upscaler_idx",
+            self._scene_upscaler_index,
+            self._set_scene_upscaler_index,
+        )
+        model.bind(
+            "scene_upscaler_preset_idx",
+            self._scene_upscaler_preset_index,
+            self._set_scene_upscaler_preset_index,
+        )
+        model.bind_func(
+            "scene_upscaler_has_preset",
+            lambda: len(self._scene_upscaler_presets.get(self._scene_upscaler(), ())) > 1,
+        )
+        model.bind("language_idx", self._language_index, self._set_language_index)
+        model.bind("navigation_idx", self._navigation_index, self._set_navigation_index)
+        model.bind("navigation_up_idx", self._navigation_up_index, self._set_navigation_up_index)
+        model.bind("new_project_align_grid", lf.get_new_project_align_grid, self._set_new_project_align_grid)
+        model.bind("zoom_speed", lf.ui.get_zoom_speed_preference, self._set_zoom_speed)
+        model.bind(
+            "navigation_speed",
+            lf.ui.get_navigation_speed_preference,
+            self._set_navigation_speed,
+        )
+        model.bind("camera_browse_repeat", lf.ui.get_camera_browse_repeat,
+                   self._set_camera_browse_repeat)
+        model.bind("camera_browse_repeat_rate", self._get_camera_repeat_rate_draft,
+                   self._set_camera_browse_repeat_rate)
+        model.bind_event("step_camera_repeat_rate", self._step_camera_repeat_rate)
+        model.bind_event("camera_repeat_rate_change",
+                         draft_change_handler(self._set_camera_browse_repeat_rate, self._commit_camera_repeat_rate))
+        model.bind_event("commit_camera_repeat_rate", lambda *_: self._commit_camera_repeat_rate())
+        model.bind_event("cancel_camera_repeat_rate", lambda *_: self._cancel_camera_repeat_rate())
+        model.bind("view_snap", lf.get_camera_view_snap_enabled, self._set_view_snap)
+        model.bind("remember_navigation", lf.ui.remember_camera_navigation, self._set_remember_navigation)
+        model.bind("remember_view_snap", lf.ui.remember_camera_view_snap, self._set_remember_view_snap)
+        model.bind(
+            "scene_graph_selection_markers",
+            lf.ui.scene_graph_selection_markers,
+            self._set_scene_graph_selection_markers,
+        )
+        for key in ("format", "sh_degree", "up_axis"):
+            model.bind("splat_drag_" + key,
+                       lambda k=key: self._get_splat_drag_preference(k),
+                       lambda value, k=key: self._set_splat_drag_preference(k, value))
+        model.bind("mcp_enabled", lambda: self._mcp_enabled, self._set_mcp_enabled)
+        model.bind("mcp_expose_network", lambda: self._mcp_expose_network, self._set_mcp_expose_network)
+        model.bind("mcp_port", lambda: self._mcp_port, self._set_mcp_port)
+        model.bind("project_location", lambda: self._project_location, self._set_project_location_draft)
+        model.bind_func("project_location_hint", self._project_location_hint)
+        model.bind_record_list("project_folders")
+        model.bind_event("add_project_folder", self._on_add_project_folder)
+        model.bind_event("rescan_project_folders", self._on_rescan_project_folders)
+        model.bind_event("remove_project_folder", self._on_remove_project_folder)
+        model.bind(
+            "project_manager_default_view",
+            lambda: read_project_manager_preferences()["defaultView"],
+            self._set_project_manager_default_view,
+        )
+        model.bind(
+            "project_manager_open_at_startup",
+            lambda: read_project_manager_preferences()["openAtStartup"],
+            self._set_project_manager_open_at_startup,
+        )
+        model.bind(
+            "project_manager_remember_state",
+            lambda: read_project_manager_preferences()["rememberState"],
+            self._set_project_manager_remember_state,
+        )
+        model.bind(
+            "embed_dataset_by_default",
+            getattr(lf.ui, "get_embed_dataset_by_default", lambda: False),
+            self._set_embed_dataset_by_default,
+        )
+        model.bind("auto_save_on_close",
+                   lf.project_auto_save_on_close_enabled,
+                   lf.project_set_auto_save_on_close)
+        model.bind_event("open_default_app_settings", self._open_default_app_settings)
+        model.bind("mcp_request_logging", lambda: self._mcp_request_logging, self._set_mcp_request_logging)
+        model.bind_func("mcp_safe_mode", lambda: self._mcp_safe_mode)
+        model.bind_func("mcp_status", self._mcp_status_text)
+        model.bind_func("mcp_port_override_visible", lambda: lf.ui.get_mcp_port_override() is not None)
+        model.bind_func("mcp_port_override_text", self._mcp_port_override_text)
+        model.bind("mcp_endpoint_value", self._mcp_endpoint_text, lambda _value: None)
+        model.bind("mcp_token_value", self._mcp_token_text, lambda _value: None)
+        model.bind_func("mcp_error", self._mcp_error_text)
+        model.bind_func("mcp_has_error", lambda: bool(self._mcp_error_text()))
+        model.bind_func("mcp_log_file", self._mcp_log_file_text)
+        model.bind_func("mcp_has_log_file", lambda: bool(self._mcp_log_file_text()))
+        model.bind_event("accept_and_close", self._on_accept_and_close)
+        model.bind_event("reset_current_section", self._on_reset_current_section)
+        model.bind_event("reset_all_settings", self._on_reset_all_settings)
+        model.bind_event("save_startup_sidebar", lambda *_: lf.ui.save_startup_sidebar())
+        model.bind_event("clear_startup_sidebar", lambda *_: lf.ui.clear_startup_sidebar())
+        model.bind_event("show_general", lambda *_: self._set_section("general"))
+        model.bind_event("show_appearance", lambda *_: self._set_section("appearance"))
+        model.bind_event("show_input", lambda *_: self._set_section("input"))
+        model.bind_event("show_interface", lambda *_: self._set_section("interface"))
+        model.bind_event("show_file_associations", lambda *_: self._set_section("file_associations"))
+        model.bind_event("show_mcp", lambda *_: self._set_section("mcp"))
+        model.bind_event("show_portal", lambda *_: self._set_section("portal"))
+        model.bind_event("portal_connect", lambda *_: self._portal_account().start_device_flow())
+        model.bind_event("portal_turn_on", lambda *_: self._portal_account().start_device_flow())
+        model.bind_event("portal_disconnect", lambda *_: self._portal_account().disconnect_async())
+        model.bind_event("portal_cancel", lambda *_: self._portal_account().cancel_device_flow())
+        model.bind_event("portal_copy_code", self._copy_portal_code)
+        model.bind_event("portal_open", self._open_portal_verification)
+        model.bind_event("set_file_association", self._on_set_file_association)
+        model.bind_event("toggle_mcp_enabled", self._on_toggle_mcp_enabled)
+        model.bind_event("mcp_port_change", draft_change_handler(self._set_mcp_port, self._commit_mcp_port))
+        model.bind_event("confirm_mcp_port", lambda *_: self._commit_mcp_port())
+        model.bind_event("project_location_change",
+                         draft_change_handler(self._set_project_location_draft, self._commit_project_location))
+        model.bind_event("confirm_project_location", lambda *_: self._commit_project_location())
+        model.bind_event("browse_project_location", self._on_browse_project_location)
+        model.bind_event("use_default_project_location", self._on_use_default_project_location)
+        model.bind_event("open_mcp_log_folder", self._on_open_mcp_log_folder)
+        model.bind_event("copy_mcp_token", self._on_copy_mcp_token)
+        model.bind_event("toggle_section", self._on_toggle_section)
+        model.bind_event("set_theme_variant", self._set_theme_variant)
+        model.bind_record_list("theme_families")
+        model.bind_record_list("theme_variants")
+        model.bind_record_list("progress_bar_styles")
+        model.bind_record_list("viewport_chrome_styles")
+        model.bind_record_list("viewport_toolbar_positions")
+        model.bind_record_list("scales")
+        model.bind_record_list("scene_upscalers")
+        model.bind_record_list("scene_upscaler_presets")
+        model.bind_record_list("languages")
+        model.bind_record_list("navigation_modes")
+        model.bind_record_list("file_associations")
+        self._handle = model.get_handle()
+        self._portal_state_binding.set_handle(self._handle)
+        self._keymap.bind(model)
+        self._reload_file_associations()
+
+    def on_mount(self, doc):
+        # The title bar is a cancellation boundary for the drafted MCP port,
+        # so it needs the specialized close handler instead of Panel's generic
+        # visibility-only listener.
+        close_btn = doc.get_element_by_id("close-btn") if doc else None
+        if close_btn:
+            close_btn.add_event_listener(
+                "click", lambda _ev: self._on_close(None, None, None)
+            )
+        self._document = doc
+        if doc:
+            self._rendering_defaults.mount(doc)
+        self._portal_state_binding.close()
+        self._portal_state_binding.watch(
+            RuntimeState.account_state,
+            dirty=(
+                "portal_connection_status",
+                "portal_connection_since",
+                "portal_user_code",
+                "portal_verification_qr",
+                "portal_connect_visible",
+                "portal_turn_on_visible",
+                "portal_disconnect_visible",
+                "portal_linking",
+                "portal_code_visible",
+            ),
+        )
+        self._mount_count += 1
+        self._expanded_sections = set(self.EXPANDABLE_SECTIONS)
+        self._dirty_expanded_sections()
+        self._rebuild_records()
+        self._refresh_project_folders()
+        self._load_mcp_preferences()
+        self._consume_section_request()
+        self._last_state = self._state()
+        self._refresh_selection()
+        self._keymap.on_mount(doc)
+        self._ensure_keymap_rows_if_visible()
+        if callable(getattr(doc, "query_selector_all", None)) and callable(
+            getattr(doc, "add_event_listener", None)
+        ):
+            self._scrub_fields.mount(doc)
+
+    def on_unmount(self, doc):
+        self._portal_state_binding.close()
+        self._scrub_fields.unmount()
+        self._keymap.on_unmount()
+        self._document = None
+        self._handle = None
+        doc.remove_data_model("preferences")
+
+    def on_update(self, doc):
+        self._refresh_project_folders()
+        self._consume_section_request()
+        self._sync_mcp_runtime()
+        self._ensure_keymap_rows_if_visible()
+        state = self._state()
+        if state != self._last_state:
+            self._last_state = state
+            self._sync_scene_upscaler_preset_records()
+            self._sync_theme_variant_records()
+            self._dirty_selection()
+            self._dirty_mcp()
+        self._rendering_defaults.sync()
+        self._scrub_fields.sync_all()
+        self._keymap.on_update(doc)
+
+    def _ensure_keymap_rows_if_visible(self):
+        if self._section == "input" and "key_bindings" in self._expanded_sections:
+            self._keymap.ensure_binding_rows()
+
+    def _state(self):
+        project_manager_preferences = read_project_manager_preferences()
+        splat_drag_preferences = lf.ui.get_splat_drag_preferences()
+        return (
+            lf.ui.get_theme(),
+            lf.ui.get_theme_family(),
+            lf.ui.get_theme_mode(),
+            lf.ui.get_progress_bar_style(),
+            lf.ui.get_viewport_chrome_style(),
+            lf.ui.get_viewport_toolbar_position(),
+            float(lf.ui.get_ui_scale_preference()),
+            bool(lf.ui.get_native_floating_windows()),
+            tuple(splat_drag_preferences[key] for key in ("format", "sh_degree", "up_axis")),
+            self._scene_upscaler(),
+            self._scene_upscaler_preset(),
+            lf.ui.get_current_language(),
+            lf.get_camera_navigation_mode(),
+            lf.get_new_project_navigation_up_axis(),
+            lf.get_new_project_align_grid(),
+            float(lf.ui.get_zoom_speed_preference()),
+            float(lf.ui.get_navigation_speed_preference()),
+            lf.ui.get_camera_browse_repeat(),
+            float(lf.ui.get_camera_browse_repeat_rate()),
+            lf.get_camera_view_snap_enabled(),
+            getattr(lf.ui, "get_embed_dataset_by_default", lambda: False)(),
+            lf.project_auto_save_on_close_enabled(),
+            tuple(read_marketplace_preferences().values()),
+            project_manager_preferences["defaultView"],
+            project_manager_preferences["openAtStartup"],
+            project_manager_preferences["rememberState"],
+            lf.ui.remember_camera_navigation(),
+            lf.ui.remember_camera_view_snap(),
+            self._mcp_status_signature(),
+            tuple(vignette_value(name) for name in ("enabled", "intensity", "radius", "softness")),
+        )
+
+    @staticmethod
+    def _open_default_app_settings(*_):
+        lf.ui.register_file_associations()
+        lf.ui.open_file_association_settings()
+
+    def _rebuild_records(self):
+        self._sync_scene_reconstruction_catalog()
+        self._theme_catalog = sorted(
+            lf.ui.themes(),
+            key=lambda theme: (theme.get("order", 0), theme.get("name", theme.get("id", ""))),
+        )
+        families = {}
+        for theme in self._theme_catalog:
+            family_id = theme.get("family_id") or theme["id"]
+            family = families.setdefault(
+                family_id,
+                {
+                    "id": family_id,
+                    "name": theme.get("family_name") or theme.get("name") or family_id,
+                    "order": theme.get("order", 0),
+                    "variants": [],
+                },
+            )
+            family["order"] = min(family["order"], theme.get("order", 0))
+            family["variants"].append(theme)
+        self._theme_families = sorted(
+            families.values(), key=lambda family: (family["order"], family["name"])
+        )
+        self._language_catalog = list(lf.ui.get_languages())
+        if not self._handle:
+            return
+        self._handle.update_record_list(
+            "theme_families",
+            [
+                {
+                    "index": str(index),
+                    "label": family["name"],
+                }
+                for index, family in enumerate(self._theme_families)
+            ],
+        )
+        self._sync_theme_variant_records()
+        self._handle.update_record_list(
+            "progress_bar_styles",
+            [
+                {"index": str(index), "label": lf.ui.tr(label)}
+                for index, (_style, label) in enumerate(self.PROGRESS_BAR_OPTIONS)
+            ],
+        )
+        self._handle.update_record_list(
+            "viewport_chrome_styles",
+            [
+                {"index": str(index), "label": lf.ui.tr(label)}
+                for index, (_style, label) in enumerate(self.VIEWPORT_CHROME_OPTIONS)
+            ],
+        )
+        self._handle.update_record_list(
+            "viewport_toolbar_positions",
+            [
+                {"index": str(index), "label": lf.ui.tr(label)}
+                for index, (_position, label) in enumerate(
+                    self.VIEWPORT_TOOLBAR_POSITION_OPTIONS
+                )
+            ],
+        )
+        self._handle.update_record_list(
+            "scales",
+            [
+                {
+                    "index": str(index),
+                    "label": lf.ui.tr(label) if scale == 0.0 else label,
+                }
+                for index, (scale, label) in enumerate(self.SCALE_OPTIONS)
+            ],
+        )
+        self._handle.update_record_list(
+            "scene_upscalers",
+            [
+                {"index": str(index), "label": lf.ui.tr(label_key)}
+                for index, (_backend, label_key) in enumerate(self._scene_upscaler_catalog)
+            ],
+        )
+        self._sync_scene_upscaler_preset_records()
+        self._handle.update_record_list(
+            "languages",
+            [
+                {"index": str(index), "label": name}
+                for index, (_code, name) in enumerate(self._language_catalog)
+            ],
+        )
+        self._handle.update_record_list(
+            "navigation_modes",
+            [
+                {"index": str(index), "label": lf.ui.tr(label)}
+                for index, (_mode, label) in enumerate(self.NAVIGATION_OPTIONS)
+            ],
+        )
+        self._reload_file_associations()
+
+    def _theme_family_index(self):
+        current = lf.ui.get_theme_family()
+        for index, family in enumerate(self._theme_families):
+            if family["id"] == current:
+                return str(index)
+        return "0"
+
+    def _set_theme_family_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self._theme_families):
+            family = self._theme_families[index]
+            variants = family["variants"]
+            available_modes = {variant["mode"] for variant in variants}
+            mode = lf.ui.get_theme_mode()
+            if len(variants) == 1:
+                mode = variants[0]["mode"]
+            elif mode != "auto" and mode not in available_modes:
+                mode = "dark" if "dark" in available_modes else "light"
+            lf.ui.set_theme_family(family["id"], mode)
+            self._sync_theme_variant_records()
+            self._refresh_selection()
+
+    def _selected_theme_family(self):
+        current = lf.ui.get_theme_family()
+        return next(
+            (family for family in self._theme_families if family["id"] == current),
+            None,
+        )
+
+    def _theme_has_variants(self):
+        family = self._selected_theme_family()
+        return bool(family and len(family["variants"]) > 1)
+
+    def _sync_theme_variant_records(self):
+        if not self._handle:
+            return
+        family = self._selected_theme_family()
+        selection_mode = lf.ui.get_theme_mode()
+        records = []
+        if family and len(family["variants"]) > 1:
+            variants = sorted(
+                family["variants"],
+                key=lambda variant: (variant.get("order", 0), variant.get("mode", "")),
+            )
+            for variant in variants:
+                records.append(
+                    {
+                        "mode": variant["mode"],
+                        "label": variant.get("variant_name") or variant.get("name") or variant["mode"],
+                        "selected": selection_mode == variant["mode"],
+                    }
+                )
+            modes = {variant["mode"] for variant in variants}
+            if {"dark", "light"}.issubset(modes) and lf.ui.supports_system_theme():
+                records.append(
+                    {
+                        "mode": "auto",
+                        "label": lf.ui.tr("menu.view.theme.auto"),
+                        "selected": selection_mode == "auto",
+                    }
+                )
+        self._handle.update_record_list("theme_variants", records)
+        self._handle.dirty("theme_has_variants")
+
+    def _set_theme_variant(self, _handle, _event, args):
+        if not args:
+            return
+        mode = str(args[0])
+        family = self._selected_theme_family()
+        if not family:
+            return
+        if lf.ui.set_theme_family(family["id"], mode):
+            self._sync_theme_variant_records()
+            self._refresh_selection()
+
+    def _progress_bar_index(self):
+        current = lf.ui.get_progress_bar_style()
+        for index, (style, _label) in enumerate(self.PROGRESS_BAR_OPTIONS):
+            if style == current:
+                return str(index)
+        return "0"
+
+    def _set_progress_bar_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self.PROGRESS_BAR_OPTIONS):
+            lf.ui.set_progress_bar_style(self.PROGRESS_BAR_OPTIONS[index][0])
+            self._refresh_selection()
+
+    def _viewport_chrome_index(self):
+        current = lf.ui.get_viewport_chrome_style()
+        for index, (style, _label) in enumerate(self.VIEWPORT_CHROME_OPTIONS):
+            if style == current:
+                return str(index)
+        return "1"
+
+    def _set_viewport_chrome_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self.VIEWPORT_CHROME_OPTIONS):
+            lf.ui.set_viewport_chrome_style(self.VIEWPORT_CHROME_OPTIONS[index][0])
+            self._refresh_selection()
+
+    def _viewport_toolbar_position_index(self):
+        current = lf.ui.get_viewport_toolbar_position()
+        for index, (position, _label) in enumerate(self.VIEWPORT_TOOLBAR_POSITION_OPTIONS):
+            if position == current:
+                return str(index)
+        return "1"
+
+    def _set_viewport_toolbar_position_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self.VIEWPORT_TOOLBAR_POSITION_OPTIONS):
+            lf.ui.set_viewport_toolbar_position(
+                self.VIEWPORT_TOOLBAR_POSITION_OPTIONS[index][0]
+            )
+            self._refresh_selection()
+
+    def _scale_index(self):
+        preference = float(lf.ui.get_ui_scale_preference())
+        for index, (scale, _label) in enumerate(self.SCALE_OPTIONS):
+            if abs(preference - scale) < 0.01:
+                return str(index)
+        return "0"
+
+    def _set_scale_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self.SCALE_OPTIONS):
+            lf.ui.set_ui_scale(self.SCALE_OPTIONS[index][0])
+            self._refresh_selection()
+
+    def _scene_upscaler(self):
+        settings = lf.get_render_settings()
+        backend = "native" if settings is None else str(settings.scene_upscaler)
+        return (
+            backend
+            if any(item[0] == backend for item in self._scene_upscaler_catalog)
+            else "native"
+        )
+
+    def _sync_scene_reconstruction_catalog(self):
+        records = lf.ui.get_scene_reconstruction_options()
+        backends = []
+        presets = {}
+        for record in records:
+            backend_id = str(record["id"])
+            label_key = str(record["label_key"])
+            backend_presets = tuple(
+                (str(preset["id"]), str(preset["label_key"]))
+                for preset in record.get("presets", ())
+            )
+            if backend_id and label_key and backend_presets:
+                backends.append((backend_id, label_key))
+                presets[backend_id] = backend_presets
+        self._scene_upscaler_catalog = backends
+        self._scene_upscaler_presets = presets
+
+    def _sync_scene_upscaler_preset_records(self):
+        if not self._handle:
+            return
+        presets = self._scene_upscaler_presets.get(self._scene_upscaler(), ())
+        selected_preset = self._scene_upscaler_preset()
+        self._handle.update_record_list(
+            "scene_upscaler_presets",
+            [
+                {
+                    "index": str(index),
+                    "label": lf.ui.tr(label_key),
+                    "selected": preset == selected_preset,
+                }
+                for index, (preset, label_key) in enumerate(presets)
+            ],
+        )
+
+    def _scene_upscaler_index(self):
+        current = self._scene_upscaler()
+        return next(
+            (str(index) for index, (backend, _label) in enumerate(self._scene_upscaler_catalog)
+             if backend == current),
+            "0",
+        )
+
+    def _set_scene_upscaler_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if not 0 <= index < len(self._scene_upscaler_catalog):
+            return
+        settings = lf.get_render_settings()
+        if settings is None:
+            return
+        backend = self._scene_upscaler_catalog[index][0]
+        presets = self._scene_upscaler_presets.get(backend, ())
+        default_preset = presets[0][0] if presets else "native"
+        try:
+            remembered_preset = str(lf.ui.get_scene_reconstruction_preset_preference(backend))
+        except AttributeError:
+            remembered_preset = default_preset
+        preset = (
+            remembered_preset
+            if any(item[0] == remembered_preset for item in presets)
+            else default_preset
+        )
+        self._apply_scene_reconstruction(backend, preset)
+        self._sync_scene_upscaler_preset_records()
+        self._refresh_selection()
+
+    @staticmethod
+    def _apply_scene_reconstruction(backend, preset):
+        setter = getattr(lf.ui, "set_scene_reconstruction", None)
+        if setter is not None:
+            return setter(backend, preset)
+        settings = lf.get_render_settings()
+        if settings is None:
+            return False
+        settings.scene_upscaler = backend
+        settings.scene_upscaler_preset = preset
+        return True
+
+    def _scene_upscaler_preset(self):
+        backend = self._scene_upscaler()
+        settings = lf.get_render_settings()
+        presets = self._scene_upscaler_presets.get(backend, ())
+        if not presets:
+            return "native"
+        preset = presets[0][0] if settings is None else str(settings.scene_upscaler_preset)
+        return preset if any(item[0] == preset for item in presets) else presets[0][0]
+
+    def _scene_upscaler_preset_index(self):
+        current = self._scene_upscaler_preset()
+        presets = self._scene_upscaler_presets.get(self._scene_upscaler(), ())
+        return next(
+            (str(index) for index, (preset, _label) in enumerate(presets)
+             if preset == current),
+            "0",
+        )
+
+    def _set_scene_upscaler_preset_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        backend = self._scene_upscaler()
+        presets = self._scene_upscaler_presets.get(backend, ())
+        if not 0 <= index < len(presets):
+            return
+        if len(presets) <= 1:
+            return
+        self._apply_scene_reconstruction(backend, presets[index][0])
+        self._refresh_selection()
+
+    def _language_index(self):
+        current = lf.ui.get_current_language()
+        for index, (code, _name) in enumerate(self._language_catalog):
+            if code == current:
+                return str(index)
+        return "0"
+
+    def _set_language_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self._language_catalog):
+            language = self._language_catalog[index][0]
+            if language == lf.ui.get_current_language():
+                return
+            lf.ui.set_language(language)
+            self._refresh_selection()
+
+    def _navigation_index(self):
+        current = lf.get_camera_navigation_mode()
+        for index, (mode, _label) in enumerate(self.NAVIGATION_OPTIONS):
+            if mode == current:
+                return str(index)
+        return "0"
+
+    def _set_navigation_index(self, value):
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self.NAVIGATION_OPTIONS):
+            lf.set_camera_navigation_mode(self.NAVIGATION_OPTIONS[index][0])
+            self._refresh_selection()
+
+    def _navigation_up_index(self):
+        return "1" if lf.get_new_project_navigation_up_axis() == "data_z" else "0"
+
+    def _set_navigation_up_index(self, value):
+        axis = {"0": "legacy_y", "1": "data_z"}.get(str(value))
+        if axis is not None:
+            lf.set_new_project_navigation_defaults(axis, lf.get_new_project_align_grid())
+            self._refresh_selection()
+
+    def _set_new_project_align_grid(self, enabled):
+        lf.set_new_project_navigation_defaults(lf.get_new_project_navigation_up_axis(), bool(enabled))
+        self._refresh_selection()
+
+    def _set_zoom_speed(self, value):
+        lf.ui.set_zoom_speed_preference(float(value))
+        self._refresh_selection()
+
+    def _set_navigation_speed(self, value):
+        lf.ui.set_navigation_speed_preference(float(value))
+        self._refresh_selection()
+
+    def _set_camera_browse_repeat(self, value):
+        lf.ui.set_camera_browse_repeat(bool(value))
+        self._refresh_selection()
+
+    def _get_camera_repeat_rate_draft(self):
+        if self._camera_repeat_rate_draft is None:
+            return str(int(lf.ui.get_camera_browse_repeat_rate()))
+        return self._camera_repeat_rate_draft
+
+    def _set_camera_browse_repeat_rate(self, value):
+        # Retain empty and partial input until Enter or blur. Periodic refreshes
+        # must read this draft, rather than restore the saved value mid-edit.
+        self._camera_repeat_rate_draft = str(value)
+
+    def _cancel_camera_repeat_rate(self):
+        self._camera_repeat_rate_draft = None
+        self._refresh_selection()
+
+    def _commit_camera_repeat_rate(self):
+        try:
+            rate = float(self._get_camera_repeat_rate_draft())
+        except (TypeError, ValueError):
+            rate = 0
+        valid = 1 <= rate <= 20
+        if valid and round(rate) != lf.ui.get_camera_browse_repeat_rate():
+            lf.ui.set_camera_browse_repeat_rate(round(rate))
+        self._cancel_camera_repeat_rate()
+        return valid
+
+    def _step_camera_repeat_rate(self, _handle, _event, args):
+        if not args:
+            return
+        self._commit_camera_repeat_rate()
+        rate = lf.ui.get_camera_browse_repeat_rate() + int(args[0])
+        lf.ui.set_camera_browse_repeat_rate(max(1, min(20, rate)))
+        self._refresh_selection()
+
+    def _get_scrub_value(self, prop):
+        if prop.startswith("theme_vignette_"):
+            return float(vignette_value(prop.removeprefix("theme_vignette_")))
+        if prop == "zoom_speed":
+            return float(lf.ui.get_zoom_speed_preference())
+        if prop == "navigation_speed":
+            return float(lf.ui.get_navigation_speed_preference())
+        return self.SPEED_SCRUB_FIELD_DEFS[prop].min_value
+
+    def _set_scrub_value(self, prop, value):
+        if prop.startswith("theme_vignette_"):
+            set_vignette_value(prop.removeprefix("theme_vignette_"), value, persist=False)
+            if self._handle:
+                self._handle.dirty(prop)
+            return
+        if prop == "zoom_speed":
+            lf.ui.set_zoom_speed_preference(float(value), persist=False)
+        elif prop == "navigation_speed":
+            lf.ui.set_navigation_speed_preference(float(value), persist=False)
+        self._refresh_selection()
+
+    def _commit_scrub_value(self, prop, value):
+        if prop.startswith("theme_vignette_"):
+            set_vignette_value(prop.removeprefix("theme_vignette_"), value)
+            return
+        if prop == "zoom_speed":
+            self._set_zoom_speed(value)
+        elif prop == "navigation_speed":
+            self._set_navigation_speed(value)
+
+    def _set_view_snap(self, enabled):
+        lf.set_camera_view_snap_enabled(bool(enabled))
+        self._refresh_selection()
+
+    def _set_remember_navigation(self, enabled):
+        lf.ui.set_remember_camera_navigation(bool(enabled))
+        if enabled:
+            lf.set_camera_navigation_mode(lf.get_camera_navigation_mode())
+        self._refresh_selection()
+
+    def _set_remember_view_snap(self, enabled):
+        lf.ui.set_remember_camera_view_snap(bool(enabled))
+        if enabled:
+            lf.set_camera_view_snap_enabled(lf.get_camera_view_snap_enabled())
+        self._refresh_selection()
+
+    def _get_splat_drag_preference(self, key):
+        value = lf.ui.get_splat_drag_preferences()[key]
+        return value if key == "format" else str(value)
+
+    def _set_splat_drag_preference(self, key, value):
+        if self._mcp_safe_mode:
+            return
+        if key != "format":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return
+        if key == "sh_degree" and not 0 <= value <= 3:
+            return
+        if key == "up_axis" and value not in (-2, 2, -3, 3):
+            return
+        lf.ui.set_splat_drag_preferences({key: value})
+        if self._handle:
+            self._handle.dirty("splat_drag_" + key)
+
+    def _set_scene_graph_selection_markers(self, enabled):
+        if self._mcp_safe_mode:
+            return
+        lf.ui.set_scene_graph_selection_markers(bool(enabled))
+        self._refresh_selection()
+
+    def _read_project_location(self):
+        stored = lf.ui.get_project_location_preference()
+        self._applied_project_location = stored or lf.ui.get_default_project_location()
+        self._project_location = self._applied_project_location
+        if self._project_folders_index is not None:
+            self._project_folders_index.set_default_folder_path(self._applied_project_location)
+            self._project_folders_signature = None
+        self._dirty_project_location()
+
+    def _project_folders_backend(self):
+        get_panel = getattr(lf.ui, "get_panel_object", None)
+        panel = get_panel("lfs.asset_manager") if callable(get_panel) else None
+        if panel is not None and getattr(panel, "_asset_index", None) is not None:
+            return panel, panel._asset_index_folders()
+        if self._project_folders_index is None:
+            path = resolve_asset_manager_storage_path()
+            path.mkdir(parents=True, exist_ok=True)
+            self._project_folders_index = AssetIndex(
+                library_path=path / "library.json",
+                default_folder_path=resolve_default_asset_directory(),
+            )
+            self._project_folders_index.load()
+        return self._project_folders_index, self._project_folders_index.folders
+
+    def _refresh_project_folders(self):
+        if not self._handle:
+            return
+        backend, folders = self._project_folders_backend()
+        signature = tuple(sorted((key, str(value.get("name")), str(value.get("path")))
+                                 for key, value in folders.items()))
+        if signature == self._project_folders_signature:
+            return
+        self._project_folders_signature = signature
+        rows = [
+            {
+                "id": key,
+                "name": str(value.get("name") or value.get("path") or key),
+                "label": str(value.get("name") or value.get("path") or key) + (
+                    f" ({lf.ui.tr('preferences.project_folders_default')})" if key == "default" else ""
+                ),
+                "path": str(value.get("path") or ""),
+                "is_default": key == "default",
+                "can_remove": key != "default",
+            }
+            for key, value in folders.items()
+        ]
+        rows.sort(key=lambda row: (row["id"] != "default", row["name"].casefold()))
+        self._handle.update_record_list("project_folders", rows)
+        self._handle.dirty("project_folders")
+
+    def _on_add_project_folder(self, _handle=None, _event=None, _args=None):
+        directory = lf.ui.open_folder_dialog(
+            lf.ui.tr("projects.dialog.select_folder"), str(resolve_default_asset_directory()))
+        if not directory:
+            return
+        folder_only = lf.ui.tr("projects.action.folder_only")
+        include_subfolders = lf.ui.tr("projects.action.include_subfolders")
+
+        def choose(button):
+            if button not in (folder_only, include_subfolders):
+                return
+            recursive = button == include_subfolders
+            backend, _folders = self._project_folders_backend()
+            if hasattr(backend, "_add_folder_from_path"):
+                backend._add_folder_from_path(str(directory), recursive=recursive)
+            else:
+                folder = backend.add_folder(str(directory), recursive=recursive)
+                if folder is not None:
+                    threading.Thread(
+                        target=scan_asset_folder,
+                        args=(backend, folder.id, str(directory)),
+                        kwargs={"recursive": recursive}, daemon=True,
+                    ).start()
+            self._refresh_project_folders()
+
+        lf.ui.confirm_dialog(
+            lf.ui.tr("projects.dialog.scan_depth"),
+            lf.ui.tr("projects.dialog.scan_depth_message"),
+            [folder_only, include_subfolders, lf.ui.tr("common.cancel")], choose,
+        )
+
+    def _on_remove_project_folder(self, _handle=None, _event=None, args=None):
+        folder_id = str((args or [""])[0])
+        backend, folders = self._project_folders_backend()
+        folder = folders.get(folder_id)
+        if folder_id == "default" or folder is None:
+            return
+        if hasattr(backend, "on_delete_folder"):
+            backend.on_delete_folder(None, None, [folder_id])
+            self._project_folders_signature = None
+            return
+        label = lf.ui.tr("projects.action.remove_folder")
+        count = sum(
+            project.get("folder_id") == folder_id
+            for project in backend.assets.values()
+        )
+
+        def confirmed(button):
+            if button == label:
+                backend.delete_folder(folder_id)
+                self._refresh_project_folders()
+        lf.ui.confirm_dialog(
+            lf.ui.tr("projects.dialog.remove_folder"),
+            lf.ui.tr("projects.dialog.remove_folder_message").format(
+                name=str(folder.get("name") or ""), count=count,
+            ),
+            [lf.ui.tr("common.cancel"), label], confirmed,
+        )
+
+    def _on_rescan_project_folders(self, _handle=None, _event=None, _args=None):
+        backend, _folders = self._project_folders_backend()
+        if hasattr(backend, "refresh_catalog"):
+            backend.refresh_catalog(scan_folders=True)
+        else:
+            threading.Thread(
+                target=scan_all_asset_folders, args=(backend,), daemon=True,
+            ).start()
+
+    def _set_project_location_draft(self, value):
+        self._project_location = str(value).strip()
+        self._dirty_project_location()
+
+    @staticmethod
+    def _set_embed_dataset_by_default(enabled):
+        setter = getattr(lf.ui, "set_embed_dataset_by_default", None)
+        if setter:
+            setter(bool(enabled))
+
+    @staticmethod
+    def _notify_project_manager_preferences_changed():
+        getter = getattr(lf.ui, "get_panel_object", None)
+        panel = getter("lfs.asset_manager") if callable(getter) else None
+        reload_preferences = getattr(panel, "reload_project_manager_preferences", None)
+        if callable(reload_preferences):
+            reload_preferences()
+
+    @staticmethod
+    def _notify_marketplace_preferences_changed():
+        panel = lf.ui.get_panel_object("lfs.plugin_marketplace")
+        reload_preferences = getattr(panel, "reload_marketplace_preferences", None)
+        if callable(reload_preferences):
+            reload_preferences()
+
+    def _set_marketplace_preference(self, key, value):
+        if key == "git_checkout" and value and not self._marketplace_git_available:
+            return
+        set_marketplace_preference(key, value)
+        self._notify_marketplace_preferences_changed()
+        if self._handle:
+            self._handle.dirty("marketplace_" + key)
+
+    def _set_project_manager_default_view(self, value):
+        try:
+            set_project_manager_preference("defaultView", str(value))
+        except (OSError, TypeError, ValueError):
+            return
+        self._notify_project_manager_preferences_changed()
+        self._refresh_selection()
+
+    def _set_project_manager_open_at_startup(self, enabled):
+        try:
+            set_project_manager_preference("openAtStartup", bool(enabled))
+        except (OSError, TypeError, ValueError):
+            return
+        self._refresh_selection()
+
+    def _set_project_manager_remember_state(self, enabled):
+        try:
+            set_project_manager_preference("rememberState", bool(enabled))
+        except (OSError, TypeError, ValueError):
+            return
+        self._notify_project_manager_preferences_changed()
+        self._refresh_selection()
+
+    def _on_browse_project_location(self, _handle, _event, _args):
+        start = self._project_location or lf.ui.get_default_project_location()
+        chosen = lf.ui.open_folder_dialog(
+            lf.ui.tr("preferences.project_location"), start)
+        if chosen:
+            self._project_location = chosen
+            self._commit_project_location()
+
+    def _on_use_default_project_location(self, _handle, _event, _args):
+        lf.ui.clear_project_location()
+        self._read_project_location()
+
+    def _project_location_hint(self):
+        template = (
+            lf.ui.tr("preferences.project_location_hint")
+            or "New projects and the Default folder: {path}"
+        )
+        return template.replace("{path}", self._applied_project_location)
+
+    def _commit_project_location(self):
+        draft = (self._project_location or "").strip()
+        default_path = lf.ui.get_default_project_location()
+        if not draft or draft == default_path:
+            lf.ui.clear_project_location()
+            self._read_project_location()
+            return True
+        error = lf.ui.set_project_location(draft)
+        if error:
+            lf.ui.message_dialog(
+                lf.ui.tr("preferences.project_location"),
+                error or lf.ui.tr("preferences.project_location_invalid"),
+                "error",
+            )
+            self._project_location = self._applied_project_location
+            self._dirty_project_location()
+            return False
+        self._read_project_location()
+        return True
+
+    def _dirty_project_location(self):
+        if not self._handle:
+            return
+        self._handle.dirty("project_location")
+        self._handle.dirty("project_location_hint")
+
+    def _read_mcp_preferences(self):
+        preferences = lf.ui.get_mcp_preferences()
+        self._mcp_enabled = bool(preferences.get("enabled", True))
+        self._mcp_expose_network = bool(preferences.get("expose_network", False))
+        self._mcp_port = str(preferences.get("port", 45677))
+        self._mcp_applied_port = int(self._mcp_port)
+        self._mcp_request_logging = bool(preferences.get("request_logging", False))
+        self._mcp_safe_mode = bool(preferences.get("safe_mode", False))
+        self._last_mcp_runtime_config = self._mcp_runtime_config_signature()
+
+    def _load_mcp_preferences(self):
+        self._read_mcp_preferences()
+        self._dirty_mcp()
+
+    def _set_mcp_enabled(self, enabled):
+        if self._mcp_safe_mode:
+            return
+        self._mcp_enabled = bool(enabled)
+        self._apply_mcp_preferences()
+
+    def _on_toggle_mcp_enabled(self, _handle, _event, _args):
+        self._set_mcp_enabled(not self._mcp_enabled)
+
+    def _set_mcp_expose_network(self, enabled):
+        if self._mcp_safe_mode:
+            return
+        self._mcp_expose_network = bool(enabled)
+        self._apply_mcp_preferences()
+
+    def _set_mcp_port(self, value):
+        if self._mcp_safe_mode:
+            return
+        self._mcp_port = str(value).strip()
+        self._dirty_mcp()
+
+    def _commit_mcp_port(self):
+        port = self._validated_mcp_port()
+        if port is None:
+            self._dirty_mcp()
+            return False
+        if port == self._mcp_applied_port:
+            status = lf.ui.get_mcp_status()
+            if status.get("enabled") and status.get("phase") == "failed":
+                return self._apply_mcp_preferences(port)
+            return True
+        return self._apply_mcp_preferences(port)
+
+    def _set_mcp_request_logging(self, enabled):
+        if self._mcp_safe_mode:
+            return
+        self._mcp_request_logging = bool(enabled)
+        self._apply_mcp_preferences()
+
+    def _apply_mcp_preferences(self, port=None):
+        if self._mcp_safe_mode:
+            return False
+        port = self._mcp_applied_port if port is None else port
+        accepted = lf.ui.set_mcp_preferences(
+            self._mcp_enabled,
+            self._mcp_expose_network,
+            port,
+            self._mcp_request_logging,
+        )
+        if not accepted:
+            self._dirty_mcp()
+            return False
+        self._mcp_applied_port = port
+        self._last_mcp_runtime_config = self._mcp_runtime_config_signature()
+        self._dirty_mcp()
+        return True
+
+    def _validated_mcp_port(self):
+        try:
+            port = int(self._mcp_port)
+        except (TypeError, ValueError):
+            return None
+        return port if 1 <= port <= 65535 else None
+
+    def _mcp_status_signature(self):
+        status = lf.ui.get_mcp_status()
+        return (
+            bool(status.get("enabled")),
+            bool(status.get("running")),
+            str(status.get("phase", "")),
+            bool(status.get("expose_network")),
+            int(status.get("port", 0)),
+            int(status.get("request_count", 0)),
+            int(status.get("success_count", 0)),
+            int(status.get("error_count", 0)),
+            bool(status.get("request_logging")),
+            str(status.get("log_file", "")),
+            str(status.get("error", "")),
+            str(status.get("error_kind", "")),
+            str(status.get("error_address", "")),
+            int(status.get("error_port", 0)),
+            bool(status.get("safe_mode", False)),
+            tuple(str(endpoint) for endpoint in status.get("endpoints") or ()),
+        )
+
+    def _mcp_runtime_config_signature(self):
+        status = lf.ui.get_mcp_status()
+        return (
+            bool(status.get("enabled")),
+            bool(status.get("expose_network")),
+            int(status.get("port", 45677)),
+            bool(status.get("request_logging")),
+            bool(status.get("safe_mode", False)),
+        )
+
+    def _sync_mcp_runtime(self):
+        signature = self._mcp_runtime_config_signature()
+        if signature == self._last_mcp_runtime_config:
+            return
+        draft_port = self._mcp_port
+        has_unconfirmed_port = draft_port != str(self._mcp_applied_port)
+        self._load_mcp_preferences()
+        if has_unconfirmed_port:
+            self._mcp_port = draft_port
+            self._dirty_mcp()
+
+    def _mcp_status_text(self):
+        if self._validated_mcp_port() is None:
+            return lf.ui.tr("preferences.mcp_status_error")
+        status = lf.ui.get_mcp_status()
+        phase = status.get("phase")
+        if phase == "starting":
+            return lf.ui.tr("preferences.mcp_status_starting")
+        if phase == "stopping":
+            return lf.ui.tr("preferences.mcp_status_stopping")
+        if phase == "failed":
+            return lf.ui.tr("preferences.mcp_status_error")
+        if phase == "disabled" or not status.get("enabled"):
+            return lf.ui.tr("preferences.mcp_status_off")
+        if phase == "running" or status.get("running"):
+            return lf.ui.tr("preferences.mcp_status_running")
+        return lf.ui.tr("preferences.mcp_status_error")
+
+    def _mcp_endpoint_text(self):
+        status = lf.ui.get_mcp_status()
+        if not status.get("running"):
+            return lf.ui.tr("preferences.mcp_no_active_endpoint")
+        endpoints = status.get("endpoints") or []
+        if endpoints:
+            return "\n".join(str(endpoint) for endpoint in endpoints)
+        port = status.get("port", 45677)
+        return f"http://127.0.0.1:{port}/mcp\nhttp://localhost:{port}/mcp"
+
+    def _mcp_endpoint_rows(self):
+        return min(10, max(2, len(self._mcp_endpoint_text().splitlines())))
+
+    def _mcp_error_text(self):
+        if self._validated_mcp_port() is None:
+            return lf.ui.tr("preferences.mcp_invalid_port")
+        status = lf.ui.get_mcp_status()
+        error_kind = status.get("error_kind", "none")
+        if error_kind == "invalid_port":
+            return lf.ui.tr("preferences.mcp_invalid_port")
+        if error_kind == "bind_failed":
+            address = str(status.get("error_address", ""))
+            port = int(status.get("error_port", 0))
+            endpoint = f"{address}:{port}" if address and port else address
+            return lf.ui.tr("preferences.mcp_bind_failed").format(
+                endpoint=endpoint
+            )
+        return (
+            lf.ui.tr("status_bar.mcp_error_detail")
+            if error_kind not in ("", "none") or status.get("error")
+            else ""
+        )
+
+    def _mcp_log_file_text(self):
+        return str(lf.ui.get_mcp_status().get("log_file", ""))
+
+    def _on_open_mcp_log_folder(self, _handle, _event, _args):
+        lf.ui.open_url(lf.ui.get_mcp_log_directory())
+
+    def _on_copy_mcp_token(self, _handle, _event, _args):
+        token = self._mcp_token_text()
+        if token:
+            lf.ui.set_clipboard_text(token)
+
+    def _mcp_token_text(self):
+        getter = getattr(lf.ui, "get_mcp_access_token", None)
+        return getter() if getter else ""
+
+    @staticmethod
+    def _coerce_bool(value):
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _file_association_status_rows(self):
+        getter = getattr(lf, "file_associations_status", None)
+        if not callable(getter):
+            return []
+        rows = getter()
+        if not rows:
+            return []
+        result = []
+        for row in rows:
+            extension = str(row.get("extension", "")).strip()
+            if not extension:
+                continue
+            result.append(
+                {
+                    "extension": extension,
+                    "registered": bool(row.get("registered", False)),
+                    "label": extension,
+                }
+            )
+        return result
+
+    def _reload_file_associations(self):
+        self._file_associations = self._file_association_status_rows()
+        if self._handle:
+            self._handle.update_record_list(
+                "file_associations",
+                [
+                    {
+                        "extension": row["extension"],
+                        "registered": row["registered"],
+                        "label": row["label"],
+                    }
+                    for row in self._file_associations
+                ],
+            )
+            dirty = getattr(self._handle, "dirty", None)
+            if callable(dirty):
+                dirty("has_file_associations")
+                dirty("show_file_associations")
+
+    def _has_file_associations(self):
+        return bool(self._file_associations)
+
+    def _show_file_associations(self):
+        return self._section == "file_associations" and self._has_file_associations()
+
+    def _on_set_file_association(self, _handle, _event, args):
+        if not args or len(args) < 2:
+            return
+        self._set_file_association(args[0], args[1])
+
+    def _set_file_association(self, extension, enabled):
+        setter = getattr(lf, "file_association_set", None)
+        if not callable(setter):
+            return False
+        ok = bool(setter(str(extension), self._coerce_bool(enabled)))
+        self._reload_file_associations()
+        return ok
+
+    def _consume_section_request(self):
+        section = lf.ui.take_preferences_section_request()
+        if section in ("general", "appearance", "viewport", "input", "interface", "file_associations", "mcp", "marketplace"):
+            if section == "file_associations" and not self._has_file_associations():
+                return
+            self._set_section(section)
+
+    def _mcp_port_override_text(self):
+        port = lf.ui.get_mcp_port_override()
+        if port is None:
+            return ""
+        return lf.ui.tr("preferences.mcp_port_override").replace("{port}", str(port))
+
+    def _dirty_mcp(self):
+        if not self._handle:
+            return
+        for name in (
+            "mcp_enabled",
+            "mcp_expose_network",
+            "mcp_port",
+            "mcp_request_logging",
+            "mcp_safe_mode",
+            "mcp_status",
+            "mcp_port_override_visible",
+            "mcp_port_override_text",
+            "mcp_endpoint_value",
+            "mcp_token_value",
+            "mcp_error",
+            "mcp_has_error",
+            "mcp_log_file",
+            "mcp_has_log_file",
+        ):
+            self._handle.dirty(name)
+        if self._document:
+            endpoint_list = self._document.get_element_by_id("mcp-endpoints")
+            if endpoint_list:
+                endpoint_list.set_attribute("rows", str(self._mcp_endpoint_rows()))
+
+    def _on_close(self, _handle, _event, _args):
+        # The floating-window title bar is cancellation: discard an unconfirmed
+        # port draft while preserving settings that were already applied live.
+        mcp_draft_changed = self._mcp_port != str(self._mcp_applied_port)
+        project_draft_changed = self._project_location != self._applied_project_location
+        self._mcp_port = str(self._mcp_applied_port)
+        self._project_location = self._applied_project_location
+        if mcp_draft_changed:
+            self._dirty_mcp()
+        if project_draft_changed:
+            self._dirty_project_location()
+        lf.ui.set_panel_enabled(self.id, False)
+
+    def _on_accept_and_close(self, _handle, _event, _args):
+        if not self._commit_mcp_port():
+            return
+        if not self._commit_project_location():
+            return
+        lf.ui.set_panel_enabled(self.id, False)
+
+    def _set_gallery_preference(self, key, value):
+        from .gallery_preferences import set_preference
+        try:
+            set_preference(key, value)
+            self._gallery_preferences_error = ""
+        except (ValueError, OSError):
+            self._gallery_preferences_error = lf.ui.tr("preferences.gallery.invalid")
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _set_section(self, section):
+        if self._section == section:
+            return
+        self._section = section
+        self._ensure_keymap_rows_if_visible()
+        if self._handle:
+            for name in (
+                "show_viewport",
+                "show_general",
+                "show_appearance",
+                "show_input",
+                "show_interface",
+                "show_file_associations",
+                "has_file_associations",
+                "show_mcp",
+                "show_portal",
+                "show_marketplace",
+                "show_section_reset",
+                "reset_section_label",
+            ):
+                self._handle.dirty(name)
+
+    @staticmethod
+    def _portal_account():
+        from .portal_account import get_portal_account_service
+        return get_portal_account_service()
+
+    def _portal_connection_snapshot(self):
+        return self._portal_account().snapshot()
+
+    def _portal_connection_state(self):
+        return connection_state(self._portal_connection_snapshot())
+
+    def _portal_connection_action(self):
+        return connection_action(self._portal_connection_state())[0]
+
+    def _show_section_reset(self):
+        return self._section != "portal"
+
+    def _portal_connection_status(self):
+        account = self._portal_connection_snapshot()
+        status = connection_state(account)
+        _action, label_key = connection_action(status)
+        if status == "connected" and account.display_name:
+            label = lf.ui.tr(label_key)
+            return label.replace("{name}", account.display_name)
+        if status == "busy":
+            return lf.ui.tr(label_key)
+        if status == "connected":
+            return lf.ui.tr("portal.status.connected")
+        return lf.ui.tr({
+            "switched_off": "portal.status.switched_off",
+            "not_connected": "portal.status.disconnected",
+        }.get(status, label_key))
+
+    def _portal_connection_since(self):
+        account = self._portal_account().snapshot()
+        if not account.signed_in or not account.connected_since:
+            return ""
+        return account.connected_since[:10]
+
+    def _portal_user_code(self):
+        return self._portal_account().snapshot().user_code
+
+    def _portal_verification_qr(self):
+        account = self._portal_account()
+        url = account.snapshot().verification_uri_complete
+        from .portal_connection_ui import qr_image_path
+        path = account.credentials_path.parent / "portal-approval-qr.png"
+        if not url:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return ""
+        from .portal_security import checked_portal_url
+        try:
+            return qr_image_path(checked_portal_url(account, url), path.parent)
+        except ValueError:
+            return ""
+
+    def _copy_portal_code(self, *_args):
+        code = self._portal_user_code()
+        if code:
+            lf.ui.set_clipboard_text(code)
+
+    def _open_portal_verification(self, *_args):
+        account = self._portal_account()
+        url = account.snapshot().verification_uri_complete
+        if url:
+            from .portal_security import checked_portal_url
+            lf.ui.open_url(checked_portal_url(account, url))
+
+    def _on_toggle_section(self, _handle, _event, args):
+        if not args:
+            return
+        section = str(args[0])
+        if section not in self.EXPANDABLE_SECTIONS:
+            return
+        if section in self._expanded_sections:
+            self._expanded_sections.remove(section)
+        else:
+            self._expanded_sections.add(section)
+        if self._handle:
+            self._handle.dirty(f"{section}_expanded")
+        self._ensure_keymap_rows_if_visible()
+
+    def _dirty_expanded_sections(self):
+        if not self._handle:
+            return
+        for section in self.EXPANDABLE_SECTIONS:
+            self._handle.dirty(f"{section}_expanded")
+
+    def _reset_section_label(self):
+        return lf.ui.tr("preferences.reset_current_section")
+
+    def _on_reset_current_section(self, _handle, _event, _args):
+        if self._section == "portal":
+            return
+        reset_label = self._reset_section_label()
+        section_name = lf.ui.tr(f"preferences.{self._section}")
+
+        def _on_result(button):
+            if button != reset_label:
+                return
+            error = self._reset_section()
+            if error:
+                lf.ui.message_dialog(
+                    reset_label,
+                    f"{lf.ui.tr('preferences.reset_section_failed')} {error}",
+                    "error",
+                )
+                return
+            lf.ui.message_dialog(
+                reset_label,
+                lf.ui.tr("preferences.reset_section_success"),
+            )
+
+        lf.ui.confirm_dialog(
+            f"{reset_label}: {section_name}",
+            f"{lf.ui.tr('preferences.reset_section_confirmation')} {section_name}.",
+            [lf.ui.tr("common.cancel"), reset_label],
+            _on_result,
+        )
+
+    def _on_reset_all_settings(self, _handle, _event, _args):
+        reset_label = lf.ui.tr("preferences.reset_all_settings")
+
+        def _on_result(button):
+            if button != reset_label:
+                return
+            errors = [
+                self._reset_section(section)
+                for section in ("general", "appearance", "viewport", "input", "interface", "marketplace", "mcp")
+            ]
+            errors.append(lf.ui.reset_window_state())
+            error = next((item for item in errors if item), None)
+            if error:
+                lf.ui.message_dialog(
+                    reset_label,
+                    f"{lf.ui.tr('preferences.reset_section_failed')} {error}",
+                    "error",
+                )
+                return
+            self._refresh_selection()
+            lf.ui.message_dialog(reset_label, lf.ui.tr("preferences.reset_all_settings_success"))
+
+        lf.ui.confirm_dialog(
+            reset_label,
+            lf.ui.tr("preferences.reset_all_settings_confirmation"),
+            [lf.ui.tr("common.cancel"), reset_label],
+            _on_result,
+        )
+
+    def _reset_section(self, section=None):
+        section = section or self._section
+        if section == "portal":
+            return None
+        if section == "viewport":
+            self._rendering_defaults.reset()
+        elif section == "general":
+            from .gallery_preferences import DEFAULTS, set_preference
+            for key, value in DEFAULTS.items():
+                set_preference(key, value)
+            lf.ui.set_language("en")
+            lf.ui.clear_project_location()
+            setter = getattr(lf.ui, "set_embed_dataset_by_default", None)
+            if setter:
+                setter(False)
+            reset_project_manager_preferences()
+            self._notify_project_manager_preferences_changed()
+            self._read_project_location()
+        elif section == "marketplace":
+            reset_marketplace_preferences()
+            self._notify_marketplace_preferences_changed()
+        elif section == "appearance":
+            if hasattr(lf.ui, "set_theme_vignette_style"):
+                lf.ui.set_theme_vignette_style(0.3, 0.7, 0.5)
+                lf.ui.set_theme_vignette_enabled(False)
+            lf.ui.set_theme("dark")
+            lf.ui.set_progress_bar_style("classic")
+            lf.ui.set_viewport_chrome_style("translucent")
+            lf.ui.set_viewport_toolbar_position("centered")
+            lf.ui.set_ui_scale(0.0)
+            lf.ui.set_scene_reconstruction("native", "native")
+            lf.ui.reset_scene_reconstruction_preferences()
+            self._sync_scene_upscaler_preset_records()
+        elif section == "input":
+            self._keymap.reset_to_default()
+
+            lf.set_new_project_navigation_defaults("legacy_y", True)
+            lf.ui.set_zoom_speed_preference(11.0)
+            lf.ui.set_navigation_speed_preference(10.0)
+            lf.ui.set_camera_browse_repeat(True)
+            self._camera_repeat_rate_draft = None
+            lf.ui.set_camera_browse_repeat_rate(5.0)
+            lf.ui.set_remember_camera_navigation(False)
+            lf.ui.set_remember_camera_view_snap(False)
+            lf.set_camera_navigation_mode("orbit")
+            lf.set_camera_view_snap_enabled(False)
+        elif section == "interface":
+            lf.ui.clear_startup_sidebar()
+            lf.ui.set_native_floating_windows(False)
+            if not self._mcp_safe_mode:
+                lf.ui.set_scene_graph_selection_markers(False)
+                lf.ui.set_splat_drag_preferences({"format": "ply", "sh_degree": 3, "up_axis": -2})
+            self._refresh_selection()
+            return lf.ui.reset_layout()
+        elif section == "mcp":
+            if not self._mcp_safe_mode:
+                lf.ui.set_mcp_preferences(True, False, 45677, False)
+                self._load_mcp_preferences()
+        self._refresh_selection()
+        return None
+
+    def _refresh_selection(self):
+        self._last_state = self._state()
+        self._sync_theme_variant_records()
+        self._dirty_selection()
+
+    def _dirty_selection(self):
+        if self._handle:
+            for prop in ("enabled", "intensity", "radius", "softness"):
+                self._handle.dirty("theme_vignette_" + prop)
+            self._handle.dirty("theme_family_idx")
+            self._handle.dirty("theme_has_variants")
+            self._handle.dirty("progress_bar_idx")
+            self._handle.dirty("viewport_chrome_idx")
+            self._handle.dirty("viewport_toolbar_position_idx")
+            self._handle.dirty("scale_idx")
+            self._handle.dirty("native_floating_windows")
+            self._handle.dirty("scene_upscaler_idx")
+            self._handle.dirty("scene_upscaler_preset_idx")
+            self._handle.dirty("scene_upscaler_has_preset")
+            self._handle.dirty("language_idx")
+            self._handle.dirty("navigation_idx")
+            self._handle.dirty("navigation_up_idx")
+            self._handle.dirty("new_project_align_grid")
+            self._handle.dirty("zoom_speed")
+            self._handle.dirty("navigation_speed")
+            self._handle.dirty("camera_browse_repeat")
+            self._handle.dirty("camera_browse_repeat_rate")
+            self._handle.dirty("view_snap")
+            self._handle.dirty("remember_navigation")
+            self._handle.dirty("remember_view_snap")
+            self._handle.dirty("scene_graph_selection_markers")
+            for key in ("format", "sh_degree", "up_axis"):
+                self._handle.dirty("splat_drag_" + key)
+            self._dirty_mcp()
+            self._dirty_project_location()
+            self._handle.dirty("embed_dataset_by_default")
+            self._handle.dirty("auto_save_on_close")
+            self._handle.dirty("marketplace_view")
+            self._handle.dirty("marketplace_git_checkout")
+            self._handle.dirty("project_manager_default_view")
+            self._handle.dirty("project_manager_open_at_startup")
+            self._handle.dirty("project_manager_remember_state")

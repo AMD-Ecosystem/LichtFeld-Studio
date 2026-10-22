@@ -108,7 +108,21 @@ class SplatData:
         """Set maximum SH degree"""
 
     def reserve_capacity(self, capacity: int) -> None:
-        """Reserve capacity for Gaussians (for densification)"""
+        """
+        Reserve capacity for Gaussians (for densification). Raises if the model is renderer-backed.
+        """
+
+class SceneSplatSnapshot:
+    @property
+    def transform(self) -> tuple: ...
+
+    @property
+    def sh_degree(self) -> int: ...
+
+    def splat_data(self) -> SplatData:
+        """
+        Materialize this owned node's local geometry. May run on an export worker.
+        """
 
 class NodeType(enum.Enum):
     SPLAT = 0
@@ -116,6 +130,8 @@ class NodeType(enum.Enum):
     POINTCLOUD = 1
 
     GROUP = 2
+
+    PLY_SEQUENCE = 13
 
     CROPBOX = 3
 
@@ -233,6 +249,14 @@ class Ellipsoid:
         """List available attributes"""
 
 class PointCloud:
+    """
+    Point-cloud data owned by a load result or referenced by scene node identity.
+
+    Loaded data remains usable after its LoadResult is released. Scene-backed
+    handles raise RuntimeError while their source node is absent; undo restoring
+    the same node makes the handle usable again.
+    """
+
     @property
     def means(self) -> lichtfeld.Tensor:
         """Position tensor [N, 3]"""
@@ -312,6 +336,10 @@ class SceneNode:
         """Unique node identifier"""
 
     @property
+    def uuid(self) -> str:
+        """Durable node UUID"""
+
+    @property
     def parent_id(self) -> int:
         """Parent node identifier (-1 for root)"""
 
@@ -324,10 +352,14 @@ class SceneNode:
         """Node type (SPLAT, GROUP, CAMERA, etc.)"""
 
     @property
+    def local_transform(self) -> tuple:
+        """Local transform as 4x4 row-major tuple"""
+
+    @property
     def world_transform(self) -> tuple:
         """World-space transform as 4x4 row-major tuple"""
 
-    def set_local_transform(self, arg: Annotated[NDArray[numpy.float32], dict(shape=(4, 4))], /) -> None:
+    def set_local_transform(self, arg: Annotated[NDArray[numpy.float32], dict(shape=(4, 4), device='cpu')], /) -> None:
         """Set local transform from a [4, 4] ndarray"""
 
     @property
@@ -369,6 +401,10 @@ class SceneNode:
         """Path to the camera mask file"""
 
     @property
+    def depth_path(self) -> str:
+        """Path to the camera depth map file"""
+
+    @property
     def has_camera(self) -> bool:
         """Whether this node has camera data"""
 
@@ -376,9 +412,18 @@ class SceneNode:
     def has_mask(self) -> bool:
         """Whether this camera node has a mask file"""
 
+    @property
+    def has_depth(self) -> bool:
+        """Whether this camera node has a depth map file"""
+
     def load_mask(self, resize_factor: int = 1, max_width: int = 0, invert: bool = False, threshold: float = 0.5) -> lichtfeld.Tensor | None:
         """
         Load mask as tensor [1, H, W] on CUDA (None if not a camera node or no mask)
+        """
+
+    def load_depth(self, resize_factor: int = 1, max_width: int = 0) -> lichtfeld.Tensor | None:
+        """
+        Load depth map as tensor [H, W] on CUDA (None if not a camera node or no depth map)
         """
 
     @property
@@ -436,6 +481,10 @@ class Scene:
     def generation(self) -> int:
         """Generation counter when scene was acquired"""
 
+    @property
+    def render_generation(self) -> int:
+        """Scene content revision, excluding Gaussian selection changes"""
+
     def add_group(self, name: str, parent: int = -1) -> int:
         """Add an empty group node, returns node ID"""
 
@@ -460,11 +509,13 @@ class Scene:
         """
 
     def add_point_cloud(self, name: str, points: lichtfeld.Tensor, colors: lichtfeld.Tensor, parent: int = -1) -> int:
-        """Add a point cloud node from tensor data [N,3] positions and colors"""
+        """
+        Add a point cloud node from [N,3] positions and uint8 or float32 colors; other color dtypes raise ValueError
+        """
 
     def add_mesh(self, name: str, vertices: lichtfeld.Tensor, indices: lichtfeld.Tensor, colors: lichtfeld.Tensor | None = None, normals: lichtfeld.Tensor | None = None, parent: int = -1) -> int:
         """
-        Add a mesh node from [V,3] vertices, [F,3] face indices, optional [V,4] colors and [V,3] normals
+        Add a mesh node from [V,3] vertices, [F,3] face indices, optional [V,4] colors and [V,3] normals; invalid color shapes raise ValueError
         """
 
     def add_camera_group(self, name: str, parent: int, camera_count: int) -> int:
@@ -496,7 +547,9 @@ class Scene:
         """
 
     def remove_node(self, name: str, keep_children: bool = False) -> None:
-        """Remove a node by name, optionally keeping its children"""
+        """
+        Remove a node by name, optionally keeping its children. Raises RuntimeError if the GUI scene manager rejects removal.
+        """
 
     def rename_node(self, old_name: str, new_name: str) -> bool:
         """Rename a node, returns true on success"""
@@ -504,14 +557,17 @@ class Scene:
     def clear(self) -> None:
         """Remove all nodes from the scene"""
 
-    def reparent(self, node_id: int, new_parent_id: int) -> None:
-        """Move a node under a new parent"""
+    def reparent(self, node_id: int, new_parent_id: int) -> bool:
+        """Move a node under a new parent, returns true on success"""
 
     def root_nodes(self) -> list[int]:
         """Get all root-level nodes"""
 
     def get_node_by_id(self, id: int) -> SceneNode | None:
         """Find a node by its integer ID (None if not found)"""
+
+    def get_node_by_uuid(self, uuid: str) -> SceneNode | None:
+        """Find a node by its durable UUID (None if invalid or not found)"""
 
     def get_node(self, name: str) -> SceneNode | None:
         """Find a node by name (None if not found)"""
@@ -522,6 +578,11 @@ class Scene:
     def get_visible_nodes(self) -> list[SceneNode]:
         """Get all visible nodes in the scene"""
 
+    def snapshot_visible_splats(self) -> list[SceneSplatSnapshot]:
+        """
+        Copy visible splats and world transforms at a UI safe point. Returned data owns its storage and supports worker-side export after scene edits or deletion.
+        """
+
     def is_node_effectively_visible(self, id: int) -> bool:
         """Check if a node is visible considering parent visibility"""
 
@@ -529,15 +590,20 @@ class Scene:
         """Get world-space transform as 4x4 row-major tuple"""
 
     @overload
-    def set_node_transform(self, name: str, transform: Annotated[NDArray[numpy.float32], dict(shape=(4, 4))]) -> None:
-        """Set node local transform from a [4, 4] ndarray"""
-
-    @overload
     def set_node_transform(self, name: str, transform: lichtfeld.Tensor) -> None:
         """Set node local transform from a [4, 4] Tensor"""
 
+    @overload
+    def set_node_transform(self, name: str, transform: Annotated[NDArray[numpy.float32], dict(shape=(4, 4), device='cpu')]) -> None:
+        """Set node local transform from a [4, 4] ndarray"""
+
     def combined_model(self) -> SplatData | None:
         """Get the merged SplatData for all visible splats (None if empty)"""
+
+    def apply_crop_filter(self, mask: lichtfeld.Tensor) -> None:
+        """
+        Filter a combined-model CUDA bool mask in place by enabled render crop boxes and ellipsoids. Scene selection is unchanged.
+        """
 
     def training_model(self) -> SplatData | None:
         """Get the SplatData used for training (None if unavailable)"""
@@ -686,7 +752,7 @@ class Scene:
         """Notify the renderer that scene data has changed"""
 
     def duplicate_node(self, name: str) -> str:
-        """Duplicate a node by name, returns new node ID"""
+        """Duplicate a node by name, returns the new node name"""
 
     def merge_group(self, group_name: str) -> str:
         """Merge all splats in a group into a single node, returns merged node ID"""
@@ -749,8 +815,20 @@ class Camera:
         """Full path to mask file"""
 
     @property
+    def depth_path(self) -> str:
+        """Full path to depth map file"""
+
+    @property
     def has_mask(self) -> bool:
         """Whether a mask file exists"""
+
+    @property
+    def has_depth(self) -> bool:
+        """Whether a depth map file exists"""
+
+    @property
+    def has_image(self) -> bool:
+        """Whether the bound dataset image file exists"""
 
     @property
     def uid(self) -> int:
@@ -797,6 +875,9 @@ class Camera:
 
     def load_mask(self, resize_factor: int = 1, max_width: int = 0, invert: bool = False, threshold: float = 0.5) -> lichtfeld.Tensor:
         """Load mask as tensor [1, H, W] on CUDA"""
+
+    def load_depth(self, resize_factor: int = 1, max_width: int = 0) -> lichtfeld.Tensor:
+        """Load depth map as tensor [H, W] on CUDA"""
 
 class CameraDataset:
     def __len__(self) -> int:

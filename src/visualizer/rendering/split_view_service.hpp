@@ -38,26 +38,26 @@ namespace lfs::vis {
             SplitViewMode current_mode = SplitViewMode::Disabled;
             bool mode_changed = false;
             bool clear_viewport_output = false;
+            bool render_settings_changed = false;
             std::optional<bool> restore_equirectangular;
         };
 
         [[nodiscard]] std::optional<glm::ivec2> gtContentDimensions() const;
-        [[nodiscard]] const std::optional<GTComparisonContext>& gtContext() const { return gt_context_; }
         [[nodiscard]] bool isActive(const RenderSettings& settings) const;
         [[nodiscard]] bool isGTComparisonActive(const RenderSettings& settings) const;
         [[nodiscard]] bool isIndependentDualActive(const RenderSettings& settings) const;
         [[nodiscard]] std::optional<std::array<SplitViewPanelLayout, 2>>
         panelLayouts(const RenderSettings& settings, int total_width) const;
-        [[nodiscard]] std::optional<int> dividerPixel(const RenderSettings& settings, int total_width) const;
 
         [[nodiscard]] ModeChangeResult toggleMode(RenderSettings& settings,
                                                   SplitViewMode target_mode,
                                                   const Viewport* primary_viewport = nullptr);
         [[nodiscard]] ModeChangeResult handleSceneLoaded(RenderSettings& settings);
         [[nodiscard]] ModeChangeResult handleSceneCleared(RenderSettings& settings);
-        [[nodiscard]] ModeChangeResult handlePLYRemoved(RenderSettings& settings, SceneManager* scene_manager);
+        [[nodiscard]] ModeChangeResult handleVisiblePLYsChanged(RenderSettings& settings, SceneManager* scene_manager);
         void advanceSplitOffset(RenderSettings& settings);
         [[nodiscard]] SplitViewInfo getInfo() const;
+        [[nodiscard]] std::optional<SplitViewInfo> getInfoIfChanged(std::uint64_t& generation) const;
         // Focused panel and the secondary viewport are main-thread-owned state used by
         // input, frame planning, and rendering on the UI thread. Only current_info_ is
         // mutex-protected because it is read from UI/status-bar code outside that path.
@@ -83,8 +83,11 @@ namespace lfs::vis {
 
         mutable std::mutex info_mutex_;
         SplitViewInfo current_info_;
+        std::uint64_t info_generation_ = 0;
         std::optional<GTComparisonContext> gt_context_;
         bool pre_gt_equirectangular_ = false;
+        bool pre_gt_show_camera_frustums_ = false;
+        bool gt_forced_camera_frustums_off_ = false;
         SplitViewPanelId focused_panel_ = SplitViewPanelId::Left;
         Viewport secondary_viewport_;
     };

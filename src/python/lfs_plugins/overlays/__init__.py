@@ -4,7 +4,11 @@ import math
 
 import lichtfeld as lf
 
+from ..ui import RuntimeState
+from ..localization import safe_format
+
 from .. import toolbar as viewport_toolbar
+from ..gallery_transfer_overlay import GalleryTransferOverlay
 
 try:
     from ..ui.store import native_value as _native_store_value
@@ -28,13 +32,6 @@ _PULSE_SPEED = 3.0
 _BOUNCE_SPEED = 4.0
 _BOUNCE_AMOUNT = 5.0
 
-_ZONE_PADDING = 120.0
-_DASH_LENGTH = 12.0
-_GAP_LENGTH = 8.0
-_BORDER_THICKNESS = 2.0
-_ICON_SIZE = 48.0
-_ANIM_SPEED = 30.0
-_MIN_VIEWPORT_SIZE = 200.0
 _AUTO_DISMISS_DELAY = 3.0
 
 _OVERLAY_FLAGS = (
@@ -67,6 +64,20 @@ def _viewport_bottom_inset(layout, base_inset):
     return bottom_inset
 
 
+def _empty_state_visible(import_visible):
+    return (
+        not import_visible
+        and lf.ui.is_scene_empty()
+        and not lf.ui.is_drag_hovering()
+        and not lf.ui.is_startup_visible()
+    )
+
+
+def _empty_state_import_hint():
+    import_path = lf.ui.tr("menu.file") + " > " + lf.ui.tr("menu.file.import")
+    return safe_format(lf.ui.tr("startup.drop_files_hint"), path=import_path)
+
+
 def _get_import_state():
     native_state = _native_store_value("import_overlay_state", None)
     if isinstance(native_state, dict):
@@ -90,6 +101,7 @@ def _get_video_state():
 
 class _OverlayDocumentController:
     def __init__(self):
+        self.gallery_transfers = GalleryTransferOverlay()
         self.reset()
 
     def reset(self):
@@ -98,6 +110,8 @@ class _OverlayDocumentController:
         self._video_state = {}
         self._last_import_signature = None
         self._last_video_signature = None
+        self._empty_state_signature = None
+        self.gallery_transfers.reset()
         viewport_toolbar.reset_overlay_state()
 
     def update(self, doc=None):
@@ -126,6 +140,7 @@ class _OverlayDocumentController:
         import_visible = import_active or import_completion
         if import_visible:
             import_signature = (
+                RuntimeState.language_generation.value,
                 import_active,
                 import_completion,
                 import_state.get("success", False),
@@ -138,11 +153,12 @@ class _OverlayDocumentController:
                 import_state.get("error", ""),
             )
         else:
-            import_signature = (False,)
+            import_signature = (RuntimeState.language_generation.value, False)
 
         video_active = video_state.get("active", False)
         if video_active:
             video_signature = (
+                RuntimeState.language_generation.value,
                 True,
                 round(video_state.get("progress", 0.0), 3),
                 video_state.get("current_frame", 0),
@@ -150,7 +166,7 @@ class _OverlayDocumentController:
                 video_state.get("stage", ""),
             )
         else:
-            video_signature = (False,)
+            video_signature = (RuntimeState.language_generation.value, False)
 
         dirty_sources = []
         status_dirty = False
@@ -167,8 +183,20 @@ class _OverlayDocumentController:
             dirty_sources.append("video_status")
             status_dirty = True
 
+        empty_state_signature = (
+            RuntimeState.language_generation.value,
+            _empty_state_visible(import_visible),
+        )
+        if empty_state_signature != self._empty_state_signature:
+            self._empty_state_signature = empty_state_signature
+            dirty_sources.append("empty_state")
+            status_dirty = True
+
         toolbar_sources = viewport_toolbar.update_overlay(doc) or []
         dirty_sources.extend(f"toolbar.{source}" for source in toolbar_sources)
+        if self.gallery_transfers.update():
+            dirty_sources.append("gallery_transfers")
+            status_dirty = True
 
         if status_dirty:
             self._handle.dirty_all()
@@ -194,7 +222,10 @@ class _OverlayDocumentController:
             return False
 
         model.bind_func("show_import_overlay", self._show_import_overlay)
-        model.bind_func("show_import_backdrop", lambda: self._import_state.get("active", False))
+        model.bind_func(
+            "show_import_backdrop",
+            lambda: (self._import_state.get("active", False)
+                     and self._import_state.get("dataset_type") != "project"))
         model.bind_func("import_title", self._import_title)
         model.bind_func("import_title_class", self._import_title_class)
         model.bind_func("show_import_path", lambda: bool(self._import_state.get("path", "")))
@@ -220,7 +251,14 @@ class _OverlayDocumentController:
         model.bind_func("video_stage", lambda: self._video_state.get("stage", ""))
         model.bind_func("video_cancel_label", lambda: lf.ui.tr("common.cancel"))
 
+        model.bind_func("show_empty_state",
+                        lambda: self._empty_state_signature is not None and self._empty_state_signature[1])
+        model.bind_func("empty_state_title", lambda: lf.ui.tr("startup.drop_files_title"))
+        model.bind_func("empty_state_subtitle", lambda: lf.ui.tr("startup.drop_files_subtitle"))
+        model.bind_func("empty_state_import_hint", _empty_state_import_hint)
+
         viewport_toolbar.bind_overlay_model(model)
+        self.gallery_transfers.bind_model(model)
 
         model.bind_event("overlay_action", self._on_overlay_action)
         self._handle = model.get_handle()
@@ -264,6 +302,8 @@ class _OverlayDocumentController:
 
     def _import_title(self):
         state = self._import_state
+        if state.get("dataset_type") == "project":
+            return lf.ui.tr("progress.opening_project")
         show_completion = state.get("show_completion", False)
         if show_completion and not state.get("active", False):
             if state.get("success", False):
@@ -295,7 +335,7 @@ class _OverlayDocumentController:
         return f"{_clamp_progress(state.get('progress', 0.0)) * 100:.0f}%"
 
     def _import_counts(self):
-        return f"{self._import_state.get('num_images', 0)} images, {self._import_state.get('num_points', 0)} points"
+        return f"{self._import_state.get('num_images', 0):,} images, {self._import_state.get('num_points', 0):,} points"
 
     def _video_progress_value(self):
         return str(_clamp_progress(self._video_state.get("progress", 0.0)))
@@ -304,7 +344,7 @@ class _OverlayDocumentController:
         return f"{_clamp_progress(self._video_state.get('progress', 0.0)) * 100:.0f}%"
 
     def _video_frame_text(self):
-        return f"Frame {self._video_state.get('current_frame', 0)} / {self._video_state.get('total_frames', 0)}"
+        return f"Frame {self._video_state.get('current_frame', 0):,} / {self._video_state.get('total_frames', 0):,}"
 
     def _on_overlay_action(self, _handle, _ev, args):
         if not args:
@@ -315,117 +355,6 @@ class _OverlayDocumentController:
             lf.ui.dismiss_import()
         elif action == "cancel_video_export":
             lf.ui.cancel_video_export()
-
-
-def _draw_empty_state_overlay(layout):
-    if not lf.ui.is_scene_empty() or lf.ui.is_drag_hovering() or lf.ui.is_startup_visible():
-        return
-    import_state = _get_import_state()
-    if import_state.get("active", False) or import_state.get("show_completion", False):
-        return
-
-    vp_x, vp_y = layout.get_viewport_pos()
-    vp_w, vp_h = layout.get_viewport_size()
-    if vp_w < _MIN_VIEWPORT_SIZE or vp_h < _MIN_VIEWPORT_SIZE:
-        return
-
-    layout.set_next_window_pos((vp_x, vp_y))
-    layout.set_next_window_size((vp_w, vp_h))
-
-    if not layout.begin_window("##EmptyStateOverlay", _OVERLAY_FLAGS):
-        layout.end_window()
-        return
-
-    theme = lf.ui.theme()
-    border_color = theme.palette.overlay_border
-    icon_color = theme.palette.overlay_icon
-    title_color = theme.palette.overlay_text
-    subtitle_color = theme.palette.overlay_text_dim
-    hint_color = (subtitle_color[0], subtitle_color[1], subtitle_color[2], 0.5)
-
-    center_x = vp_x + vp_w * 0.5
-    center_y = vp_y + vp_h * 0.5
-    zone_min_x = vp_x + _ZONE_PADDING
-    zone_min_y = vp_y + _ZONE_PADDING
-    zone_max_x = vp_x + vp_w - _ZONE_PADDING
-    zone_max_y = vp_y + vp_h - _viewport_bottom_inset(layout, _ZONE_PADDING)
-
-    dash_offset = (lf.ui.get_time() * _ANIM_SPEED) % (_DASH_LENGTH + _GAP_LENGTH)
-
-    def draw_dashed_line(start_x, start_y, end_x, end_y):
-        dx = end_x - start_x
-        dy = end_y - start_y
-        length = math.sqrt(dx * dx + dy * dy)
-        if length < 0.001:
-            return
-        nx, ny = dx / length, dy / length
-        pos = -dash_offset
-        while pos < length:
-            d0 = max(0.0, pos)
-            d1 = min(length, pos + _DASH_LENGTH)
-            if d1 > d0:
-                layout.draw_window_line(
-                    start_x + nx * d0,
-                    start_y + ny * d0,
-                    start_x + nx * d1,
-                    start_y + ny * d1,
-                    border_color,
-                    _BORDER_THICKNESS,
-                )
-            pos += _DASH_LENGTH + _GAP_LENGTH
-
-    draw_dashed_line(zone_min_x, zone_min_y, zone_max_x, zone_min_y)
-    draw_dashed_line(zone_max_x, zone_min_y, zone_max_x, zone_max_y)
-    draw_dashed_line(zone_max_x, zone_max_y, zone_min_x, zone_max_y)
-    draw_dashed_line(zone_min_x, zone_max_y, zone_min_x, zone_min_y)
-
-    icon_y = center_y - 50.0
-    layout.draw_window_rect(
-        center_x - _ICON_SIZE * 0.5,
-        icon_y - _ICON_SIZE * 0.3,
-        center_x + _ICON_SIZE * 0.5,
-        icon_y + _ICON_SIZE * 0.4,
-        icon_color,
-        2.0,
-    )
-    layout.draw_window_line(
-        center_x - _ICON_SIZE * 0.5,
-        icon_y - _ICON_SIZE * 0.3,
-        center_x - _ICON_SIZE * 0.2,
-        icon_y - _ICON_SIZE * 0.5,
-        icon_color,
-        2.0,
-    )
-    layout.draw_window_line(
-        center_x - _ICON_SIZE * 0.2,
-        icon_y - _ICON_SIZE * 0.5,
-        center_x + _ICON_SIZE * 0.1,
-        icon_y - _ICON_SIZE * 0.5,
-        icon_color,
-        2.0,
-    )
-    layout.draw_window_line(
-        center_x + _ICON_SIZE * 0.1,
-        icon_y - _ICON_SIZE * 0.5,
-        center_x + _ICON_SIZE * 0.2,
-        icon_y - _ICON_SIZE * 0.3,
-        icon_color,
-        2.0,
-    )
-
-    title = lf.ui.tr("startup.drop_files_title")
-    subtitle = lf.ui.tr("startup.drop_files_subtitle")
-    hint = lf.ui.tr("startup.drop_files_hint")
-
-    title_w, _ = layout.calc_text_size(title)
-    subtitle_w, _ = layout.calc_text_size(subtitle)
-    hint_w, _ = layout.calc_text_size(hint)
-
-    layout.draw_window_text(center_x - title_w * 0.5, center_y + 10.0, title, title_color)
-    layout.draw_window_text(center_x - subtitle_w * 0.5, center_y + 40.0, subtitle, subtitle_color)
-    layout.draw_window_text(center_x - hint_w * 0.5, center_y + 70.0, hint, hint_color)
-
-    layout.end_window()
 
 
 def _draw_drag_drop_overlay(layout):
@@ -549,8 +478,12 @@ def sync_document(doc=None):
     return _sync_viewport_overlay_document(doc)
 
 
+def show_gallery_transfers():
+    _sync_viewport_overlay_document()
+    _document_controller.gallery_transfers.show()
+
+
 def _draw_viewport_overlay(layout):
-    _draw_empty_state_overlay(layout)
     _draw_drag_drop_overlay(layout)
 
 
@@ -565,6 +498,13 @@ def register():
     _sync_viewport_overlay_document()
 
 
+def on_document_unloaded():
+    """Drop Python overlay handles before RmlUi frees the native document."""
+    global _document_controller
+    if _document_controller is not None:
+        _document_controller.reset()
+
+
 def unregister():
     """Unregister built-in viewport overlay controllers."""
     global _hook_registered
@@ -573,5 +513,4 @@ def unregister():
 
     lf.ui.remove_hook(_HOOK_PANEL, _DRAW_SECTION, _draw_viewport_overlay)
     _hook_registered = False
-    if _document_controller is not None:
-        _document_controller.reset()
+    on_document_unloaded()

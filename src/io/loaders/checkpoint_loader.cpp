@@ -4,6 +4,7 @@
 
 #include "checkpoint_loader.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
 #include "io/error.hpp"
@@ -31,12 +32,12 @@ namespace lfs::io {
         }
 
         // Validate file exists
-        if (!std::filesystem::exists(path)) {
+        if (!lfs::core::native_fs::exists(path)) {
             return make_error(ErrorCode::PATH_NOT_FOUND,
                               "Checkpoint file does not exist", path);
         }
 
-        if (!std::filesystem::is_regular_file(path)) {
+        if (!lfs::core::native_fs::is_regular_file(path)) {
             return make_error(ErrorCode::NOT_A_FILE,
                               "Path is not a regular file", path);
         }
@@ -97,7 +98,8 @@ namespace lfs::io {
             .scene_center = Tensor::zeros({3}, Device::CPU),
             .loader_used = name(),
             .load_time = load_time,
-            .warnings = {std::format("Checkpoint from iteration {}", iteration)}};
+            .warnings = {std::format("Checkpoint from iteration {}", iteration)},
+            .georeference = std::nullopt};
 
         LOG_INFO("Checkpoint loaded successfully in {}ms ({} Gaussians from iteration {})",
                  load_time.count(), num_gaussians, iteration);
@@ -106,11 +108,11 @@ namespace lfs::io {
     }
 
     bool CheckpointLoader::canLoad(const std::filesystem::path& path) const {
-        if (!std::filesystem::exists(path) || std::filesystem::is_directory(path)) {
+        if (!lfs::core::native_fs::exists(path) || lfs::core::native_fs::is_directory(path)) {
             return false;
         }
 
-        auto ext = path.extension().string();
+        auto ext = lfs::core::path_to_utf8(path.extension());
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
         if (ext != ".resume") {
@@ -123,8 +125,11 @@ namespace lfs::io {
             return false;
         }
 
-        uint32_t magic;
+        uint32_t magic = 0;
         file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        if (!file) {
+            return false;
+        }
         return magic == lfs::core::CHECKPOINT_MAGIC;
     }
 

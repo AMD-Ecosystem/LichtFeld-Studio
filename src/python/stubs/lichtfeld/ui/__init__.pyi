@@ -208,14 +208,56 @@ class Theme:
 def theme() -> Theme:
     """Get the current theme"""
 
-def set_theme_vignette_enabled(arg: bool, /) -> None:
+def set_theme_vignette_enabled(enabled: bool, persist: bool = True) -> None:
     """Set theme vignette enabled"""
 
-def set_theme_vignette_intensity(arg: float, /) -> None:
+def set_theme_vignette_intensity(intensity: float, persist: bool = True) -> None:
     """Set theme vignette intensity"""
 
-def set_theme_vignette_style(arg0: float, arg1: float, arg2: float, /) -> None:
+def set_theme_vignette_style(intensity: float, radius: float, softness: float, persist: bool = True) -> None:
     """Set vignette intensity, radius, and softness"""
+
+def remember_camera_navigation() -> bool:
+    """Return whether camera navigation is persisted between launches"""
+
+def set_remember_camera_navigation(enabled: bool) -> None:
+    """Enable or disable camera navigation persistence"""
+
+def remember_camera_view_snap() -> bool:
+    """Return whether camera view snap is persisted between launches"""
+
+def set_remember_camera_view_snap(enabled: bool) -> None:
+    """Enable or disable camera view snap persistence"""
+
+def take_splat_export_request() -> list[str]: ...
+
+def get_splat_drag_preferences() -> dict: ...
+
+def set_splat_drag_preferences(arg: dict, /) -> None: ...
+
+def scene_graph_selection_markers() -> bool:
+    """Return whether Scene Graph selection markers are visible"""
+
+def set_scene_graph_selection_markers(enabled: bool) -> None:
+    """Show or hide Scene Graph selection markers"""
+
+def get_progress_bar_style() -> str:
+    """Return the status bar progress style (classic or miner)"""
+
+def set_progress_bar_style(style: str) -> None:
+    """Set the status bar progress style (classic or miner)"""
+
+def get_viewport_chrome_style() -> str:
+    """Return the viewport controls style (solid, translucent, or frosted)"""
+
+def set_viewport_chrome_style(style: str) -> None:
+    """Set the viewport controls style (solid, translucent, or frosted)"""
+
+def get_viewport_toolbar_position() -> str:
+    """Return the viewport toolbar position (top, centered, or free)"""
+
+def set_viewport_toolbar_position(position: str) -> None:
+    """Set the viewport toolbar position (top, centered, or free)"""
 
 class PanelSpace(enum.Enum):
     SIDE_PANEL = 0
@@ -230,7 +272,9 @@ class PanelSpace(enum.Enum):
 
     BOTTOM_DOCK = 5
 
-    STATUS_BAR = 6
+    LEFT_DOCK = 6
+
+    STATUS_BAR = 7
 
 class PanelHeightMode(enum.Enum):
     FILL = 0
@@ -280,7 +324,7 @@ class Panel:
 
     update_interval_ms: int = 100
 
-    update_policy: str = 'interval'
+    update_policy: str = 'dirty'
 
     @classmethod
     def poll(cls, context) -> bool: ...
@@ -296,6 +340,12 @@ class Panel:
     def on_update(self, doc): ...
 
     def on_scene_changed(self, doc): ...
+
+    def capture_chrome(self):
+        """Optional per-panel GUIL payload. Return a dict or None."""
+
+    def apply_chrome(self, payload):
+        """Restore capture_chrome() output. Missing keys keep defaults."""
 
 class PanelSummary:
     @property
@@ -356,11 +406,51 @@ def get_panel_names(space: PanelSpace = PanelSpace.FLOATING) -> list[str]:
 def set_panel_enabled(panel_id: str, enabled: bool) -> None:
     """Enable or disable a panel by id"""
 
+def save_startup_sidebar() -> bool:
+    """
+    Save the right sidebar as a startup default; saved .licht workspaces take precedence.
+    """
+
+def clear_startup_sidebar() -> None:
+    """
+    Clear startup sidebar defaults without changing the current project workspace.
+    """
+
+def reset_layout() -> str:
+    """
+    Reset the saved UI layout and apply the default dock arrangement immediately.
+    """
+
+def reset_window_state() -> str:
+    """
+    Reset persisted window geometry and apply the default geometry immediately.
+    """
+
 def is_panel_enabled(panel_id: str) -> bool:
     """Check if a panel is enabled"""
 
+def get_left_dock_width() -> float:
+    """
+    Get the left dock width the user chose, in logical pixels. The dock is narrower while the window is too small to fit it.
+    """
+
+def set_left_dock_width(width: float) -> None:
+    """Set the left dock width in logical pixels"""
+
 def get_main_panel_tabs() -> list[PanelSummary]:
     """Get all main panel tabs as typed panel summaries"""
+
+def get_bottom_dock_tabs() -> list[str]:
+    """Get the currently visible bottom-dock panel ids in registry order"""
+
+def get_bottom_dock_active_tab() -> str:
+    """Get the active bottom-dock panel id"""
+
+def set_bottom_dock_active_tab(panel_id: str) -> None:
+    """Set the active bottom-dock panel id"""
+
+def set_main_panel_active_tab(panel_id: str) -> None:
+    """Activate a main panel tab by panel id"""
 
 def get_panel(panel_id: str) -> PanelInfo | None:
     """Get typed panel info by id (None if not found)"""
@@ -437,7 +527,7 @@ class RmlUILayout:
 
     def path_input(self, label: str, value: str, folder_mode: bool = True, dialog_title: str = '') -> tuple[bool, str]:
         """
-        Draw a path input, returns (changed, path). dialog_title is accepted for compatibility and currently ignored.
+        Draw an editable path input with a native file or folder browser. folder_mode selects folder versus file; a non-empty dialog_title uses the custom title, while an empty title keeps the native default. Returns (changed, path).
         """
 
     def color_edit3(self, label: str, color: tuple[float, float, float]) -> tuple[bool, tuple[float, float, float]]: ...
@@ -464,21 +554,7 @@ class RmlUILayout:
 
     def unindent(self, width: float = 0.0) -> None: ...
 
-    def set_next_item_width(self, width: float) -> None: ...
-
-    def begin_group(self) -> None: ...
-
-    def end_group(self) -> None: ...
-
     def collapsing_header(self, label: str, default_open: bool = False) -> bool: ...
-
-    def tree_node(self, label: str) -> bool: ...
-
-    def tree_node_ex(self, label: str, flags: str = '') -> bool: ...
-
-    def set_next_item_open(self, is_open: bool) -> None: ...
-
-    def tree_pop(self) -> None: ...
 
     def begin_table(self, id: str, columns: int) -> bool: ...
 
@@ -486,7 +562,10 @@ class RmlUILayout:
 
     def end_table(self) -> None: ...
 
-    def table_next_row(self) -> None: ...
+    def table_next_row(self) -> None:
+        """
+        Advance to the next row. Use push_id()/pop_id() around each row (a ##hidden key is accepted) for stable identity across reorder/removal. Rows without an explicit key use position identity.
+        """
 
     def table_next_column(self) -> None: ...
 
@@ -522,18 +601,6 @@ class RmlUILayout:
 
     def end_menu(self) -> None: ...
 
-    def set_keyboard_focus_here(self) -> None: ...
-
-    def is_window_focused(self) -> bool: ...
-
-    def is_window_hovered(self) -> bool: ...
-
-    def capture_keyboard_from_app(self, capture: bool = True) -> None: ...
-
-    def capture_mouse_from_app(self, capture: bool = True) -> None: ...
-
-    def set_scroll_here_y(self, center_y_ratio: float = 0.5) -> None: ...
-
     def get_cursor_screen_pos(self) -> tuple[float, float]: ...
 
     def get_mouse_pos(self) -> tuple[float, float]: ...
@@ -550,21 +617,7 @@ class RmlUILayout:
 
     def close_current_popup(self) -> None: ...
 
-    def set_next_window_pos_center(self) -> None: ...
-
-    def set_next_window_pos_viewport_center(self, always: bool = False) -> None: ...
-
-    def set_next_window_focus(self) -> None: ...
-
-    def push_modal_style(self) -> None: ...
-
-    def pop_modal_style(self) -> None: ...
-
     def get_content_region_avail(self) -> tuple[float, float]: ...
-
-    def get_cursor_pos(self) -> tuple[float, float]: ...
-
-    def set_cursor_pos_x(self, x: float) -> None: ...
 
     def calc_text_size(self, text: str) -> tuple[float, float]: ...
 
@@ -581,8 +634,6 @@ class RmlUILayout:
     def toolbar_button(self, id: str, texture_id: int, size: tuple[float, float], selected: bool = False, disabled: bool = False, tooltip: str = '') -> bool: ...
 
     def invisible_button(self, id: str, size: tuple[float, float]) -> bool: ...
-
-    def set_cursor_pos(self, pos: tuple[float, float]) -> None: ...
 
     def begin_child(self, id: str, size: tuple[float, float], border: bool = False) -> bool: ...
 
@@ -602,24 +653,6 @@ class RmlUILayout:
 
     def pop_id(self) -> None: ...
 
-    def begin_window(self, title: str, flags: int = 0) -> bool: ...
-
-    def begin_window_closable(self, title: str, flags: int = 0) -> tuple[bool, bool]: ...
-
-    def end_window(self) -> None: ...
-
-    def push_window_style(self) -> None: ...
-
-    def pop_window_style(self) -> None: ...
-
-    def set_next_window_pos(self, pos: tuple[float, float], first_use: bool = False) -> None: ...
-
-    def set_next_window_size(self, size: tuple[float, float], first_use: bool = False) -> None: ...
-
-    def set_next_window_pos_centered(self, first_use: bool = False) -> None: ...
-
-    def set_next_window_bg_alpha(self, alpha: float) -> None: ...
-
     def get_viewport_pos(self) -> tuple[float, float]: ...
 
     def get_viewport_size(self) -> tuple[float, float]: ...
@@ -628,77 +661,29 @@ class RmlUILayout:
 
     def set_mouse_cursor_hand(self) -> None: ...
 
-    def push_style_var(self, var: str, value: float) -> None: ...
-
-    def push_style_var_vec2(self, var: str, value: tuple[float, float]) -> None: ...
-
-    def pop_style_var(self, count: int = 1) -> None: ...
-
-    def push_style_color(self, col: str, color: object) -> None: ...
-
-    def pop_style_color(self, count: int = 1) -> None: ...
-
     def prop(self, data: object, prop_id: str, text: str | None = None) -> tuple[bool, object]: ...
 
     def row(self) -> object: ...
 
     def column(self) -> object: ...
 
-    def split(self, factor: float = 0.5) -> object: ...
+    def split(self, factor: float = 0.5) -> object:
+        """
+        Create a two-child split. factor is clamped to [0, 1] and sets the first/second width ratio; excess children are hidden.
+        """
 
     def box(self) -> object: ...
 
-    def grid_flow(self, columns: int = 0, even_columns: bool = True, even_rows: bool = True) -> object: ...
+    def grid_flow(self, columns: int = 0, even_columns: bool = True, even_rows: bool = True) -> object:
+        """
+        Create a wrapping grid. With even_columns=True, columns > 0 uses equal percentage widths and columns=0 uses a 100dp wrapping basis; even_columns=False uses content widths. even_rows controls cell growth and stretching.
+        """
 
     def prop_enum(self, data: object, prop_id: str, value: str, text: str = '') -> bool: ...
 
     def prop_search(self, data: object, prop_id: str, search_data: object, search_prop: str, text: str = '') -> tuple[bool, int]: ...
 
     def template_list(self, list_type_id: str, list_id: str, data: object, prop_id: str, active_data: object, active_prop: str, rows: int = 5) -> tuple[int, int]: ...
-
-    def menu(self, menu_id: str, text: str = '', icon: str = '') -> None: ...
-
-    def popover(self, panel_id: str, text: str = '', icon: str = '') -> None: ...
-
-    def draw_circle(self, x: float, y: float, radius: float, color: object, segments: int = 32, thickness: float = 1.0) -> None: ...
-
-    def draw_circle_filled(self, x: float, y: float, radius: float, color: object, segments: int = 32) -> None: ...
-
-    def draw_rect(self, x0: float, y0: float, x1: float, y1: float, color: object, thickness: float = 1.0) -> None: ...
-
-    def draw_rect_filled(self, x0: float, y0: float, x1: float, y1: float, color: object, background: bool = False) -> None: ...
-
-    def draw_rect_rounded(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float, thickness: float = 1.0, background: bool = False) -> None: ...
-
-    def draw_rect_rounded_filled(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float, background: bool = False) -> None: ...
-
-    def draw_triangle_filled(self, x0: float, y0: float, x1: float, y1: float, x2: float, y2: float, color: object, background: bool = False) -> None: ...
-
-    def draw_line(self, x0: float, y0: float, x1: float, y1: float, color: object, thickness: float = 1.0) -> None: ...
-
-    def draw_polyline(self, points: object, color: object, closed: bool = False, thickness: float = 1.0) -> None: ...
-
-    def draw_poly_filled(self, points: object, color: object) -> None: ...
-
-    def draw_text(self, x: float, y: float, text: str, color: object, background: bool = False) -> None: ...
-
-    def draw_window_rect_filled(self, x0: float, y0: float, x1: float, y1: float, color: object) -> None: ...
-
-    def draw_window_rect(self, x0: float, y0: float, x1: float, y1: float, color: object, thickness: float = 1.0) -> None: ...
-
-    def draw_window_rect_rounded(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float, thickness: float = 1.0) -> None: ...
-
-    def draw_window_rect_rounded_filled(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float) -> None: ...
-
-    def draw_window_line(self, x0: float, y0: float, x1: float, y1: float, color: object, thickness: float = 1.0) -> None: ...
-
-    def draw_window_text(self, x: float, y: float, text: str, color: object) -> None: ...
-
-    def draw_window_triangle_filled(self, x0: float, y0: float, x1: float, y1: float, x2: float, y2: float, color: object) -> None: ...
-
-    def crf_curve_preview(self, label: str, gamma: float, toe: float, shoulder: float, gamma_r: float = 0.0, gamma_g: float = 0.0, gamma_b: float = 0.0) -> None: ...
-
-    def chromaticity_diagram(self, label: str, red_x: float, red_y: float, green_x: float, green_y: float, blue_x: float, blue_y: float, neutral_x: float, neutral_y: float, range: float = 0.5) -> tuple[bool, list[float]]: ...
 
     def progress_bar(self, fraction: float, overlay: str = '', width: float = 0.0, height: float = 0.0) -> None: ...
 
@@ -717,18 +702,6 @@ class RmlUILayout:
     def get_mouse_wheel(self) -> float: ...
 
     def get_mouse_delta(self) -> tuple[float, float]: ...
-
-    def begin_drag_drop_source(self) -> bool: ...
-
-    def set_drag_drop_payload(self, type: str, data: str) -> None: ...
-
-    def end_drag_drop_source(self) -> None: ...
-
-    def begin_drag_drop_target(self) -> bool: ...
-
-    def accept_drag_drop_payload(self, type: str) -> str | None: ...
-
-    def end_drag_drop_target(self) -> None: ...
 
 class RmlSubLayout:
     def __enter__(self) -> RmlSubLayout: ...
@@ -769,11 +742,17 @@ class RmlSubLayout:
 
     def column(self) -> RmlSubLayout: ...
 
-    def split(self, factor: float = 0.5) -> RmlSubLayout: ...
+    def split(self, factor: float = 0.5) -> RmlSubLayout:
+        """
+        Create a two-child split. factor is clamped to [0, 1] and sets the first/second width ratio; excess children are hidden.
+        """
 
     def box(self) -> RmlSubLayout: ...
 
-    def grid_flow(self, columns: int = 0, even_columns: bool = True, even_rows: bool = True) -> RmlSubLayout: ...
+    def grid_flow(self, columns: int = 0, even_columns: bool = True, even_rows: bool = True) -> RmlSubLayout:
+        """
+        Create a wrapping grid. With even_columns=True, columns > 0 uses equal percentage widths and columns=0 uses a 100dp wrapping basis; even_columns=False uses content widths. even_rows controls cell growth and stretching.
+        """
 
     def label(self, text: str) -> None: ...
 
@@ -827,6 +806,11 @@ class RmlSubLayout:
 
     def stepper_float(self, label: str, value: float, steps: Sequence[float] = [1.0, 0.10000000149011612, 0.009999999776482582]) -> tuple[bool, float]: ...
 
+    def path_input(self, label: str, value: str, folder_mode: bool = True, dialog_title: str = '') -> tuple[bool, str]:
+        """
+        Draw an editable path input with a native file or folder browser. folder_mode selects folder versus file; a non-empty dialog_title uses the custom title, while an empty title keeps the native default. Returns (changed, path).
+        """
+
     def color_edit3(self, label: str, color: tuple[float, float, float]) -> tuple[bool, tuple[float, float, float]]: ...
 
     def combo(self, label: str, current_idx: int, items: Sequence[str]) -> tuple[bool, int]: ...
@@ -845,15 +829,14 @@ class RmlSubLayout:
 
     def collapsing_header(self, label: str, default_open: bool = False) -> bool: ...
 
-    def tree_node(self, label: str) -> bool: ...
-
-    def tree_pop(self) -> None: ...
-
     def begin_table(self, id: str, columns: int) -> bool: ...
 
     def table_setup_column(self, label: str, width: float = 0.0) -> None: ...
 
-    def table_next_row(self) -> None: ...
+    def table_next_row(self) -> None:
+        """
+        Advance to the next row. Use push_id()/pop_id() around each row (a ##hidden key is accepted) for stable identity across reorder/removal. Rows without an explicit key use position identity.
+        """
 
     def table_next_column(self) -> None: ...
 
@@ -911,13 +894,18 @@ class HookPosition(enum.Enum):
     APPEND = 1
 
 def add_hook(panel: str, section: str, callback: object, position: str = 'append') -> None:
-    """Add a UI hook callback to a panel section"""
+    """
+    Add a UI hook callback to a panel section. Hook layouts that cannot host interactive widgets warn once and return inert controls.
+    """
 
 def remove_hook(panel: str, section: str, callback: object) -> None:
     """Remove a specific UI hook callback"""
 
 def clear_hooks(panel: str, section: str = '') -> None:
     """Clear all hooks for a panel or panel/section"""
+
+def clear_hooks_for_module(module_prefix: str) -> None:
+    """Clear all hooks registered by a given module prefix"""
 
 def clear_all_hooks() -> None:
     """Clear all registered UI hooks"""
@@ -996,7 +984,17 @@ def poll_operator(id: str) -> bool:
 def get_operator_ids() -> list[str]:
     """Get list of registered operator ids"""
 
-def confirm_dialog(title: str, message: str, buttons: Sequence[str] = ['OK', 'Cancel'], callback: object | None = None) -> None:
+def form_dialog(key: str, title: str, body_rml: str, buttons: list, callback: object, on_change: object | None = None, width: int = 640) -> bool:
+    """
+    Show a form in the shared modal overlay. Escape user text in body_rml; callbacks receive native form values.
+    """
+
+def form_dialog_update(key: str, buttons: list, body_rml: str | None = None) -> bool:
+    """
+    Update a matching live or queued form. Omit body_rml to preserve input focus and values.
+    """
+
+def confirm_dialog(title: str, message: str, buttons: Sequence[str] = ['OK', 'Cancel'], callback: object | None = None, style: str = 'info') -> None:
     """Show a confirmation dialog with custom buttons"""
 
 def input_dialog(title: str, message: str, default_value: str = '', callback: object | None = None) -> None:
@@ -1005,8 +1003,36 @@ def input_dialog(title: str, message: str, default_value: str = '', callback: ob
 def message_dialog(title: str, message: str, style: str = 'info', callback: object | None = None) -> None:
     """Show a message dialog (style: 'info', 'warning', or 'error')"""
 
-def request_redraw() -> None:
-    """Request a UI redraw on next frame"""
+def modal_get() -> dict | None:
+    """
+    Return the currently shown modal dialog as a dict, or None if none is open
+    """
+
+def modal_press(label: str) -> bool:
+    """
+    Press an enabled modal button by label. Returns False if no matching enabled button.
+    """
+
+def get_panel_object(panel_id: str) -> object:
+    """
+    Get the Python object for a retained Python panel, or None if unavailable
+    """
+
+def begin_drag_payload(type: str, data: str, label: str = '') -> int:
+    """
+    Begin one typed cross-context RmlUI drag payload and return its source token
+    """
+
+def end_drag_payload(token: int) -> None:
+    """Mark a cross-context RmlUI drag payload released for target resolution"""
+
+def cancel_drag_payload(token: int) -> None:
+    """Cancel a cross-context RmlUI drag payload"""
+
+def request_redraw(delay: float = 0.0) -> None:
+    """
+    Request a UI redraw; with delay > 0, schedule it no later than that many seconds from now.
+    """
 
 def consume_redraw_request() -> bool:
     """Consume and return pending redraw request flag"""
@@ -1431,7 +1457,7 @@ class UILayout:
 
     def path_input(self, label: str, value: str, folder_mode: bool = True, dialog_title: str = '') -> tuple[bool, str]:
         """
-        Draw a path input with browse button, returns (changed, path). dialog_title is accepted for compatibility and currently ignored.
+        Unsupported on compatibility UILayout. In a draw hook, warns once and returns (False, value); use RmlUILayout.path_input in a panel.
         """
 
     def color_edit3(self, label: str, color: tuple[float, float, float]) -> tuple[bool, tuple[float, float, float]]:
@@ -1809,8 +1835,12 @@ class UILayout:
     def prop_search(self, data: object, prop_id: str, search_data: object, search_prop: str, text: str = '') -> tuple[bool, int]:
         """Searchable dropdown for selecting from a collection"""
 
+    @overload
     def template_list(self, list_type_id: str, list_id: str, data: object, prop_id: str, active_data: object, active_prop: str, rows: int = 5) -> tuple[int, int]:
-        """UIList template for drawing custom lists"""
+        """Unsupported on UILayout; use RmlUILayout.template_list."""
+
+    @overload
+    def template_list(self, listtype_name: str, list_id: str, data: object, propname: str, active_index: int, rows: int = 5) -> tuple[bool, int]: ...
 
     def menu(self, menu_id: str, text: str = '', icon: str = '') -> None:
         """Inline menu reference"""
@@ -1819,7 +1849,9 @@ class UILayout:
         """Panel popover"""
 
     def draw_circle(self, x: float, y: float, radius: float, color: object, segments: int = 32, thickness: float = 1.0) -> None:
-        """Draw a circle outline at (x, y) with given radius and color"""
+        """
+        Enqueue a circle in the active viewport ScreenOverlayRenderer using absolute screen coordinates. Emits nothing outside an overlay frame.
+        """
 
     def draw_circle_filled(self, x: float, y: float, radius: float, color: object, segments: int = 32) -> None:
         """Draw a filled circle at (x, y) with given radius and color"""
@@ -1828,16 +1860,18 @@ class UILayout:
         """Draw a rectangle outline from (x0,y0) to (x1,y1)"""
 
     def draw_rect_filled(self, x0: float, y0: float, x1: float, y1: float, color: object, background: bool = False) -> None:
-        """Draw a filled rectangle from (x0,y0) to (x1,y1)"""
+        """Enqueue a filled overlay rectangle; background is compatibility-only."""
 
     def draw_rect_rounded(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float, thickness: float = 1.0, background: bool = False) -> None:
-        """Draw a rounded rectangle outline"""
+        """
+        Enqueue a tessellated rounded outline; background is compatibility-only.
+        """
 
     def draw_rect_rounded_filled(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float, background: bool = False) -> None:
-        """Draw a filled rounded rectangle"""
+        """Enqueue a tessellated rounded fill; background is compatibility-only."""
 
     def draw_triangle_filled(self, x0: float, y0: float, x1: float, y1: float, x2: float, y2: float, color: object, background: bool = False) -> None:
-        """Draw a filled triangle"""
+        """Enqueue a filled overlay triangle; background is compatibility-only."""
 
     def draw_line(self, x0: float, y0: float, x1: float, y1: float, color: object, thickness: float = 1.0) -> None:
         """Draw a line from (x0,y0) to (x1,y1)"""
@@ -1849,34 +1883,48 @@ class UILayout:
         """Draw a filled convex polygon"""
 
     def draw_text(self, x: float, y: float, text: str, color: object, background: bool = False) -> None:
-        """Draw text at (x, y) with given color"""
+        """
+        Enqueue overlay text at absolute screen coordinates; background is ignored.
+        """
 
     def draw_window_rect_filled(self, x0: float, y0: float, x1: float, y1: float, color: object) -> None:
-        """Draw a filled rectangle on the window draw list"""
+        """Enqueue a filled rectangle in the viewport ScreenOverlayRenderer."""
 
     def draw_window_rect(self, x0: float, y0: float, x1: float, y1: float, color: object, thickness: float = 1.0) -> None:
-        """Draw a rectangle outline on the window draw list"""
+        """Enqueue a rectangle outline in the viewport ScreenOverlayRenderer."""
 
     def draw_window_rect_rounded(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float, thickness: float = 1.0) -> None:
-        """Draw a rounded rectangle outline on the window draw list"""
+        """Enqueue a tessellated rounded outline in the viewport overlay."""
 
     def draw_window_rect_rounded_filled(self, x0: float, y0: float, x1: float, y1: float, color: object, rounding: float) -> None:
-        """Draw a filled rounded rectangle on the window draw list"""
+        """Enqueue a tessellated rounded fill in the viewport overlay."""
 
     def draw_window_line(self, x0: float, y0: float, x1: float, y1: float, color: object, thickness: float = 1.0) -> None:
-        """Draw a line on the window draw list"""
+        """Enqueue a line in the viewport ScreenOverlayRenderer."""
 
     def draw_window_text(self, x: float, y: float, text: str, color: object) -> None:
-        """Draw text on the window draw list"""
+        """Enqueue text in the viewport ScreenOverlayRenderer."""
 
     def draw_window_triangle_filled(self, x0: float, y0: float, x1: float, y1: float, x2: float, y2: float, color: object) -> None:
-        """Draw a filled triangle on the window draw list"""
+        """
+        Enqueue a filled triangle in the viewport ScreenOverlayRenderer. Like every draw_window_* alias, coordinates are absolute screen space.
+        """
 
     def crf_curve_preview(self, label: str, gamma: float, toe: float, shoulder: float, gamma_r: float = 0.0, gamma_g: float = 0.0, gamma_b: float = 0.0) -> None:
-        """Draw CRF tone curve preview widget"""
+        """
+        Unsupported in layout APIs; use the retained RmlUi <crf-curve> custom element.
+        """
 
     def chromaticity_diagram(self, label: str, red_x: float, red_y: float, green_x: float, green_y: float, blue_x: float, blue_y: float, neutral_x: float, neutral_y: float, range: float = 0.5) -> tuple[bool, list[float]]:
-        """Draw chromaticity diagram widget for color correction"""
+        """
+        Unsupported in layout APIs; use the retained RmlUi <chromaticity-diagram> custom element.
+        """
+
+    def template_tree(self, label: str, draw_callback: object, default_open: bool = False) -> bool:
+        """Unsupported on UILayout; use RmlUILayout.collapsing_header."""
+
+    def template_id(self, label: str, items: Sequence[str], current_id: str) -> tuple[bool, str]:
+        """Unsupported on UILayout; use RmlUILayout.combo."""
 
 def open_image_dialog(start_dir: str = '') -> str:
     """
@@ -1893,14 +1941,29 @@ def open_folder_dialog(title: str = 'Select Folder', start_dir: str = '') -> str
     Open a folder selection dialog. Returns empty string if cancelled. title is accepted for compatibility and currently ignored.
     """
 
+def open_project_file_dialog(start_dir: str = '') -> str:
+    """
+    Open a file dialog to select a LichtFeld project (.licht). Returns empty string if cancelled.
+    """
+
+def save_project_file_dialog(default_name: str = 'project.licht', start_dir: str = '') -> str:
+    """
+    Choose a destination for a new LichtFeld project. Returns empty string if cancelled.
+    """
+
 def open_ply_file_dialog(start_dir: str = '') -> str:
     """
-    Open a file dialog to select a splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz). Returns empty string if cancelled.
+    Open a file dialog to select a splat file (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz). Returns empty string if cancelled.
     """
 
 def open_mesh_file_dialog(start_dir: str = '') -> str:
     """
     Open a file dialog to select a mesh file. Returns empty string if cancelled.
+    """
+
+def open_init_file_dialog(start_dir: str = '') -> str:
+    """
+    Open a file dialog to select a training initialization file: a splat, point cloud or mesh. Returns empty string if cancelled.
     """
 
 def open_checkpoint_file_dialog() -> str:
@@ -1943,9 +2006,22 @@ def save_laz_file_dialog(default_name: str = 'export') -> str:
     Open a save file dialog for LAZ compressed files. Returns empty string if cancelled.
     """
 
+def save_text_file_dialog(default_name: str = 'lichtfeld_logs') -> str:
+    """Choose a text log export path. Returns empty string if cancelled."""
+
 def save_json_file_dialog(default_name: str = 'config.json') -> str:
     """
     Open a save file dialog for JSON files. Returns empty string if cancelled.
+    """
+
+def save_png_file_dialog(default_name: str = 'export.png') -> str:
+    """
+    Open a save file dialog for PNG images. Returns empty string if cancelled.
+    """
+
+def save_jpg_file_dialog(default_name: str = 'export.jpg') -> str:
+    """
+    Open a save file dialog for JPEG images. Returns empty string if cancelled.
     """
 
 def save_ply_file_dialog(default_name: str = 'export') -> str:
@@ -1958,9 +2034,19 @@ def save_sog_file_dialog(default_name: str = 'export') -> str:
     Open a save file dialog for SOG files. Returns empty string if cancelled.
     """
 
+def save_ssog_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for SSOG files. Returns empty string if cancelled.
+    """
+
 def save_spz_file_dialog(default_name: str = 'export') -> str:
     """
     Open a save file dialog for SPZ files. Returns empty string if cancelled.
+    """
+
+def save_glb_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for GLB (SPZ glTF) files. Returns empty string if cancelled.
     """
 
 def save_usd_file_dialog(default_name: str = 'export') -> str:
@@ -2003,7 +2089,7 @@ def open_url(url: str) -> None:
 
 def set_tool(tool: str) -> None:
     """
-    Switch to a toolbar tool (none, selection, translate, rotate, scale, mirror, brush, align, cropbox)
+    Switch to a toolbar tool (none, selection, translate, rotate, scale, mirror, align, cropbox)
     """
 
 class Key(enum.Enum):
@@ -2049,17 +2135,47 @@ class Key(enum.Enum):
 
     F2 = 573
 
-def is_key_pressed(key: Key, repeat: bool = True) -> bool:
-    """Check if a key was pressed this frame"""
+def is_key_pressed(key: Key, repeat: bool = False) -> bool:
+    """
+    Return the SDL-backed rising edge for the current UI frame. Must be queried on the UI thread; returns False before frame initialization. The repeat argument is retained only for call compatibility; key repeat is not emitted.
+    """
 
 def is_key_down(key: Key) -> bool:
-    """Check if a key is currently held down"""
+    """Return the current SDL keyboard level for the key."""
 
 def is_ctrl_down() -> bool:
     """Check if Ctrl is currently held"""
 
 def is_shift_down() -> bool:
     """Check if Shift is currently held"""
+
+def is_mouse_button_down(button: int = 0) -> bool:
+    """Check if a mouse button is held: 0 left, 1 right, 2 middle"""
+
+def begin_value_drag() -> bool:
+    """
+    Hide and lock the pointer for a value drag from a UI event handler. Motion keeps accumulating past the window edge; returns False when the pointer cannot be locked.
+    """
+
+def take_value_drag_delta() -> float:
+    """
+    Horizontal pointer motion in window points since the previous call during a value drag.
+    """
+
+def value_drag_state() -> str:
+    """
+    'active' while the value drag holds the pointer, 'cancelled' after Escape, the right button or focus loss ended it, otherwise 'idle'.
+    """
+
+def request_viewport_overlay_sync() -> None:
+    """
+    Run the viewport overlay's document sync on the next frame. It does not wake the frame loop; pair it with request_redraw when no input will arrive.
+    """
+
+def end_value_drag() -> None:
+    """
+    Release the value drag pointer lock and return the pointer to where the drag started.
+    """
 
 @overload
 def tr(key: str) -> str:
@@ -2084,14 +2200,32 @@ def register_popup_draw_callback(callback: object) -> None:
 def unregister_popup_draw_callback(callback: object) -> None:
     """Unregister a legacy popup draw callback"""
 
-def on_show_dataset_load_popup(callback: object) -> None:
-    """Register callback for ShowDatasetLoadPopup event"""
+def on_show_new_project_dialog(callback: object) -> None:
+    """Register callback for ShowNewProjectDialog event"""
 
 def on_show_resume_checkpoint_popup(callback: object) -> None:
     """Register callback for ShowResumeCheckpointPopup event"""
 
 def on_request_exit(callback: object) -> None:
-    """Register callback for RequestExit event"""
+    """
+    Register callback for the close-decision prompt (receives training_in_progress: bool)
+    """
+
+def on_project_switch_confirmation(callback: object) -> None:
+    """Register callback for a dirty project-switch decision"""
+
+def on_show_load_file_confirmation(callback: object) -> None:
+    """
+    Register callback for a load-file wipe confirmation (receives paths: list[str], is_dataset: bool, replace: bool)
+    """
+
+def on_show_load_file_confirmation_with_batch(callback: object) -> None:
+    """
+    Register a load-file confirmation callback with batch provenance (receives paths: list[str], is_dataset: bool, replace: bool, user_batch: bool). Replaces the callback registered through either load-file confirmation API.
+    """
+
+def on_stop_training_confirmation(callback: object) -> None:
+    """Register callback for a stop-training project-switch decision"""
 
 def on_open_camera_preview(callback: object) -> None:
     """Register callback for OpenCameraPreview event"""
@@ -2101,6 +2235,12 @@ def set_exit_popup_open(open: bool) -> None:
 
 def get_active_tool() -> str:
     """Get the currently active tool id from C++ EditorContext"""
+
+def consume_tool_restore_guard() -> bool:
+    """Consume the one-shot native tool restore guard"""
+
+def is_tool_available(id: str) -> bool:
+    """Check whether a builtin tool is currently available"""
 
 def set_active_tool(id: str) -> None:
     """Set the active tool via C++ event"""
@@ -2120,6 +2260,33 @@ def clear_active_operator() -> None:
 def has_active_operator() -> bool:
     """Check if an operator is currently active"""
 
+def can_edit_gaussian_selection() -> bool:
+    """Return true when Gaussian selection editing is available"""
+
+def has_gaussian_selection() -> bool:
+    """Return true when any Gaussians are selected"""
+
+def has_gaussian_clipboard() -> bool:
+    """Return true when copied Gaussians are available for paste"""
+
+def copy_gaussian_selection() -> None:
+    """Copy selected Gaussians to the internal Gaussian clipboard"""
+
+def cut_gaussian_selection() -> None:
+    """Cut selected Gaussians to the internal Gaussian clipboard"""
+
+def paste_gaussian_selection() -> None:
+    """Paste copied Gaussians from the internal Gaussian clipboard"""
+
+def invert_gaussian_selection() -> None:
+    """Invert the current Gaussian selection"""
+
+def select_all_gaussians() -> None:
+    """Select all editable Gaussians"""
+
+def deselect_all_gaussians() -> None:
+    """Deselect all selected Gaussians"""
+
 def set_gizmo_type(type: str) -> None:
     """Set gizmo type without blocking camera"""
 
@@ -2129,7 +2296,7 @@ def clear_gizmo() -> None:
 def get_active_submode() -> str:
     """Get active selection submode"""
 
-def set_selection_mode(mode: str) -> None:
+def set_selection_mode(mode: str, mark_session_dirty: bool = True) -> None:
     """Set selection mode"""
 
 def execute_mirror(axis: str) -> None:
@@ -2149,6 +2316,15 @@ def is_gt_comparison_active() -> bool:
     Returns true if ground-truth comparison split view is currently enabled.
     """
 
+def get_gt_comparison_mode() -> str:
+    """Get ground-truth comparison mode: rgb, normal, or depth."""
+
+def set_gt_comparison_mode(mode: str) -> None:
+    """Set ground-truth comparison mode."""
+
+def cycle_gt_comparison_mode() -> str:
+    """Cycle ground-truth comparison mode: rgb -> normal -> depth -> rgb."""
+
 def reveal_in_file_manager(path: str) -> bool:
     """
     Reveal a file or directory in the OS file manager. Returns true on success.
@@ -2156,6 +2332,65 @@ def reveal_in_file_manager(path: str) -> bool:
 
 def apply_cropbox() -> None:
     """Apply the selected cropbox"""
+
+def set_crop_tool_shape(shape: str) -> None:
+    """Set the active crop tool shape: box or ellipsoid"""
+
+def get_crop_tool_shape() -> str:
+    """Get the active crop tool shape"""
+
+def set_crop_tool_operation(operation: str) -> None:
+    """
+    Set the active crop or selection-volume gizmo operation: translate, rotate, or scale
+    """
+
+def get_crop_tool_operation() -> str:
+    """Get the active crop or selection-volume gizmo operation"""
+
+def apply_crop_tool() -> None:
+    """
+    Apply the active crop tool primitive through the node-backed crop command path
+    """
+
+def can_apply_align() -> bool:
+    """True when the align tool has 3 non-degenerate points ready to apply"""
+
+def apply_align() -> bool:
+    """Request the running align modal to apply the current triangle"""
+
+def clear_align_points() -> None:
+    """Request the running align modal to clear all picked points"""
+
+def get_align_preview() -> bool:
+    """Whether the alignment result is being previewed"""
+
+def toggle_align_preview() -> None:
+    """Switch between the original scene and the alignment preview"""
+
+def get_align_axis_snap() -> bool:
+    """Whether align plane-normal axis snap is enabled"""
+
+def set_align_axis_snap(enabled: bool) -> None:
+    """Enable or disable align plane-normal axis snap (session lifetime)"""
+
+def get_align_edge_to_axis() -> bool:
+    """Whether align edge-to-+X in-plane yaw is enabled"""
+
+def set_align_edge_to_axis(enabled: bool) -> None:
+    """Enable or disable align edge-to-+X in-plane yaw (session lifetime)"""
+
+def fit_crop_tool(use_percentile: bool = False) -> None:
+    """
+    Fit the active crop tool primitive through the node-backed crop command path
+    """
+
+def reset_crop_tool() -> None:
+    """
+    Reset the active crop tool primitive through the node-backed crop command path
+    """
+
+def delete_crop_tool_volume() -> None:
+    """Delete the active crop tool primitive and leave the crop tool"""
 
 def fit_cropbox_to_scene(use_percentile: bool = False) -> None:
     """Fit cropbox to scene bounds"""
@@ -2182,7 +2417,7 @@ def duplicate_node(name: str) -> None:
     """Duplicate a node and its children"""
 
 def merge_group(name: str) -> None:
-    """Merge group children into a single PLY"""
+    """Merge group children into a single model"""
 
 def save_node_to_disk(node_name: str) -> None:
     """
@@ -2199,6 +2434,9 @@ def load_thumbnail(path: str, max_size: int) -> tuple:
 
 def release_texture(texture_id: int) -> None:
     """Release a UI texture"""
+
+def release_rml_texture(source: str) -> bool:
+    """Release a cached RmlUi texture by source URL"""
 
 def get_image_info(path: str) -> tuple:
     """
@@ -2254,6 +2492,9 @@ def get_import_state() -> dict:
 
 def dismiss_import() -> None:
     """Dismiss the import completion overlay"""
+
+def cancel_gallery_import() -> bool:
+    """Request gallery import cancellation without waiting for its worker"""
 
 def get_video_export_state() -> dict:
     """Get current video export progress state"""
@@ -2319,6 +2560,13 @@ class SequencerUIState:
     def show_film_strip(self, arg: bool, /) -> None: ...
 
     @property
+    def sequence_fps(self) -> float:
+        """Playback FPS for loaded PLY sequences"""
+
+    @sequence_fps.setter
+    def sequence_fps(self, arg: float, /) -> None: ...
+
+    @property
     def selected_keyframe(self) -> int: ...
 
 def get_sequencer_state() -> SequencerUIState:
@@ -2326,6 +2574,14 @@ def get_sequencer_state() -> SequencerUIState:
 
 def has_keyframes() -> bool:
     """Check if sequencer has any keyframes"""
+
+def get_camera_path() -> object:
+    """
+    Get the native camera path with clip duration, loop mode and playback speed
+    """
+
+def set_camera_path(value: dict) -> bool:
+    """Restore a native camera path including loop mode and playback speed"""
 
 def save_camera_path(path: str) -> bool:
     """Save camera path to JSON file"""
@@ -2339,8 +2595,10 @@ def clear_keyframes() -> None:
 def set_playback_speed(speed: float) -> None:
     """Set sequencer playback speed"""
 
-def export_video(width: int, height: int, framerate: int, crf: int) -> None:
-    """Export video with specified settings"""
+def export_video(width: int, height: int, framerate: int, crf: int, path: str = '', include_provenance: bool = True) -> None:
+    """
+    Export video with specified settings. Without a path a save dialog opens, which a script cannot answer; pass one to export directly. include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded.
+    """
 
 def add_keyframe() -> None:
     """Add a keyframe at current camera position"""
@@ -2358,7 +2616,9 @@ def select_keyframe(index: int) -> None:
     """Select keyframe in timeline"""
 
 def delete_keyframe(index: int) -> None:
-    """Delete keyframe by index"""
+    """
+    Delete keyframe by index; raises ValueError for the protected first keyframe
+    """
 
 def set_keyframe_easing(index: int, easing: int) -> None:
     """
@@ -2374,12 +2634,18 @@ def draw_console_button() -> None:
 def toggle_system_console() -> None:
     """Toggle system console visibility"""
 
+def toggle_vram_hud() -> None:
+    """Toggle the VRAM diagnostics HUD overlay"""
+
+def is_perf_hud_visible() -> bool:
+    """True when the performance HUD is currently shown"""
+
 def is_windows_platform() -> bool:
     """Returns true on Windows"""
 
 def register_file_associations() -> bool:
     """
-    Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz files (Windows only)
+    Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht files (Windows only)
     """
 
 def open_file_association_settings() -> bool:
@@ -2389,12 +2655,12 @@ def open_file_association_settings() -> bool:
 
 def unregister_file_associations() -> bool:
     """
-    Remove LichtFeld Studio file associations for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)
+    Remove LichtFeld Studio file associations for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht (Windows only)
     """
 
 def are_file_associations_registered() -> bool:
     """
-    Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)
+    Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht (Windows only)
     """
 
 def get_pivot_mode() -> int:
@@ -2408,6 +2674,16 @@ def get_transform_space() -> int:
 
 def set_transform_space(space: int) -> None:
     """Set transform space (0=Local, 1=World)"""
+
+def get_multi_transform_mode() -> int:
+    """Get multi-transform mode (0=Group, 1=Individual)"""
+
+def set_multi_transform_mode(mode: int) -> None:
+    """Set multi-transform mode (0=Group, 1=Individual)"""
+
+MULTI_TRANSFORM_MODE_SELECTION: int = 0
+
+MULTI_TRANSFORM_MODE_INDIVIDUAL: int = 1
 
 def request_thumbnail(video_id: str) -> None:
     """Request download of a YouTube thumbnail for the given video ID"""
@@ -2435,9 +2711,6 @@ def free_plugin_icons(plugin_name: str) -> None:
 
 def free_plugin_textures(plugin_name: str) -> None:
     """Free all dynamic textures associated with a plugin"""
-
-def set_save_asset_callback(save_cb: Callable) -> None:
-    """Set callback for Save Asset operation from scene graph"""
 
 class DynamicTexture:
     @overload
@@ -2479,8 +2752,30 @@ def set_theme(name: str) -> None:
 def get_theme() -> str:
     """Get current stable theme id"""
 
+def set_theme_family(family_id: str, mode: str) -> bool:
+    """Select a theme family using dark, light, or automatic system mode"""
+
+def get_theme_family() -> str:
+    """Get the selected theme family id"""
+
+def get_theme_mode() -> str:
+    """Get the selected family mode: dark, light, or auto"""
+
+def supports_system_theme() -> bool:
+    """
+    Return whether automatic OS light/dark detection is available in this session
+    """
+
 def themes() -> list:
     """Get available theme presets with stable ids and UI metadata"""
+
+def get_native_floating_windows() -> bool:
+    """
+    Whether floating panels use native windows on the next application start.
+    """
+
+def set_native_floating_windows(enabled: bool) -> None:
+    """Save the experimental window mode. Requires an application restart."""
 
 def set_ui_scale(scale: float) -> None:
     """Set UI scale (0.0 = auto from OS, or 1.0-4.0)"""
@@ -2491,8 +2786,157 @@ def get_ui_scale() -> float:
 def get_ui_scale_preference() -> float:
     """Get saved UI scale preference (0.0 = auto)"""
 
+def set_zoom_speed_preference(speed: float, persist: bool = True) -> None:
+    """Set the default camera zoom speed (1-100)"""
+
+def get_zoom_speed_preference() -> float:
+    """Get the default camera zoom speed"""
+
+def set_navigation_speed_preference(speed: float, persist: bool = True) -> None:
+    """Set the default WASD navigation speed (1-100)"""
+
+def get_camera_browse_repeat() -> bool:
+    """Get whether held camera shortcuts repeat through dataset images"""
+
+def set_camera_browse_repeat(enabled: bool) -> None:
+    """Enable held camera shortcuts through dataset images"""
+
+def get_camera_browse_repeat_rate() -> float:
+    """Get camera image repeat rate in images per second"""
+
+def set_camera_browse_repeat_rate(rate: float, persist: bool = True) -> None:
+    """Set camera image repeat rate (1-20 images per second)"""
+
+def get_navigation_speed_preference() -> float:
+    """Get the default WASD navigation speed"""
+
+def get_rendering_defaults_json() -> str:
+    """
+    Get user defaults for new projects; project VIEW values are independent overrides.
+    """
+
+def set_rendering_defaults_json(serialized: str) -> None:
+    """
+    Validate and persist rendering defaults without changing the current project.
+    """
+
+def capture_rendering_defaults() -> None:
+    """
+    Save current project overlay style and LOD cache limits as defaults for new projects.
+    """
+
+def apply_rendering_defaults() -> None:
+    """
+    Explicitly apply user defaults to the current project; other rendering fields are preserved.
+    """
+
+def get_marketplace_preferences() -> dict:
+    """Get Marketplace preferences from the canonical user preferences store"""
+
+def set_marketplace_view(view: str) -> None:
+    """Set the Marketplace layout (card or list)"""
+
+def set_marketplace_git_checkout(enabled: bool) -> None:
+    """Set whether Marketplace installs use Git checkouts"""
+
+def reset_marketplace_preferences() -> None:
+    """Reset Marketplace layout and installation preferences"""
+
+def get_project_manager_preferences() -> dict:
+    """
+    Get Project Manager preferences from the canonical user preferences store
+    """
+
+def set_project_manager_default_view(view: str) -> None:
+    """Set the default Project Manager view"""
+
+def set_project_manager_open_at_startup(enabled: bool) -> None:
+    """Set whether Project Manager opens at application startup"""
+
+def set_project_manager_remember_state(enabled: bool) -> None:
+    """Set whether Project Manager layout state is remembered"""
+
+def get_project_manager_state() -> str:
+    """Get remembered Project Manager layout state as JSON"""
+
+def set_project_manager_state(state: str) -> None:
+    """Set remembered Project Manager layout state from JSON"""
+
+def reset_project_manager_preferences() -> None:
+    """Reset Project Manager preferences and remembered layout state"""
+
+def get_scene_reconstruction_options() -> list:
+    """Get registered scene reconstruction backends and their presets"""
+
+def get_scene_reconstruction_preset_preference(backend_id: str) -> str:
+    """Get the saved preset for a scene reconstruction backend"""
+
+def set_scene_reconstruction(backend_id: str, preset_id: str) -> bool:
+    """Atomically select a scene reconstruction backend and preset"""
+
+def reset_scene_reconstruction_preferences() -> None:
+    """Clear all saved scene reconstruction backend and preset preferences"""
+
+def get_mcp_preferences() -> dict:
+    """Get effective MCP HTTP server preferences"""
+
+def get_mcp_access_token() -> str:
+    """Get the local MCP network access token"""
+
+def set_mcp_preferences(enabled: bool, expose_network: bool, port: int, request_logging: bool = False) -> bool:
+    """Persist and immediately apply MCP HTTP server preferences"""
+
+def get_mcp_port_override() -> int | None:
+    """Get the MCP port set on the command line for this session, or None"""
+
+def get_project_location() -> str:
+    """Get the effective project location."""
+
+def get_project_location_preference() -> str:
+    """Get the raw project location preference."""
+
+def get_default_project_location() -> str:
+    """Get the default project location."""
+
+def set_project_location(path: str) -> str:
+    """
+    Set the project location. Returns an empty string on success, or a user-facing error.
+    """
+
+def clear_project_location() -> None:
+    """Clear the project location preference so the default is used."""
+
+def get_embed_dataset_by_default() -> bool:
+    """Get whether new projects copy datasets into the project by default."""
+
+def mark_project_session_chapter_committed(chapter: str) -> None:
+    """Mark a committed project session setting change for autosave."""
+
+def set_embed_dataset_by_default(enabled: bool) -> bool:
+    """Set whether new projects copy datasets into the project by default."""
+
+def get_mcp_status() -> dict:
+    """Get current MCP HTTP server runtime status"""
+
+def get_mcp_log_directory() -> str:
+    """Return the MCP per-session log directory"""
+
+def take_preferences_section_request() -> str:
+    """Consume a requested Preferences section name"""
+
 def set_clipboard_text(text: str) -> None:
     """Copy text to the system clipboard"""
+
+def has_clipboard_image() -> bool:
+    """Return True if the system clipboard holds an image"""
+
+def get_clipboard_image_texture() -> tuple:
+    """
+    Read an image from the clipboard as a UI texture, returns (texture_id, width, height)
+    """
+
+def save_clipboard_image(path: str) -> bool:
+    """Decode the clipboard image and write it to path; returns success"""
 
 def set_mouse_cursor_hand() -> None:
     """Set mouse cursor to hand pointer for this frame"""
@@ -2500,14 +2944,14 @@ def set_mouse_cursor_hand() -> None:
 def set_language(lang_code: str) -> None:
     """Set language by code (e.g., 'en', 'de')"""
 
+def resource_directory() -> str:
+    """Directory containing the bundled UI resources"""
+
 def get_current_language() -> str:
     """Get current language code"""
 
 def get_languages() -> list[tuple[str, str]]:
     """Get available languages as list of (code, name) tuples"""
-
-def show_input_settings() -> None:
-    """Show input settings window"""
 
 def show_python_console() -> None:
     """Show Python console"""
@@ -2520,7 +2964,7 @@ def set_cancel_operator_callback(callback: Callable) -> None:
 
 def get_selection_submode() -> int:
     """
-    Get current selection sub-mode (0=Brush, 1=Rectangle, 2=Polygon, 3=Lasso, 4=Rings)
+    Get current selection sub-mode (0=Centers, 1=Rectangle, 2=Polygon, 3=Lasso, 4=Rings, 5=Color, 6=Box, 7=Sphere)
     """
 
 def request_keyboard_capture(owner_id: str) -> None:
@@ -2597,7 +3041,14 @@ def is_point_cloud_forced() -> bool:
     """Check if point cloud mode is forced (pre-training mode)"""
 
 def get_fps() -> float:
-    """Get current FPS"""
+    """
+    Get viewport renders in the trailing second (cached and deferred results excluded)
+    """
+
+def get_ui_fps() -> float:
+    """
+    Get successful GUI presents in the trailing second (idle-clear frame excluded)
+    """
 
 def get_content_type() -> str:
     """Get content type (empty, splat_files, dataset)"""
@@ -2626,3 +3077,6 @@ def register_property_group(group_id: str, group_name: str, property_group_class
 
 def unregister_property_group(group_id: str) -> None:
     """Unregister a Python PropertyGroup from the property registry"""
+
+def property_group_info(group_id: str) -> dict:
+    """Get registered property metadata for a property group"""

@@ -5,6 +5,8 @@
 #include "tools/selection_tool.hpp"
 #include "geometry/euclidean_transform.hpp"
 #include "gui/gui_focus_state.hpp"
+#include "gui/gui_manager.hpp"
+#include "input/sdl_coordinate_utils.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "rendering/screen_overlay_renderer.hpp"
@@ -15,11 +17,20 @@
 #include <cmath>
 #include <cstdio>
 #include <glm/gtc/quaternion.hpp>
-#include <imgui.h>
 
 namespace lfs::vis::tools {
 
     namespace {
+        // The tool re-derives its filters from the camera every frame. Only a
+        // changed filter may request a redraw, or the viewport never idles.
+        bool sameSelectionFilter(const RenderSettings& a, const RenderSettings& b) {
+            return a.crop_filter_for_selection == b.crop_filter_for_selection &&
+                   a.show_crop_box == b.show_crop_box && a.show_ellipsoid == b.show_ellipsoid &&
+                   a.depth_filter_enabled == b.depth_filter_enabled &&
+                   a.depth_filter_transform.getRotation() == b.depth_filter_transform.getRotation() &&
+                   a.depth_filter_transform.getTranslation() == b.depth_filter_transform.getTranslation() &&
+                   a.depth_filter_min == b.depth_filter_min && a.depth_filter_max == b.depth_filter_max;
+        }
 
         [[nodiscard]] lfs::rendering::OverlayColor toOverlay(const auto& c) {
             return {c.x, c.y, c.z, c.w};
@@ -34,20 +45,67 @@ namespace lfs::vis::tools {
             return rm ? rm->getScreenOverlayRenderer() : nullptr;
         }
 
-        [[nodiscard]] float depthBoxHalfHeight(const ToolContext& ctx, const float half_width) {
+        // Split panels keep the vertical FOV, so the box narrows with the panel to frame it like the full viewport.
+        [[nodiscard]] glm::vec2 depthBoxHalfExtents(const ToolContext& ctx, const float half_width,
+                                                    const SplitViewPanelId panel) {
             const auto& bounds = ctx.getViewportBounds();
             const float aspect = (bounds.height > 0.0f)
                                      ? std::max(bounds.width / bounds.height, 0.1f)
                                      : 1.0f;
-            return std::max(half_width / aspect, 0.05f);
+            float panel_width_fraction = 1.0f;
+            if (const auto* const rm = ctx.getRenderingManager(); rm && bounds.width > 0.0f) {
+                if (const auto info = rm->resolveViewerPanel(ctx.getViewport(),
+                                                             {bounds.x, bounds.y},
+                                                             {bounds.width, bounds.height},
+                                                             std::nullopt, panel)) {
+                    panel_width_fraction = std::clamp(info->width / bounds.width, 0.0f, 1.0f);
+                }
+            }
+            return {std::max(half_width * panel_width_fraction, 0.05f),
+                    std::max(half_width / aspect, 0.05f)};
         }
 
-        [[nodiscard]] const Viewport& selectionFilterViewport(const ToolContext& ctx) {
-            auto* const rm = ctx.getRenderingManager();
-            if (rm) {
-                return rm->resolveFocusedViewport(ctx.getViewport());
+        [[nodiscard]] const Viewport& selectionFilterViewport(const ToolContext& ctx, const SplitViewPanelId panel) {
+            const auto& bounds = ctx.getViewportBounds();
+            if (const auto* const rm = ctx.getRenderingManager()) {
+                if (const auto info = rm->resolveViewerPanel(ctx.getViewport(),
+                                                             {bounds.x, bounds.y},
+                                                             {bounds.width, bounds.height},
+                                                             std::nullopt, panel)) {
+                    return *info->viewport;
+                }
             }
             return ctx.getViewport();
+        }
+
+        [[nodiscard]] bool pointInViewportBounds(const ViewportBounds& bounds, const glm::vec2 point) {
+            return point.x >= bounds.x &&
+                   point.y >= bounds.y &&
+                   point.x < bounds.x + bounds.width &&
+                   point.y < bounds.y + bounds.height;
+        }
+
+        [[nodiscard]] lfs::vis::SelectionMode selectionModeFromModifiers(const SDL_Keymod kmods) {
+            if (kmods & SDL_KMOD_SHIFT) {
+                return lfs::vis::SelectionMode::Add;
+            }
+            if (kmods & SDL_KMOD_CTRL) {
+                return lfs::vis::SelectionMode::Remove;
+            }
+            if (kmods & SDL_KMOD_ALT) {
+                return lfs::vis::SelectionMode::Intersect;
+            }
+            return lfs::vis::SelectionMode::Replace;
+        }
+
+        [[nodiscard]] const char* selectionModeSuffixFromModifiers(const SDL_Keymod kmods) {
+            switch (selectionModeFromModifiers(kmods)) {
+            case lfs::vis::SelectionMode::Add: return " +";
+            case lfs::vis::SelectionMode::Remove: return " -";
+            case lfs::vis::SelectionMode::Intersect: return " &";
+            case lfs::vis::SelectionMode::Replace: return "";
+            }
+            return "";
         }
 
     } // namespace
@@ -69,7 +127,7 @@ namespace lfs::vis::tools {
         }
 
         float mx, my;
-        SDL_GetMouseState(&mx, &my);
+        const SDL_MouseButtonFlags mouse_buttons = input::mouseStateInPixels(ctx.getWindow(), &mx, &my);
         last_mouse_pos_ = glm::vec2(mx, my);
 
         if (depth_filter_enabled_ || crop_filter_enabled_) {
@@ -78,6 +136,54 @@ namespace lfs::vis::tools {
 
         if (auto* const sm = ctx.getSceneManager()) {
             if (auto* const service = sm->getSelectionService()) {
+                auto* const rm = ctx.getRenderingManager();
+                if (const auto* input = InputController::instance();
+                    rm && input && input->isCameraNavigating() &&
+                    !service->isInteractiveSelectionActive()) {
+                    rm->clearCursorPreviewState();
+                    rm->clearPreviewSelection();
+                    return;
+                }
+                const bool passive_hover =
+                    mouse_buttons == 0 &&
+                    !gui::guiFocusState().want_capture_mouse &&
+                    pointInViewportBounds(ctx.getViewportBounds(), last_mouse_pos_);
+                if (rm && rm->getSelectionPreviewMode() == lfs::vis::SelectionPreviewMode::Centers &&
+                    !service->isInteractiveSelectionActive()) {
+                    if (passive_hover) {
+                        const SDL_Keymod kmods = SDL_GetModState();
+                        service->updatePassiveBrushHoverPreview(
+                            last_mouse_pos_, brush_radius_, selectionModeFromModifiers(kmods));
+                    } else if (rm->isCursorPreviewActive()) {
+                        rm->clearCursorPreviewState();
+                    }
+                    return;
+                }
+                const bool passive_ring_mode =
+                    rm &&
+                    rm->getSelectionPreviewMode() == lfs::vis::SelectionPreviewMode::Rings &&
+                    !service->isInteractiveSelectionActive();
+                if (passive_ring_mode) {
+                    const bool update_hover =
+                        mouse_buttons == 0 &&
+                        !gui::guiFocusState().want_capture_mouse &&
+                        pointInViewportBounds(ctx.getViewportBounds(), last_mouse_pos_);
+                    if (update_hover) {
+                        const SDL_Keymod kmods = SDL_GetModState();
+                        const auto mode = selectionModeFromModifiers(kmods);
+                        SelectionFilterState filters{};
+                        filters.crop_filter = crop_filter_enabled_;
+                        filters.depth_filter = depth_filter_enabled_;
+                        filters.restrict_to_selected_nodes =
+                            restrict_to_selected_nodes_;
+                        service->updatePassiveRingHoverPreview(last_mouse_pos_, mode, filters);
+                    } else {
+                        if (rm->isCursorPreviewActive()) {
+                            rm->clearCursorPreviewState();
+                        }
+                    }
+                    return;
+                }
                 service->refreshInteractivePreview();
             }
         }
@@ -95,6 +201,10 @@ namespace lfs::vis::tools {
             }
         }
 
+        if (preserve_restored_render_state_) {
+            preserve_restored_render_state_ = false;
+            return;
+        }
         if (enabled) {
             applySelectionFilterSettings(*tool_context_);
         } else {
@@ -124,11 +234,26 @@ namespace lfs::vis::tools {
         frustum_half_width_ = std::max(frustum_half_width, 0.05f);
 
         depth_filter_enabled_ = enabled;
-        if (!tool_context_ || !isEnabled()) {
+        if (!tool_context_ || !isEnabled() ||
+            preserve_restored_render_state_) {
             return;
         }
 
         applySelectionFilterSettings(*tool_context_);
+    }
+
+    void SelectionTool::restoreDepthFilterBox(const glm::vec3& box_min, const glm::vec3& box_max,
+                                              const bool saved_in_split_view) {
+        const float near_plane = std::max(0.0f, -box_max.z);
+        const float far_plane = std::max(near_plane + 0.01f, -box_min.z);
+        float half_width = std::max(std::abs(box_min.x), std::abs(box_max.x));
+        if (saved_in_split_view && tool_context_) {
+            const auto& bounds = tool_context_->getViewportBounds();
+            if (bounds.width > 0.0f && bounds.height > 0.0f) {
+                half_width = std::max(std::abs(box_min.y), std::abs(box_max.y)) * bounds.width / bounds.height;
+            }
+        }
+        setDepthFilterRange(true, near_plane, far_plane, half_width);
     }
 
     void SelectionTool::adjustDepthFar(const float scale) {
@@ -142,13 +267,17 @@ namespace lfs::vis::tools {
         if (!tool_context_ || !isEnabled() || !depth_filter_enabled_) {
             return;
         }
+        if (&viewport != &selectionFilterViewport(*tool_context_, filter_panel_)) {
+            return;
+        }
 
         auto* const rm = tool_context_->getRenderingManager();
         if (!rm) {
             return;
         }
 
-        auto settings = rm->getSettings();
+        const auto current = rm->getSettings();
+        auto settings = current;
         settings.crop_filter_for_selection = crop_filter_enabled_;
         if (crop_filter_enabled_) {
             settings.show_crop_box = true;
@@ -156,12 +285,25 @@ namespace lfs::vis::tools {
         }
         settings.depth_filter_enabled = depth_filter_enabled_;
         const glm::quat camera_quat = glm::quat_cast(viewport.camera.R);
-        const float half_height = depthBoxHalfHeight(*tool_context_, frustum_half_width_);
+        const glm::vec2 half_extents = depthBoxHalfExtents(*tool_context_, frustum_half_width_, filter_panel_);
         settings.depth_filter_transform = lfs::geometry::EuclideanTransform(camera_quat, viewport.camera.t);
-        settings.depth_filter_min = glm::vec3(-frustum_half_width_, -half_height, -depth_far_);
-        settings.depth_filter_max = glm::vec3(frustum_half_width_, half_height, -depth_near_);
+        settings.depth_filter_min = glm::vec3(-half_extents, -depth_far_);
+        settings.depth_filter_max = glm::vec3(half_extents, -depth_near_);
+        if (sameSelectionFilter(current, settings)) {
+            return;
+        }
         rm->updateSettings(settings);
-        rm->markDirty(DirtyFlag::SELECTION);
+        rm->markDirty(DirtyFlag::SELECTION, lfs::vis::FrameReason::Selection);
+    }
+
+    void SelectionTool::setFilterPanel(const SplitViewPanelId panel) {
+        if (filter_panel_ == panel) {
+            return;
+        }
+        filter_panel_ = panel;
+        if (tool_context_ && isEnabled() && depth_filter_enabled_) {
+            applySelectionFilterSettings(*tool_context_);
+        }
     }
 
     void SelectionTool::setCropFilterEnabled(const bool enabled) {
@@ -178,7 +320,8 @@ namespace lfs::vis::tools {
             return;
         }
 
-        auto settings = rm->getSettings();
+        const auto current = rm->getSettings();
+        auto settings = current;
         settings.crop_filter_for_selection = crop_filter_enabled_;
         if (crop_filter_enabled_) {
             settings.show_crop_box = true;
@@ -186,15 +329,18 @@ namespace lfs::vis::tools {
         }
         settings.depth_filter_enabled = depth_filter_enabled_;
         if (depth_filter_enabled_) {
-            const auto& viewport = selectionFilterViewport(ctx);
+            const auto& viewport = selectionFilterViewport(ctx, filter_panel_);
             const glm::quat camera_quat = glm::quat_cast(viewport.camera.R);
-            const float half_height = depthBoxHalfHeight(ctx, frustum_half_width_);
+            const glm::vec2 half_extents = depthBoxHalfExtents(ctx, frustum_half_width_, filter_panel_);
             settings.depth_filter_transform = lfs::geometry::EuclideanTransform(camera_quat, viewport.camera.t);
-            settings.depth_filter_min = glm::vec3(-frustum_half_width_, -half_height, -depth_far_);
-            settings.depth_filter_max = glm::vec3(frustum_half_width_, half_height, -depth_near_);
+            settings.depth_filter_min = glm::vec3(-half_extents, -depth_far_);
+            settings.depth_filter_max = glm::vec3(half_extents, -depth_near_);
+        }
+        if (sameSelectionFilter(current, settings)) {
+            return;
         }
         rm->updateSettings(settings);
-        rm->markDirty(DirtyFlag::SELECTION);
+        rm->markDirty(DirtyFlag::SELECTION, lfs::vis::FrameReason::Selection);
     }
 
     void SelectionTool::clearSelectionRenderState(const ToolContext& ctx) const {
@@ -208,7 +354,7 @@ namespace lfs::vis::tools {
         settings.depth_filter_enabled = false;
         rm->updateSettings(settings);
         rm->clearSelectionPreviews();
-        rm->markDirty(DirtyFlag::SELECTION);
+        rm->markDirty(DirtyFlag::SELECTION, lfs::vis::FrameReason::Selection);
     }
 
     void SelectionTool::onSelectionModeChanged() {
@@ -243,23 +389,17 @@ namespace lfs::vis::tools {
             {viewport_bounds.x, viewport_bounds.y},
             {viewport_bounds.x + viewport_bounds.width, viewport_bounds.y + viewport_bounds.height});
 
-        // ImGui::GetMousePos returns the cached, NewFrame-aligned cursor — matches what the
-        // viewport pass will see this frame. SDL_GetMouseState samples one extra event-pump
-        // late, which surfaces as a visible lag on the selection ring.
-        const ImVec2 mouse_imv = ImGui::GetMousePos();
-        const glm::vec2 mp{mouse_imv.x, mouse_imv.y};
+        float mouse_x = 0.0f;
+        float mouse_y = 0.0f;
+        input::mouseStateInPixels(tool_context_->getWindow(), &mouse_x, &mouse_y);
+        const glm::vec2 mp{mouse_x, mouse_y};
         const auto& t = theme();
 
         // Cursor outlines are drawn by GuiManager in a late-stage Vulkan overlay pass so
         // their sample-to-present path stays as short as possible.
 
         const SDL_Keymod kmods = SDL_GetModState();
-        const char* op_suffix = "";
-        if (kmods & SDL_KMOD_CTRL) {
-            op_suffix = " -";
-        } else if (kmods & SDL_KMOD_SHIFT) {
-            op_suffix = " +";
-        }
+        const char* op_suffix = selectionModeSuffixFromModifiers(kmods);
 
         const char* mode_name = nullptr;
         float text_offset = 15.0f;
@@ -272,12 +412,17 @@ namespace lfs::vis::tools {
             case lfs::vis::SelectionPreviewMode::Rectangle: mode_name = "RECT"; break;
             case lfs::vis::SelectionPreviewMode::Polygon: mode_name = "POLY"; break;
             case lfs::vis::SelectionPreviewMode::Lasso: mode_name = "LASSO"; break;
+            case lfs::vis::SelectionPreviewMode::Box: mode_name = "BOX"; break;
+            case lfs::vis::SelectionPreviewMode::Sphere: mode_name = "SPHERE"; break;
             case lfs::vis::SelectionPreviewMode::Color: mode_name = "COLOR"; break;
             default: break;
             }
         }
 
-        if (mode_name) {
+        const bool hardware_ring_active =
+            tool_context_->getGuiManager() &&
+            tool_context_->getGuiManager()->isHardwareSelectionRingActive();
+        if (mode_name && !hardware_ring_active) {
             char label_buf[32];
             std::snprintf(label_buf, sizeof(label_buf), "%s%s", mode_name, op_suffix);
             const float label_size = t.fonts.large_size;

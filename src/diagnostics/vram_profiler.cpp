@@ -10,6 +10,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <nvml.h>
+#include <unistd.h>
+#endif
 #include <deque>
 #include <iterator>
 #include <list>
@@ -49,6 +54,13 @@ namespace lfs::diagnostics {
             bool current_sample = false;
         };
 
+        // Vulkan current-state rows are the ownership registry for long-lived VMA
+        // allocations. Most of those objects exist before detailed profiling is
+        // enabled, so keep this small registry independent of high-volume tracing.
+        [[nodiscard]] bool is_persistent_current_scope(const std::string_view scope) {
+            return scope.starts_with("vulkan.") || scope.starts_with("vksplat");
+        }
+
         struct AllocationRecord {
             MetricKey key;
             std::size_t bytes = 0;
@@ -60,7 +72,97 @@ namespace lfs::diagnostics {
         constexpr std::size_t kTopNLive = 10;
         constexpr std::size_t kHistRingCapacity = 256;
         constexpr std::size_t kGpuEventPoolSize = 64;
-        constexpr std::size_t kAccountedHistoryLength = 64;
+        constexpr std::size_t kMarkerCapacity = 1024;
+
+#ifndef _WIN32
+        struct NvmlMemorySample {
+            std::size_t process = 0;
+            std::size_t used = 0;
+            std::size_t total = 0;
+        };
+
+        [[nodiscard]] NvmlMemorySample nvml_memory_sample() {
+            using Device = void*;
+            struct DeviceMemoryInfo {
+                unsigned long long total;
+                unsigned long long free;
+                unsigned long long used;
+            };
+            struct Api {
+                void* lib = nullptr;
+                Device device = nullptr;
+                std::mutex mutex;
+                int (*handle)(const char*, Device*) = nullptr;
+                int (*processes)(Device, unsigned int*, nvmlProcessInfo_t*) = nullptr;
+                int (*graphics)(Device, unsigned int*, nvmlProcessInfo_t*) = nullptr;
+                int (*memory)(Device, DeviceMemoryInfo*) = nullptr;
+                Api() {
+                    lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+                    if (!lib)
+                        return;
+                    const auto init = reinterpret_cast<int (*)()>(dlsym(lib, "nvmlInit_v2"));
+                    handle = reinterpret_cast<int (*)(const char*, Device*)>(
+                        dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2"));
+                    processes = reinterpret_cast<int (*)(Device, unsigned int*, nvmlProcessInfo_t*)>(
+                        dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
+                    graphics = reinterpret_cast<int (*)(Device, unsigned int*, nvmlProcessInfo_t*)>(
+                        dlsym(lib, "nvmlDeviceGetGraphicsRunningProcesses_v3"));
+                    memory = reinterpret_cast<int (*)(Device, DeviceMemoryInfo*)>(
+                        dlsym(lib, "nvmlDeviceGetMemoryInfo"));
+                    if (!init || !handle || !processes || init() != 0) {
+                        handle = nullptr;
+                        return;
+                    }
+                }
+                Device getDevice() {
+                    std::lock_guard lock(mutex);
+                    if (device)
+                        return device;
+                    if (!handle)
+                        return nullptr;
+                    int cuda_device = 0;
+                    char bus_id[32]{};
+                    if (cudaGetDevice(&cuda_device) != cudaSuccess ||
+                        cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), cuda_device) != cudaSuccess ||
+                        handle(bus_id, &device) != 0)
+                        device = nullptr;
+                    return device;
+                }
+            };
+            static Api api;
+            NvmlMemorySample sample;
+            const auto device = api.getDevice();
+            if (!device)
+                return sample;
+            if (api.memory) {
+                DeviceMemoryInfo info{};
+                if (api.memory(device, &info) == 0) {
+                    sample.used = static_cast<std::size_t>(info.used);
+                    sample.total = static_cast<std::size_t>(info.total);
+                }
+            }
+            for (const auto query : {api.processes, api.graphics}) {
+                if (!query)
+                    continue;
+                std::vector<nvmlProcessInfo_t> info(64);
+                auto count = static_cast<unsigned int>(info.size());
+                auto status = query(device, &count, info.data());
+                if (status == NVML_ERROR_INSUFFICIENT_SIZE) {
+                    info.resize(count);
+                    status = query(device, &count, info.data());
+                }
+                if (status != NVML_SUCCESS)
+                    continue;
+                for (unsigned int i = 0; i < count; ++i) {
+                    if (info[i].pid == static_cast<unsigned int>(getpid()) &&
+                        info[i].usedGpuMemory != NVML_VALUE_NOT_AVAILABLE)
+                        sample.process = std::max(sample.process,
+                                                  static_cast<std::size_t>(info[i].usedGpuMemory));
+                }
+            }
+            return sample;
+        }
+#endif
 
         template <std::size_t Capacity>
         struct RingBuffer {
@@ -306,15 +408,20 @@ namespace lfs::diagnostics {
         std::unordered_map<MetricKey, Metric, MetricKeyHash> static_metrics;
         std::unordered_map<void*, AllocationRecord> allocations;
         std::unordered_map<std::string, ScopeNodeStats> scope_nodes;
+        TrainingStateLedger training_state;
         VramProcessSnapshot process;
         std::size_t pinned_host_used = 0;
+        std::size_t pinned_host_cached = 0;
+        std::size_t pinned_host_peak = 0;
         std::size_t vulkan_vma_used = 0;
         std::size_t vulkan_vma_block_bytes = 0;
         std::size_t exportable_splat_bytes = 0;
+        std::size_t shared_scratch_bytes = 0;
         std::size_t cuda_slab_reserved_bytes = 0;
         // Pushed lock-free from the tensor pool's hot path; read into the snapshot
         // under the mutex. A lossy gauge, so no sequence bump on update.
         std::atomic<std::size_t> cuda_pool_bucket_cache_bytes{0};
+        std::atomic<std::size_t> cuda_pool_bucket_live_waste_bytes{0};
         std::size_t cuda_context_baseline = 0;
         std::size_t cuda_warmup_bytes = 0;
         std::size_t cuda_device_baseline = 0;
@@ -331,6 +438,8 @@ namespace lfs::diagnostics {
         std::unordered_map<std::string, std::uint64_t> iter_counters;
         std::unordered_map<std::string, std::uint64_t> total_counters;
         std::unordered_map<std::string, HistogramSeries> histograms;
+        std::deque<VramMarker> markers;
+        std::uint64_t next_marker_id = 1;
 
         std::array<PendingGpuEvent, kGpuEventPoolSize> gpu_event_pool{};
         std::array<bool, kGpuEventPoolSize> gpu_event_in_use{};
@@ -342,7 +451,6 @@ namespace lfs::diagnostics {
         std::chrono::steady_clock::time_point iter_window_origin{};
         std::uint64_t iter_window_count = 0;
         double iter_per_second = 0.0;
-        std::deque<std::size_t> accounted_history;
     };
 
     VramProfiler& VramProfiler::instance() {
@@ -361,7 +469,14 @@ namespace lfs::diagnostics {
         impl_->enabled.store(enabled, std::memory_order_release);
         if (!enabled) {
             std::lock_guard lock(impl_->mutex);
-            impl_->metrics.clear();
+            for (auto it = impl_->metrics.begin(); it != impl_->metrics.end();) {
+                if (!it->second.current_sample || it->second.live_bytes == 0 ||
+                    !is_persistent_current_scope(it->first.scope)) {
+                    it = impl_->metrics.erase(it);
+                } else {
+                    ++it;
+                }
+            }
             impl_->allocations.clear();
             impl_->scope_nodes.clear();
             impl_->accounted_live_bytes = 0;
@@ -374,17 +489,22 @@ namespace lfs::diagnostics {
             impl_->iter_counters.clear();
             impl_->total_counters.clear();
             impl_->histograms.clear();
+            impl_->markers.clear();
             impl_->iter_ms_ring.clear();
             impl_->iter_ms_last = 0.0;
             impl_->iter_per_second = 0.0;
             impl_->last_iteration_tp = std::chrono::steady_clock::time_point{};
             impl_->iter_window_origin = std::chrono::steady_clock::time_point{};
             impl_->iter_window_count = 0;
-            impl_->accounted_history.clear();
             impl_->pinned_host_used = 0;
-            impl_->vulkan_vma_used = 0;
-            impl_->vulkan_vma_block_bytes = 0;
+            impl_->pinned_host_cached = 0;
+            impl_->pinned_host_peak = 0;
+            // Keep VMA process gauges: long-lived vulkan.* ownership rows and the
+            // free-in-blocks sampler stay live when detailed profiling is off, so the
+            // blockBytes / budget totals must remain coherent with those rows.
+            // vulkan_vma_used / vulkan_vma_block_bytes intentionally preserved.
             impl_->exportable_splat_bytes = 0;
+            impl_->shared_scratch_bytes = 0;
             impl_->cuda_slab_reserved_bytes = 0;
             // cuda_context_baseline intentionally preserved: it captures the irreducible
             // runtime overhead once at process startup and is valid for the session.
@@ -424,10 +544,6 @@ namespace lfs::diagnostics {
             impl_->iter_window_count = 0;
         }
 
-        impl_->accounted_history.push_back(impl_->accounted_live_bytes);
-        while (impl_->accounted_history.size() > kAccountedHistoryLength)
-            impl_->accounted_history.pop_front();
-
         impl_->iter_counters.clear();
         impl_->iter_allocation_events_start = impl_->allocation_events;
         impl_->iter_free_events_start = impl_->free_events;
@@ -464,10 +580,6 @@ namespace lfs::diagnostics {
             upsert_scope_node(impl_->scope_nodes, allocation.key.scope, false, false, false);
         }
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    void VramProfiler::setIteration(const int iteration) {
-        impl_->iteration.store(iteration, std::memory_order_relaxed);
     }
 
     void VramProfiler::pushScope(std::string_view scope) {
@@ -620,6 +732,12 @@ namespace lfs::diagnostics {
 
     void VramProfiler::recordAllocation(void* ptr,
                                         const std::size_t bytes,
+                                        const VramAllocationMethod method) {
+        recordAllocation(ptr, bytes, method, {});
+    }
+
+    void VramProfiler::recordAllocation(void* ptr,
+                                        const std::size_t bytes,
                                         const VramAllocationMethod method,
                                         std::string_view label) {
         if (!enabled() || !ptr || bytes == 0) {
@@ -710,34 +828,28 @@ namespace lfs::diagnostics {
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
-    void VramProfiler::recordBytes(std::string_view scope,
-                                   std::string_view label,
-                                   const std::size_t bytes,
-                                   const VramAllocationMethod method) {
-        if (!enabled() || bytes == 0 || scope.empty() || label.empty()) {
-            return;
-        }
-
-        std::lock_guard lock(impl_->mutex);
-        auto& metric = impl_->metrics[MetricKey{std::string(scope), std::string(label)}];
-        metric.allocated_bytes += bytes;
-        metric.peak_bytes = std::max(metric.peak_bytes, bytes);
-        metric.allocation_count += 1;
-        metric.method = method;
-        upsert_scope_node(impl_->scope_nodes, scope, false, false, false);
-        impl_->sequence.fetch_add(1, std::memory_order_relaxed);
-    }
-
     void VramProfiler::recordCurrentBytes(std::string_view scope,
                                           std::string_view label,
                                           const std::size_t bytes,
                                           const VramAllocationMethod method) {
-        if (!enabled() || scope.empty() || label.empty()) {
+        if (scope.empty() || label.empty()) {
+            return;
+        }
+
+        const bool detailed_tracking = enabled();
+        if (!detailed_tracking && !is_persistent_current_scope(scope)) {
             return;
         }
 
         std::lock_guard lock(impl_->mutex);
-        auto& metric = impl_->metrics[MetricKey{std::string(scope), std::string(label)}];
+        MetricKey key{std::string(scope), std::string(label)};
+        if (!detailed_tracking && bytes == 0) {
+            if (impl_->metrics.erase(key) > 0) {
+                impl_->sequence.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        auto& metric = impl_->metrics[std::move(key)];
         metric.live_bytes = bytes;
         metric.peak_bytes = std::max(metric.peak_bytes, bytes);
         metric.allocated_bytes = std::max(metric.allocated_bytes, bytes);
@@ -806,26 +918,6 @@ namespace lfs::diagnostics {
         node.last_ms = elapsed_ms;
         node.max_ms = std::max(node.max_ms, elapsed_ms);
         node.wall_ring.push(std::max(elapsed_ms, 0.0));
-        impl_->sequence.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    void VramProfiler::recordGpuTimerSample(std::string_view scope, const double elapsed_ms) {
-        if (!enabled() || scope.empty() || !std::isfinite(elapsed_ms) || elapsed_ms < 0.0) {
-            return;
-        }
-        std::lock_guard lock(impl_->mutex);
-        const auto parts = split_scope_path(scope);
-        if (parts.empty()) {
-            return;
-        }
-        const auto path = join_parts(parts, parts.size());
-        upsert_scope_node(impl_->scope_nodes, path, false, true, false);
-        auto& node = impl_->scope_nodes[path];
-        node.timer_scope = true;
-        node.gpu_call_count += 1;
-        node.gpu_total_ms += elapsed_ms;
-        node.gpu_last_ms = elapsed_ms;
-        node.gpu_max_ms = std::max(node.gpu_max_ms, elapsed_ms);
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -956,10 +1048,31 @@ namespace lfs::diagnostics {
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
-    void VramProfiler::setPinnedHostUsed(const std::size_t bytes) {
+    void VramProfiler::mark(std::string_view kind, std::string_view text,
+                            std::size_t bytes, double pause_ms) {
+        if (!enabled() || kind.empty())
+            return;
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
         std::lock_guard lock(impl_->mutex);
-        impl_->pinned_host_used = bytes;
-        impl_->process.pinned_host_used = bytes;
+        impl_->markers.push_back({impl_->next_marker_id++,
+                                  std::chrono::duration_cast<std::chrono::milliseconds>(now).count(),
+                                  impl_->iteration.load(std::memory_order_relaxed),
+                                  std::string(kind), std::string(text), bytes, pause_ms});
+        if (impl_->markers.size() > kMarkerCapacity)
+            impl_->markers.pop_front();
+        impl_->sequence.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void VramProfiler::setPinnedHostMemory(const std::size_t active_bytes,
+                                           const std::size_t cached_bytes,
+                                           const std::size_t peak_bytes) {
+        std::lock_guard lock(impl_->mutex);
+        impl_->pinned_host_used = active_bytes;
+        impl_->pinned_host_cached = cached_bytes;
+        impl_->pinned_host_peak = peak_bytes;
+        impl_->process.pinned_host_used = active_bytes;
+        impl_->process.pinned_host_cached = cached_bytes;
+        impl_->process.pinned_host_peak = peak_bytes;
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -983,6 +1096,11 @@ namespace lfs::diagnostics {
         impl_->cuda_pool_bucket_cache_bytes.store(bytes, std::memory_order_relaxed);
     }
 
+    void VramProfiler::setCudaPoolBucketLiveWasteBytes(const std::size_t bytes) {
+        // Lock-free: this is updated on every size-bucketed allocation/free.
+        impl_->cuda_pool_bucket_live_waste_bytes.store(bytes, std::memory_order_relaxed);
+    }
+
     void VramProfiler::setCudaSlabReservedBytes(const std::size_t bytes) {
         std::lock_guard lock(impl_->mutex);
         impl_->cuda_slab_reserved_bytes = bytes;
@@ -997,15 +1115,10 @@ namespace lfs::diagnostics {
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
-    void VramProfiler::captureCudaContextBaseline() {
-        std::size_t used = 0;
-        if (!sample_cuda_used_bytes(used))
-            return;
+    void VramProfiler::setSharedScratchBytes(const std::size_t bytes) {
         std::lock_guard lock(impl_->mutex);
-        if (impl_->cuda_context_baseline == 0) {
-            impl_->cuda_context_baseline = used;
-            impl_->process.cuda_context_baseline = used;
-        }
+        impl_->shared_scratch_bytes = bytes;
+        impl_->process.shared_scratch_bytes = bytes;
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -1041,7 +1154,21 @@ namespace lfs::diagnostics {
         std::lock_guard lock(impl_->mutex);
         if (impl_->cuda_device_baseline == 0)
             impl_->cuda_device_baseline = used;
+#ifndef _WIN32
+        if (impl_->cuda_context_baseline == 0) {
+            const auto process_bytes = nvml_memory_sample().process;
+            if (process_bytes) {
+                impl_->cuda_context_baseline = process_bytes;
+                impl_->process.cuda_context_baseline = process_bytes;
+            }
+        }
+#endif
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::size_t VramProfiler::cudaDeviceBaselineBytes() const {
+        std::lock_guard lock(impl_->mutex);
+        return impl_->cuda_device_baseline;
     }
 
     void VramProfiler::captureCudaWarmupDelta() {
@@ -1106,6 +1233,15 @@ namespace lfs::diagnostics {
             process.cuda_total = total_bytes;
             process.cuda_memory_valid = true;
         }
+#ifndef _WIN32
+        {
+            const auto usage = nvml_memory_sample();
+            process.process_used = usage.process;
+            process.total = usage.total ? usage.total : process.cuda_total;
+            process.total_used = std::min(usage.total ? usage.used : process.cuda_used, process.total);
+            process.process_memory_valid = usage.process > 0;
+        }
+#endif
 
 #if CUDART_VERSION >= 12080
         int device = 0;
@@ -1133,12 +1269,17 @@ namespace lfs::diagnostics {
                         : 0;
             }
             process.pinned_host_used = impl_->pinned_host_used;
+            process.pinned_host_cached = impl_->pinned_host_cached;
+            process.pinned_host_peak = impl_->pinned_host_peak;
             process.vulkan_vma_used = impl_->vulkan_vma_used;
             process.vulkan_vma_block_bytes = impl_->vulkan_vma_block_bytes;
             process.cuda_pool_bucket_cache_bytes =
                 impl_->cuda_pool_bucket_cache_bytes.load(std::memory_order_relaxed);
+            process.cuda_pool_bucket_live_waste_bytes =
+                impl_->cuda_pool_bucket_live_waste_bytes.load(std::memory_order_relaxed);
             process.cuda_slab_reserved_bytes = impl_->cuda_slab_reserved_bytes;
             process.exportable_splat_bytes = impl_->exportable_splat_bytes;
+            process.shared_scratch_bytes = impl_->shared_scratch_bytes;
             process.cuda_context_baseline = impl_->cuda_context_baseline;
             process.cuda_warmup_bytes = impl_->cuda_warmup_bytes;
             impl_->process = std::move(process);
@@ -1155,18 +1296,37 @@ namespace lfs::diagnostics {
             return;
         }
 
+        // The GUI has already selected a source. Do not replace an unavailable
+        // PID sample with device-wide usage or an independently timed sample.
+        const auto measured_process_used = process_used;
+        const auto measured_total_used = std::min(total_used, total);
+        const auto measured_total = total;
         std::lock_guard lock(impl_->mutex);
-        impl_->process.process_used = process_used;
-        impl_->process.total_used = total_used;
-        impl_->process.total = total;
+        impl_->process.process_used = measured_process_used;
+        impl_->process.total_used = measured_total_used;
+        impl_->process.total = measured_total;
         impl_->process.device_name = std::move(device_name);
-        impl_->process.process_memory_valid = process_used > 0 || total_used > 0 || total > 0;
-        if (!impl_->process.cuda_memory_valid && total_used > 0 && total > 0) {
-            impl_->process.cuda_used = total_used;
-            impl_->process.cuda_total = total;
+        impl_->process.process_memory_valid = measured_process_used > 0;
+        if (!impl_->process.cuda_memory_valid && measured_total_used > 0 && measured_total > 0) {
+            impl_->process.cuda_used = measured_total_used;
+            impl_->process.cuda_total = measured_total;
             impl_->process.cuda_memory_valid = true;
         }
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void VramProfiler::setTrainingStateLedger(const TrainingStateLedger& ledger) {
+        if (!enabled()) {
+            return;
+        }
+        std::lock_guard lock(impl_->mutex);
+        impl_->training_state = ledger;
+        impl_->sequence.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    TrainingStateLedger VramProfiler::trainingStateLedger() const {
+        std::lock_guard lock(impl_->mutex);
+        return impl_->training_state;
     }
 
     VramProfilerSnapshot VramProfiler::snapshot() const {
@@ -1187,13 +1347,14 @@ namespace lfs::diagnostics {
         out.iter_per_second = impl_->iter_per_second;
         out.iter_ms_p95 = ring_percentile(impl_->iter_ms_ring, 0.95);
         out.iter_ms_last = impl_->iter_ms_last;
+        out.markers.assign(impl_->markers.begin(), impl_->markers.end());
         out.accounted_live_bytes = impl_->accounted_live_bytes;
         const auto add_accounted_method = [&](const VramAllocationMethod method,
                                               const std::size_t bytes) {
             switch (method) {
             case VramAllocationMethod::Slab:
+                // C2: slab memory is cudaMalloc, not inside cudaMemPoolAttrUsedMemCurrent.
                 out.accounted_slab_live_bytes += bytes;
-                out.accounted_cuda_pool_live_bytes += bytes;
                 break;
             case VramAllocationMethod::Bucketed:
                 out.accounted_bucketed_live_bytes += bytes;
@@ -1225,8 +1386,7 @@ namespace lfs::diagnostics {
             add_accounted_method(metric.method, metric.live_bytes);
         }
         out.accounted_peak_bytes = impl_->accounted_peak_bytes;
-        out.accounted_live_history.assign(impl_->accounted_history.begin(),
-                                          impl_->accounted_history.end());
+        out.training_state = impl_->training_state;
         out.process = impl_->process;
         out.rows.reserve(impl_->metrics.size() + impl_->static_metrics.size());
         std::unordered_map<std::string, VramTreeNodeSnapshot> tree_nodes;
@@ -1297,12 +1457,21 @@ namespace lfs::diagnostics {
                                                     stats.max_vram_decrease_bytes);
         };
 
-        const auto append_metric = [&](const MetricKey& key, const Metric& metric, const bool include_live_sample) {
+        const auto append_metric = [&](const MetricKey& key,
+                                       const Metric& metric,
+                                       const bool from_static_map) {
             if (metric.live_bytes == 0 && metric.peak_bytes == 0 &&
                 metric.allocated_bytes == 0 && metric.freed_bytes == 0) {
                 return;
             }
-            if (metric.current_sample || include_live_sample) {
+            // C1: row kind so consumers can separate allocations from disclosures.
+            VramRowKind kind = VramRowKind::Hooked;
+            if (from_static_map) {
+                kind = VramRowKind::Static;
+            } else if (metric.current_sample) {
+                kind = VramRowKind::Sampled;
+            }
+            if (metric.current_sample || from_static_map) {
                 out.sampled_live_bytes += metric.live_bytes;
             }
             out.rows.push_back({
@@ -1315,6 +1484,7 @@ namespace lfs::diagnostics {
                 .allocation_count = metric.allocation_count,
                 .free_count = metric.free_count,
                 .method = metric.method,
+                .kind = kind,
             });
             add_metric_to_tree(key, metric);
         };
@@ -1449,10 +1619,13 @@ namespace lfs::diagnostics {
                 break;
         }
 
-        out.gauges.reserve(impl_->gauges.size());
+        out.gauges.reserve(impl_->gauges.size() + 1);
         for (const auto& [k, v] : impl_->gauges) {
             out.gauges.push_back({k, v, impl_->gauge_generation});
         }
+        out.gauges.push_back({"vram.audit.pool.bucket_live_rounding_waste",
+                              static_cast<double>(out.process.cuda_pool_bucket_live_waste_bytes),
+                              impl_->gauge_generation});
         std::sort(out.gauges.begin(), out.gauges.end(),
                   [](const auto& a, const auto& b) { return a.key < b.key; });
 
@@ -1616,6 +1789,14 @@ namespace lfs::diagnostics {
             VramProfiler::instance().releaseGpuEventPair(event_pair_, stream_);
         } catch (...) {
         }
+    }
+
+    std::optional<std::size_t> process_device_memory_bytes() {
+#ifndef _WIN32
+        if (const auto bytes = nvml_memory_sample().process)
+            return bytes;
+#endif
+        return std::nullopt;
     }
 
 } // namespace lfs::diagnostics

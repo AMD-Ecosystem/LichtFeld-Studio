@@ -37,6 +37,7 @@ namespace lfs::vis {
     using SetViewCallback = std::function<void(const SetViewParams&)>;
     using SetViewForPanelCallback = std::function<void(SplitViewPanelId, const SetViewParams&)>;
     using SetFovCallback = std::function<void(float)>;
+    using SetOrthoScaleCallback = std::function<void(std::optional<float>)>;
 
     struct ViewportRender {
         std::shared_ptr<lfs::core::Tensor> image;
@@ -60,9 +61,11 @@ namespace lfs::vis {
     LFS_VIS_API void set_set_view_callback(SetViewCallback callback);
     LFS_VIS_API void set_set_view_for_panel_callback(SetViewForPanelCallback callback);
     LFS_VIS_API void set_set_fov_callback(SetFovCallback callback);
+    LFS_VIS_API void set_set_ortho_scale_callback(SetOrthoScaleCallback callback);
     LFS_VIS_API void apply_set_view(const SetViewParams& params);
     LFS_VIS_API void apply_set_view_for_panel(SplitViewPanelId panel, const SetViewParams& params);
     LFS_VIS_API void apply_set_fov(float fov_degrees);
+    LFS_VIS_API void apply_set_ortho_scale(std::optional<float> scale);
 
     struct RenderSettingsProxy {
         float focal_length_mm = 35.0f;
@@ -71,16 +74,23 @@ namespace lfs::vis {
         bool mip_filter = false;
         int sh_degree = 3;
         float render_scale = 1.0f;
+        std::string scene_upscaler = "native";
+        std::string scene_upscaler_preset = "native";
+        float scene_upscaler_scale = 1.0f;
         int camera_metrics_mode = 0;
         bool show_crop_box = false;
         bool use_crop_box = false;
         bool show_ellipsoid = false;
         bool use_ellipsoid = false;
         bool desaturate_unselected = false;
-        bool desaturate_cropping = true;
+        bool desaturate_cropping = false;
         bool hide_outside_depth_box = false;
         bool crop_filter_for_selection = false;
         std::array<float, 3> background_color{0.0f, 0.0f, 0.0f};
+        // Display color: tone IDs match none, linear, filmic, hejl, aces, aces2, neutral.
+        float color_exposure = 1.0f;
+        int color_tonemapping = 0;
+        int splat_render_profile = 0; // 0: Studio, 1: standard portal
         int environment_mode = 0;
         std::string environment_map_path{
             std::string(kDefaultEnvironmentMapPath)};
@@ -103,13 +113,18 @@ namespace lfs::vis {
         std::array<float, 3> eval_camera_color{1.0f, 0.0f, 0.0f};
         bool show_pivot = false;
         int split_view_mode = 0;
+        int gt_comparison_mode = 0;
         float split_position = 0.5f;
+        size_t split_view_offset = 0;
         int raster_backend = 2;
         bool gut = false;
         bool equirectangular = false;
         bool orthographic = false;
         float ortho_scale = 100.0f;
-        std::array<float, 3> selection_color_committed{0.859f, 0.325f, 0.325f};
+        bool depth_view = false;
+        float depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
+        float depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
+        int depth_visualization_mode = 0;
         std::array<float, 3> selection_color_preview{0.0f, 0.871f, 0.298f};
         std::array<float, 3> selection_color_center_marker{0.0f, 0.604f, 0.733f};
         bool depth_clip_enabled = false;
@@ -134,6 +149,19 @@ namespace lfs::vis {
         std::array<float, 3> depth_filter_max{50.0f, 10000.0f, 100.0f};
         std::array<float, 4> depth_filter_rotation{1.0f, 0.0f, 0.0f, 0.0f};
         std::array<float, 3> depth_filter_translation{0.0f, 0.0f, 0.0f};
+
+        bool lod_enabled = false;
+        bool lod_auto_enable_rad = false;
+        bool lod_debug_colors = false;
+        float lod_max_splats = static_cast<float>(DEFAULT_LOD_MAX_SPLATS);
+        float lod_page_pool_splats = static_cast<float>(DEFAULT_LOD_PAGE_POOL_SPLATS);
+        float lod_pool_vram_fraction = DEFAULT_LOD_POOL_VRAM_FRACTION;
+        float lod_fade_frames = static_cast<float>(DEFAULT_LOD_FADE_FRAMES);
+        float lod_render_scale = DEFAULT_LOD_RENDER_SCALE;
+        float lod_behind_camera_penalty = DEFAULT_LOD_BEHIND_CAMERA_FOVEATION;
+        float lod_cone_foveation = DEFAULT_LOD_CONE_FOVEATION;
+        float lod_cone_inner_degrees = DEFAULT_LOD_CONE_INNER_DEGREES;
+        float lod_cone_outer_degrees = DEFAULT_LOD_CONE_OUTER_DEGREES;
     };
 
     using GetRenderSettingsCallback = std::function<std::optional<RenderSettingsProxy>()>;

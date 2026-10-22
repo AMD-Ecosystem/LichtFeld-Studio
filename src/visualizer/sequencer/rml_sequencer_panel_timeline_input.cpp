@@ -7,10 +7,12 @@
 
 #include "core/events.hpp"
 #include "gui/film_strip_renderer.hpp"
+#include "gui/panel_input_utils.hpp"
 #include "gui/rmlui/rml_input_utils.hpp"
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
+#include "operation/undo_history.hpp"
 #include "sequencer/interpolation.hpp"
 #include "sequencer/rml_sequencer_panel.hpp"
 #include "sequencer/timeline_view_math.hpp"
@@ -27,8 +29,6 @@ namespace lfs::vis {
         constexpr float MIN_KEYFRAME_SPACING = 0.1f;
         constexpr float DOUBLE_CLICK_TIME = 0.3f;
         constexpr float DRAG_THRESHOLD_PX = 3.0f;
-        constexpr float PLAYHEAD_HIT_RADIUS = 8.0f;
-        constexpr float PLAYHEAD_HANDLE_WIDTH = 14.0f;
 
         [[nodiscard]] std::string formatTime(const float seconds) {
             const int mins = static_cast<int>(seconds) / 60;
@@ -71,27 +71,8 @@ namespace lfs::vis {
 
         void forwardFocusedKeyboardInput(Rml::Context* const context,
                                          const PanelInputState& input) {
-            const int mods = gui::sdlModsToRml(input.key_ctrl, input.key_shift,
-                                               input.key_alt, input.key_super);
-            for (const int sc : input.keys_pressed) {
-                const auto rml_key = gui::sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN)
-                    context->ProcessKeyDown(rml_key, mods);
-            }
-            for (const int sc : input.keys_released) {
-                const auto rml_key = gui::sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN)
-                    context->ProcessKeyUp(rml_key, mods);
-            }
-            // SDL TextInput events are distinct from key events; without forwarding them,
-            // <input> fields cannot receive typed characters or IME composition.
-            if (!input.text_inputs.empty()) {
-                for (const auto& s : input.text_inputs)
-                    context->ProcessTextInput(s);
-            } else {
-                for (const std::uint32_t cp : input.text_codepoints)
-                    context->ProcessTextInput(static_cast<Rml::Character>(cp));
-            }
+            for (const auto& event : input.input_events)
+                gui::rml_input::processKeyboardEvent(*context, event);
         }
 
         struct ElementBounds {
@@ -248,6 +229,9 @@ namespace lfs::vis {
     void RmlSequencerPanel::forwardInput(const PanelInputState& input) {
         if (!rml_context_)
             return;
+        if (rml_manager_ && rml_manager_->routeInput(rml_context_, gui::fromSequencerPanelInput(input),
+                                                     [this](const gui::PanelInputState& event) { forwardInput(gui::toSequencerPanelInput(event)); }))
+            return;
         if (rml_manager_) {
             rml_manager_->trackContextFrame(rml_context_,
                                             static_cast<int>(cached_panel_x_ - input.screen_x),
@@ -332,7 +316,7 @@ namespace lfs::vis {
         const float s = cached_dp_ratio_;
 
         const auto& timeline = controller_.timeline();
-        if (timeline.empty())
+        if (timeline.empty() && !controller_.hasPlySequence())
             return;
 
         // Resolve actual rendered Y of #track-area (where diamonds live) from
@@ -352,13 +336,42 @@ namespace lfs::vis {
         }
         const float diamond_y_center = (track_area_top + track_area_bottom) * 0.5f;
 
+        // Ruler band from the rendered #ruler rect — C++ pos.y is the content
+        // origin after INNER_PADDING + TRANSPORT_ROW_HEIGHT and misses the
+        // docked floating-header row, which put scrub hits on the transport
+        // buttons. Fall back to that estimate only until layout has a size.
+        float ruler_top = pos.y;
+        float ruler_bottom = pos.y + RULER_HEIGHT * s;
+        if (el_ruler_) {
+            const auto ruler_offset = el_ruler_->GetAbsoluteOffset(Rml::BoxArea::Border);
+            const auto ruler_size = el_ruler_->GetBox().GetSize(Rml::BoxArea::Border);
+            if (ruler_size.y > 0.0f) {
+                ruler_top = cached_panel_y_ + ruler_offset.y;
+                ruler_bottom = ruler_top + ruler_size.y;
+            }
+        }
+
         const float mx = input.mouse_x;
         const float my = input.mouse_y;
-        // Wide band: wheel zoom/pan and click-anywhere-to-scrub.
-        const bool mouse_in_timeline = mx >= pos.x && mx <= pos.x + width &&
+        const bool mouse_in_x = mx >= pos.x && mx <= pos.x + width;
+        // Click-to-scrub / diamond hits stay in #track-area.
+        const bool mouse_in_timeline = mouse_in_x &&
                                        my >= track_area_top && my <= track_area_bottom;
+        const bool mouse_in_ruler = mouse_in_x &&
+                                    my >= ruler_top && my <= ruler_bottom;
 
-        if (mouse_in_timeline && !input.want_capture_mouse) {
+        // Wheel zoom/pan covers the whole timeline column: ruler top through
+        // the film strip (when visible) or the easing stripe otherwise.
+        const float easing_bottom = cached_panel_y_ + cached_height_ + EASING_STRIPE_HEIGHT * s;
+        float wheel_y_bottom = easing_bottom;
+        if (film_strip_attached_) {
+            const float strip_y = cached_panel_y_ + cached_height_ + EASING_STRIPE_HEIGHT * s -
+                                  BORDER_OVERLAP * s;
+            wheel_y_bottom = strip_y + gui::FilmStripRenderer::STRIP_HEIGHT;
+        }
+        const bool mouse_in_wheel_zone = mouse_in_x && my >= ruler_top && my <= wheel_y_bottom;
+
+        if (mouse_in_wheel_zone && !input.want_capture_mouse) {
             const float wheel = input.mouse_wheel;
             if (std::abs(wheel) > 0.01f) {
                 if (input.key_ctrl || input.key_super) {
@@ -426,10 +439,58 @@ namespace lfs::vis {
         if (on_playhead_handle && hovered_keyframe_.has_value())
             on_playhead_handle = false;
 
+        if (el_playhead_handle_)
+            el_playhead_handle_->SetClass("hot", on_playhead_handle || dragging_playhead_);
+
+        const float clip_duration = timeline.clipDuration();
+        const float max_pan = sequencer_ui::maxPanOffset(timeline, zoom_level_);
+        const bool scrollbar_visible = max_pan > 0.0f && clip_duration > 0.0f;
+        const float scrollbar_top = track_area_bottom - SCROLLBAR_HEIGHT * s;
+        const bool mouse_in_scrollbar = scrollbar_visible && mouse_in_x &&
+                                        my >= scrollbar_top && my <= track_area_bottom;
+
+        float thumb_left = pos.x;
+        float thumb_right = pos.x;
+        if (scrollbar_visible) {
+            const float thumb_w = (getDisplayEndTime() / clip_duration) * width;
+            thumb_left = pos.x + (pan_offset_ / clip_duration) * width;
+            thumb_right = thumb_left + thumb_w;
+        }
+        const bool mouse_on_thumb = mouse_in_scrollbar && mx >= thumb_left && mx <= thumb_right;
+
+        if (el_timeline_scrollbar_)
+            el_timeline_scrollbar_->SetClass("hot", mouse_in_scrollbar || dragging_scrollbar_);
+
+        if (input.mouse_clicked[0] && !dragging_keyframe_ && !dragging_playhead_ &&
+            mouse_in_scrollbar) {
+            if (mouse_on_thumb) {
+                dragging_scrollbar_ = true;
+                scrollbar_drag_origin_x_ = mx;
+                scrollbar_drag_origin_pan_ = pan_offset_;
+            } else {
+                const float page = getDisplayEndTime();
+                if (mx < thumb_left)
+                    pan_offset_ -= page;
+                else
+                    pan_offset_ += page;
+                clampPanOffset();
+            }
+        }
+        if (dragging_scrollbar_) {
+            if (input.mouse_down[0] && clip_duration > 0.0f && width > 0.0f) {
+                const float dx = mx - scrollbar_drag_origin_x_;
+                pan_offset_ = scrollbar_drag_origin_pan_ + (dx / width) * clip_duration;
+                clampPanOffset();
+            } else {
+                dragging_scrollbar_ = false;
+            }
+        }
+
         for (size_t i = 0; i < keyframes.size(); ++i) {
             const bool hovered = hovered_keyframe_.has_value() && *hovered_keyframe_ == i;
 
-            if (hovered && input.mouse_clicked[0] && !on_playhead_handle) {
+            if (hovered && input.mouse_clicked[0] && !on_playhead_handle &&
+                !mouse_in_scrollbar && !dragging_scrollbar_) {
                 const float current_time = input.time;
 
                 if (last_clicked_keyframe_ == i &&
@@ -469,9 +530,10 @@ namespace lfs::vis {
             }
         }
 
-        if (input.mouse_clicked[0] && !dragging_keyframe_ &&
+        if (input.mouse_clicked[0] && !dragging_keyframe_ && !dragging_scrollbar_ &&
             (on_playhead_handle ||
-             (mouse_in_timeline && !hovered_keyframe_.has_value()))) {
+             mouse_in_ruler ||
+             (mouse_in_timeline && !hovered_keyframe_.has_value() && !mouse_in_scrollbar))) {
             dragging_playhead_ = true;
             controller_.beginScrub();
         }
@@ -479,7 +541,8 @@ namespace lfs::vis {
             if (input.mouse_down[0]) {
                 float time = xToTime(mx, pos.x, width);
                 time = std::clamp(time, 0.0f, timeline.clipDuration());
-                if (ui_state_.snap_to_grid)
+                const bool effective_snap = ui_state_.snap_to_grid != (input.key_ctrl || input.key_super);
+                if (effective_snap)
                     time = snapTime(time);
                 controller_.scrub(time);
             } else {
@@ -492,7 +555,8 @@ namespace lfs::vis {
             if (input.mouse_down[0]) {
                 float new_time = xToTime(mx, pos.x, width);
                 new_time = std::max(new_time, MIN_KEYFRAME_SPACING);
-                if (ui_state_.snap_to_grid)
+                const bool effective_snap = ui_state_.snap_to_grid != (input.key_ctrl || input.key_super);
+                if (effective_snap)
                     new_time = snapTime(new_time);
                 if (controller_.previewKeyframeTimeById(dragged_keyframe_id_, new_time))
                     dragged_keyframe_changed_ = true;
@@ -529,16 +593,18 @@ namespace lfs::vis {
                 }
             }
 
+            op::TransactionGuard transaction("Delete Keyframes");
             bool removed_any = false;
             for (const auto id : to_delete)
                 removed_any |= controller_.removeKeyframeById(id);
+            transaction.commit();
             for (const auto id : to_delete)
                 removeSelectedKeyframe(selected_keyframes_, id);
             if (removed_any)
                 lfs::core::events::state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
         }
 
-        if (mouse_in_timeline && input.mouse_clicked[1]) {
+        if (mouse_in_timeline && !mouse_in_scrollbar && input.mouse_clicked[1]) {
             context_menu_time_ = std::max(0.0f, xToTime(mx, pos.x, width));
             if (ui_state_.snap_to_grid)
                 context_menu_time_ = snapTime(context_menu_time_);
@@ -645,6 +711,12 @@ namespace lfs::vis {
         focal_edit_buffer_ = fmt::format("{:.1f}", current_focal_mm);
     }
 
+    void RmlSequencerPanel::setTimelineView(const float zoom, const float pan) {
+        zoom_level_ = std::clamp(zoom, panel_config::MIN_ZOOM, panel_config::MAX_ZOOM);
+        pan_offset_ = pan;
+        clampPanOffset();
+    }
+
     float RmlSequencerPanel::getDisplayEndTime() const {
         return sequencer_ui::displayEndTime(controller_.timeline(), zoom_level_);
     }
@@ -672,7 +744,7 @@ namespace lfs::vis {
     }
 
     float RmlSequencerPanel::snapTime(const float time) const {
-        if (!ui_state_.snap_to_grid || ui_state_.snap_interval <= 0.0f)
+        if (ui_state_.snap_interval <= 0.0f)
             return time;
         return std::round(time / ui_state_.snap_interval) * ui_state_.snap_interval;
     }

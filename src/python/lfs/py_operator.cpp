@@ -27,7 +27,6 @@ namespace lfs::python {
 
         nb::enum_<vis::op::BuiltinOp>(ops, "BuiltinOp")
             .value("SelectionStroke", vis::op::BuiltinOp::SelectionStroke)
-            .value("BrushStroke", vis::op::BuiltinOp::BrushStroke)
             .value("TransformSet", vis::op::BuiltinOp::TransformSet)
             .value("TransformTranslate", vis::op::BuiltinOp::TransformTranslate)
             .value("TransformRotate", vis::op::BuiltinOp::TransformRotate)
@@ -54,19 +53,16 @@ namespace lfs::python {
             .value("Rotate", vis::op::BuiltinTool::Rotate)
             .value("Scale", vis::op::BuiltinTool::Scale)
             .value("Mirror", vis::op::BuiltinTool::Mirror)
-            .value("Brush", vis::op::BuiltinTool::Brush)
             .value("Align", vis::op::BuiltinTool::Align);
 
-        nb::enum_<vis::op::OperatorFlags>(ops, "OperatorFlags")
+        nb::enum_<vis::op::OperatorFlags>(ops, "OperatorFlags", nb::is_flag())
             .value("NONE", vis::op::OperatorFlags::NONE)
             .value("REGISTER", vis::op::OperatorFlags::REGISTER)
             .value("UNDO", vis::op::OperatorFlags::UNDO)
             .value("UNDO_GROUPED", vis::op::OperatorFlags::UNDO_GROUPED)
             .value("INTERNAL", vis::op::OperatorFlags::INTERNAL)
             .value("MODAL", vis::op::OperatorFlags::MODAL)
-            .value("BLOCKING", vis::op::OperatorFlags::BLOCKING)
-            .def("__or__", [](vis::op::OperatorFlags a, vis::op::OperatorFlags b) { return a | b; })
-            .def("__and__", [](vis::op::OperatorFlags a, vis::op::OperatorFlags b) { return a & b; });
+            .value("BLOCKING", vis::op::OperatorFlags::BLOCKING);
 
         nb::class_<vis::op::OperatorDescriptor>(ops, "OperatorDescriptor")
             .def(nb::init<>())
@@ -83,11 +79,13 @@ namespace lfs::python {
                 auto& registry = vis::op::operators();
 
                 nb::object instance = get_python_operator_instance(id);
+                std::vector<std::string> set_kwargs;
                 if (kwargs && nb::len(kwargs) > 0) {
                     if (instance.is_valid() && !instance.is_none()) {
                         for (auto [key, value] : kwargs) {
                             std::string key_str = nb::cast<std::string>(key);
                             nb::setattr(instance, key_str.c_str(), value);
+                            set_kwargs.push_back(key_str);
                         }
                     }
                 }
@@ -117,6 +115,12 @@ namespace lfs::python {
                         data = nb::cast<nb::dict>(return_data);
                     }
                     nb::delattr(instance, "_return_data");
+                }
+
+                for (const auto& key : set_kwargs) {
+                    if (nb::hasattr(instance, key.c_str())) {
+                        nb::delattr(instance, key.c_str());
+                    }
                 }
 
                 return PyOperatorReturnValue(status_str, std::move(data));

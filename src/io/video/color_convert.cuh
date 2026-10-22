@@ -42,6 +42,19 @@ namespace lfs::io::video {
         int height,
         int y_pitch = 0,  // Y plane pitch (0 = use width)
         int uv_pitch = 0, // UV plane pitch (0 = use width)
+        cudaStream_t stream = nullptr,
+        bool full_range = false);
+
+    // Rotate RGB uint8 image on GPU by 90/180/270 degrees
+    // src and dst must be separate GPU buffers
+    // For 90/270: dst must be [width * height * 3] (swapped dimensions)
+    // For 180: dst must be [height * width * 3] (same as src)
+    void rotateRgbCuda(
+        const uint8_t* src, // GPU pointer, RGB uint8 packed
+        uint8_t* dst,       // GPU pointer, rotated output
+        int width,          // source width
+        int height,         // source height
+        int angle,          // rotation angle: 90, 180, or 270
         cudaStream_t stream = nullptr);
 
 } // namespace lfs::io::video

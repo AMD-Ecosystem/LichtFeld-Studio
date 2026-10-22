@@ -7,7 +7,8 @@ from typing import Optional
 from .tool_defs.builtin import BUILTIN_TOOLS, get_tool_by_id
 from .tool_defs.definition import ToolDef
 
-_BUILTIN_TOOL_IDS = {tool.id for tool in BUILTIN_TOOLS}
+_OPERATOR_BACKED_BUILTIN_TOOL_IDS = {"builtin.cropbox"}
+_NATIVE_BUILTIN_TOOL_IDS = {tool.id for tool in BUILTIN_TOOLS} - _OPERATOR_BACKED_BUILTIN_TOOL_IDS
 
 
 class ToolRegistry:
@@ -70,7 +71,7 @@ class ToolRegistry:
 
         gizmo = tool.gizmo or ""
         set_active_tool = getattr(lf.ui, "set_active_tool", None)
-        if tool_id in _BUILTIN_TOOL_IDS and callable(set_active_tool):
+        if tool_id in _NATIVE_BUILTIN_TOOL_IDS and callable(set_active_tool):
             set_active_tool(tool_id)
         else:
             lf.ui.set_active_operator(tool_id, gizmo)
@@ -99,12 +100,22 @@ class ToolRegistry:
     @classmethod
     def get_active(cls) -> Optional[ToolDef]:
         """Get the active tool definition."""
+        cls.sync_native_active()
         return cls.get(cls._active_tool_id)
 
     @classmethod
     def get_active_id(cls) -> str:
         """Get the active tool ID."""
+        cls.sync_native_active()
         return cls._active_tool_id
+
+    @classmethod
+    def sync_native_active(cls) -> None:
+        import lichtfeld as lf
+
+        getter = getattr(lf.ui, "get_active_tool", None)
+        if callable(getter):
+            cls._active_tool_id = getter() or ""
 
     @classmethod
     def clear(cls):

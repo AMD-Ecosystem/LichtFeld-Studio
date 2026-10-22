@@ -2,16 +2,44 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "gui/utils/splat_export_request.hpp"
 #include "py_ui.hpp"
+#include "python/python_runtime.hpp"
+#include "visualizer/app_store.hpp"
+#include "visualizer/post_work_utils.hpp"
+#include "visualizer/preferences.hpp"
 #include "visualizer/theme/theme.hpp"
+#include "visualizer/visualizer.hpp"
 
-#include <imgui.h>
+#include <functional>
+#include <nanobind/stl/vector.h>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace lfs::python {
 
     namespace {
-        std::tuple<float, float, float, float> imvec4_to_tuple(const ImVec4& c) {
+        std::tuple<float, float, float, float> theme_color_to_tuple(const lfs::vis::ThemeColor& c) {
             return {c.x, c.y, c.z, c.w};
+        }
+
+        template <typename F>
+        void invoke_on_viewer_thread(F&& fn) {
+            static_assert(std::is_void_v<std::invoke_result_t<F>>);
+            auto* const viewer = get_visualizer();
+            if (!viewer || viewer->isOnViewerThread()) {
+                std::invoke(std::forward<F>(fn));
+                return;
+            }
+            if (!viewer->acceptsPostedWork())
+                return;
+
+            nb::gil_scoped_release release;
+            vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                std::forward<F>(fn),
+                []() {});
         }
     } // namespace
 
@@ -21,26 +49,26 @@ namespace lfs::python {
         PyTheme py_theme;
         py_theme.name = t.name;
 
-        py_theme.palette.background = imvec4_to_tuple(t.palette.background);
-        py_theme.palette.surface = imvec4_to_tuple(t.palette.surface);
-        py_theme.palette.surface_bright = imvec4_to_tuple(t.palette.surface_bright);
-        py_theme.palette.primary = imvec4_to_tuple(t.palette.primary);
-        py_theme.palette.primary_dim = imvec4_to_tuple(t.palette.primary_dim);
-        py_theme.palette.secondary = imvec4_to_tuple(t.palette.secondary);
-        py_theme.palette.text = imvec4_to_tuple(t.palette.text);
-        py_theme.palette.text_dim = imvec4_to_tuple(t.palette.text_dim);
-        py_theme.palette.border = imvec4_to_tuple(t.palette.border);
-        py_theme.palette.success = imvec4_to_tuple(t.palette.success);
-        py_theme.palette.warning = imvec4_to_tuple(t.palette.warning);
-        py_theme.palette.error = imvec4_to_tuple(t.palette.error);
-        py_theme.palette.info = imvec4_to_tuple(t.palette.info);
-        py_theme.palette.toolbar_background = imvec4_to_tuple(t.toolbar_background());
-        py_theme.palette.row_even = imvec4_to_tuple(t.palette.row_even);
-        py_theme.palette.row_odd = imvec4_to_tuple(t.palette.row_odd);
-        py_theme.palette.overlay_border = imvec4_to_tuple(t.overlay.border);
-        py_theme.palette.overlay_icon = imvec4_to_tuple(t.overlay.icon);
-        py_theme.palette.overlay_text = imvec4_to_tuple(t.overlay.text);
-        py_theme.palette.overlay_text_dim = imvec4_to_tuple(t.overlay.text_dim);
+        py_theme.palette.background = theme_color_to_tuple(t.palette.background);
+        py_theme.palette.surface = theme_color_to_tuple(t.palette.surface);
+        py_theme.palette.surface_bright = theme_color_to_tuple(t.palette.surface_bright);
+        py_theme.palette.primary = theme_color_to_tuple(t.palette.primary);
+        py_theme.palette.primary_dim = theme_color_to_tuple(t.palette.primary_dim);
+        py_theme.palette.secondary = theme_color_to_tuple(t.palette.secondary);
+        py_theme.palette.text = theme_color_to_tuple(t.palette.text);
+        py_theme.palette.text_dim = theme_color_to_tuple(t.palette.text_dim);
+        py_theme.palette.border = theme_color_to_tuple(t.palette.border);
+        py_theme.palette.success = theme_color_to_tuple(t.palette.success);
+        py_theme.palette.warning = theme_color_to_tuple(t.palette.warning);
+        py_theme.palette.error = theme_color_to_tuple(t.palette.error);
+        py_theme.palette.info = theme_color_to_tuple(t.palette.info);
+        py_theme.palette.toolbar_background = theme_color_to_tuple(t.toolbar_background());
+        py_theme.palette.row_even = theme_color_to_tuple(t.palette.row_even);
+        py_theme.palette.row_odd = theme_color_to_tuple(t.palette.row_odd);
+        py_theme.palette.overlay_border = theme_color_to_tuple(t.overlay.border);
+        py_theme.palette.overlay_icon = theme_color_to_tuple(t.overlay.icon);
+        py_theme.palette.overlay_text = theme_color_to_tuple(t.overlay.text);
+        py_theme.palette.overlay_text_dim = theme_color_to_tuple(t.overlay.text_dim);
 
         py_theme.sizes.window_rounding = t.sizes.window_rounding;
         py_theme.sizes.frame_rounding = t.sizes.frame_rounding;
@@ -113,9 +141,75 @@ namespace lfs::python {
             .def_ro("vignette", &PyTheme::vignette);
 
         m.def("theme", &get_current_theme, "Get the current theme");
-        m.def("set_theme_vignette_enabled", &lfs::vis::setThemeVignetteEnabled, "Set theme vignette enabled");
-        m.def("set_theme_vignette_intensity", &lfs::vis::setThemeVignetteIntensity, "Set theme vignette intensity");
-        m.def("set_theme_vignette_style", &lfs::vis::setThemeVignetteStyle, "Set vignette intensity, radius, and softness");
+        m.def("set_theme_vignette_enabled", nb::overload_cast<bool, bool>(&lfs::vis::setThemeVignetteEnabled), nb::arg("enabled"), nb::arg("persist") = true, "Set theme vignette enabled");
+        m.def("set_theme_vignette_intensity", nb::overload_cast<float, bool>(&lfs::vis::setThemeVignetteIntensity), nb::arg("intensity"), nb::arg("persist") = true, "Set theme vignette intensity");
+        m.def("set_theme_vignette_style", nb::overload_cast<float, float, float, bool>(&lfs::vis::setThemeVignetteStyle), nb::arg("intensity"), nb::arg("radius"), nb::arg("softness"), nb::arg("persist") = true, "Set vignette intensity, radius, and softness");
+        m.def("remember_camera_navigation", &lfs::vis::rememberCameraNavigationPreference,
+              "Return whether camera navigation is persisted between launches");
+        m.def("set_remember_camera_navigation", &lfs::vis::setRememberCameraNavigationPreference,
+              nb::arg("enabled"), "Enable or disable camera navigation persistence");
+        m.def("remember_camera_view_snap", &lfs::vis::rememberCameraViewSnapPreference,
+              "Return whether camera view snap is persisted between launches");
+        m.def("set_remember_camera_view_snap", &lfs::vis::setRememberCameraViewSnapPreference,
+              nb::arg("enabled"), "Enable or disable camera view snap persistence");
+        m.def("take_splat_export_request", &lfs::vis::gui::takeSplatExportRequest);
+        m.def("get_splat_drag_preferences", []() {
+            const auto s = lfs::vis::UserPreferences::instance().splatDrag();
+            nb::dict result;
+            result["format"] = s.format;
+            result["sh_degree"] = s.sh_degree;
+            result["up_axis"] = s.axes.up;
+            // Compatibility for scripts written against the original checkbox.
+            result["blender_axes"] = s.axes.up == 3;
+            return result;
+        });
+        m.def("set_splat_drag_preferences", [](nb::dict values) {
+            auto s = lfs::vis::UserPreferences::instance().splatDrag();
+            if (values.contains("format"))
+                s.format = nb::cast<std::string>(values["format"]);
+            if (values.contains("sh_degree"))
+                s.sh_degree = nb::cast<int>(values["sh_degree"]);
+            if (values.contains("up_axis")) {
+                s.axes.up = nb::cast<int>(values["up_axis"]);
+            } else if (values.contains("blender_axes")) {
+                s.axes = nb::cast<bool>(values["blender_axes"]) ? lfs::vis::SplatDragAxes::blender() : lfs::vis::SplatDragAxes{};
+            }
+            if (!s.axes.valid())
+                throw std::invalid_argument("Splat drag up axis must be -Y, +Y, -Z or +Z");
+            lfs::vis::UserPreferences::instance().setSplatDrag(s);
+        });
+        m.def("scene_graph_selection_markers", &lfs::vis::loadSceneGraphSelectionMarkersPreference,
+              "Return whether Scene Graph selection markers are visible");
+        m.def("set_scene_graph_selection_markers", &lfs::vis::saveSceneGraphSelectionMarkersPreference,
+              nb::arg("enabled"), "Show or hide Scene Graph selection markers");
+        m.def("get_progress_bar_style", &lfs::vis::loadProgressBarStylePreference,
+              "Return the status bar progress style (classic or miner)");
+        m.def(
+            "set_progress_bar_style",
+            [](const std::string& style) { lfs::vis::saveProgressBarStylePreference(style); },
+            nb::arg("style"), "Set the status bar progress style (classic or miner)");
+        m.def("get_viewport_chrome_style", &lfs::vis::loadViewportChromeStylePreference,
+              "Return the viewport controls style (solid, translucent, or frosted)");
+        m.def(
+            "set_viewport_chrome_style",
+            [](std::string style) {
+                invoke_on_viewer_thread([style = std::move(style)]() {
+                    lfs::vis::saveViewportChromeStylePreference(style);
+                    lfs::vis::refreshThemePresentation();
+                });
+            },
+            nb::arg("style"), "Set the viewport controls style (solid, translucent, or frosted)");
+        m.def("get_viewport_toolbar_position", &lfs::vis::loadViewportToolbarPositionPreference,
+              "Return the viewport toolbar position (top, centered, or free)");
+        m.def(
+            "set_viewport_toolbar_position",
+            [](std::string position) {
+                invoke_on_viewer_thread([position = std::move(position)]() {
+                    lfs::vis::saveViewportToolbarPositionPreference(position);
+                    lfs::vis::publish_viewport_toolbar_generation();
+                });
+            },
+            nb::arg("position"), "Set the viewport toolbar position (top, centered, or free)");
     }
 
 } // namespace lfs::python

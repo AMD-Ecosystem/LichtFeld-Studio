@@ -8,10 +8,12 @@
 #include "core/reactive/store.hpp"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace lfs::diagnostics {
     struct VramProfilerSnapshot;
@@ -21,12 +23,32 @@ namespace lfs::vis {
 
     class LFS_VIS_API AppStore {
     public:
+        enum class CameraMetricsStatus : std::uint8_t {
+            Available,
+            NeedsInitializedTrainingSession,
+            CalculationFailed
+        };
+
         struct LFS_VIS_API CameraMetrics {
             int camera_id = -1;
             int iteration = -1;
             float psnr = 0.0f;
             std::optional<float> ssim;
             bool used_mask = false;
+            CameraMetricsStatus status = CameraMetricsStatus::Available;
+
+            [[nodiscard]] static CameraMetrics unavailable(
+                const int camera_id,
+                const int iteration,
+                const bool training_session_initialized) {
+                CameraMetrics result;
+                result.camera_id = camera_id;
+                result.iteration = iteration;
+                result.status = training_session_initialized
+                                    ? CameraMetricsStatus::CalculationFailed
+                                    : CameraMetricsStatus::NeedsInitializedTrainingSession;
+                return result;
+            }
 
             bool operator==(const CameraMetrics&) const = default;
         };
@@ -37,22 +59,45 @@ namespace lfs::vis {
             float y = 16.0f;
             bool show_ssim = false;
             int current_camera_id = -1;
+            CameraMetricsStatus metrics_status = CameraMetricsStatus::Available;
 
             [[nodiscard]] bool operator==(const GTMetricsOverlayConfig& other) const noexcept {
                 return visible == other.visible &&
                        std::abs(x - other.x) <= 0.5f &&
                        std::abs(y - other.y) <= 0.5f &&
                        show_ssim == other.show_ssim &&
-                       current_camera_id == other.current_camera_id;
+                       current_camera_id == other.current_camera_id &&
+                       metrics_status == other.metrics_status;
             }
         };
 
-        struct LFS_VIS_API VramHud {
-            bool visible = false;
-            std::shared_ptr<const lfs::diagnostics::VramProfilerSnapshot> snapshot;
+        struct LFS_VIS_API PerfHudSnapshot {
+            std::size_t vram_process_bytes = 0;
+            std::size_t vram_used_bytes = 0;
+            std::size_t vram_total_bytes = 0;
+            std::size_t ram_process_bytes = 0;
+            std::size_t ram_used_bytes = 0;
+            std::size_t ram_total_bytes = 0;
+            float gpu_utilization_percent = -1.0f;
+            float process_cpu_percent = -1.0f;
+            std::vector<float> per_core_cpu_percent;
+            float rate = 0.0f;
+            float ui_fps = 0.0f;
+            bool gpu_utilization_valid = false;
+            bool cpu_valid = false;
+            bool ledger_valid = false; // false when profiler off → badge unknown (not GAP)
+            bool ledger_closed = false;
+            bool ledger_over = false;
+        };
 
-            [[nodiscard]] bool operator==(const VramHud& other) const noexcept {
-                return visible == other.visible && snapshot == other.snapshot;
+        struct LFS_VIS_API PerfHud {
+            bool visible = false;
+            bool expanded = true;
+            std::shared_ptr<const PerfHudSnapshot> snapshot;
+
+            [[nodiscard]] bool operator==(const PerfHud& other) const noexcept {
+                return visible == other.visible && expanded == other.expanded &&
+                       snapshot == other.snapshot;
             }
         };
 
@@ -72,6 +117,40 @@ namespace lfs::vis {
             bool operator==(const ImportOverlayState&) const = default;
         };
 
+        struct LFS_VIS_API AccountState {
+            bool signed_in = false;
+            bool authorized = false;
+            bool linking = false;
+            bool disconnecting = false;
+            bool membership_required = false;
+            std::string error;
+            std::string label;
+            std::string email;
+            std::string connected_since;
+            std::string display_name;
+            std::string tier;
+            std::string tooltip;
+
+            bool operator==(const AccountState&) const = default;
+        };
+
+        struct LFS_VIS_API GalleryState {
+            bool signed_in = false;
+            bool relink_required = false;
+            int active_uploads = 0;
+            int active_downloads = 0;
+            int paused = 0;
+            int attention = 0;
+            int percent = -1;
+            std::string label;
+            std::string detail;
+            std::string tooltip;
+            std::string tone{"idle"};
+            std::uint64_t epoch = 0;
+
+            bool operator==(const GalleryState&) const = default;
+        };
+
         struct LFS_VIS_API VideoExportOverlayState {
             bool active = false;
             float progress = 0.0f;
@@ -86,16 +165,20 @@ namespace lfs::vis {
             bool active = false;
             float progress = 0.0f;
             std::string stage;
+            std::string outcome{"idle"};
             std::string format;
             std::string error;
+            std::string warning;
             std::string path;
 
             [[nodiscard]] bool operator==(const ExportProgressState& other) const noexcept {
                 return active == other.active &&
                        std::abs(progress - other.progress) <= 0.0005f &&
                        stage == other.stage &&
+                       outcome == other.outcome &&
                        format == other.format &&
                        error == other.error &&
+                       warning == other.warning &&
                        path == other.path;
             }
         };
@@ -129,24 +212,31 @@ namespace lfs::vis {
             TrainerLoaded,
             EvalPsnr,
             EvalSsim,
+            EvalLpips,
             SceneGeneration,
+            StoredSessionGeneration,
             SelectionGeneration,
-            Fps,
             ModeText,
             CameraMetricsValue,
             GTMetricsOverlayConfigValue,
-            VramHudValue,
+            PerfHudValue,
             ActiveTool,
             ActiveSubmode,
             TransformSpaceValue,
             PivotModeValue,
+            MultiTransformModeValue,
             ImportOverlayStateValue,
+            AccountStateValue,
             VideoExportOverlayStateValue,
             ExportProgressStateValue,
             Mesh2SplatStateValue,
             SplatSimplifyStateValue,
             ScriptsGeneration,
             LanguageGeneration,
+            RenderSettingsGeneration,
+            ViewportToolbarGeneration,
+            GalleryStateValue,
+            AlignStateGeneration,
         };
 
         AppStore();
@@ -164,30 +254,39 @@ namespace lfs::vis {
         lfs::core::reactive::Observable<bool> trainer_loaded;
         lfs::core::reactive::Observable<std::optional<float>> eval_psnr;
         lfs::core::reactive::Observable<std::optional<float>> eval_ssim;
+        lfs::core::reactive::Observable<std::optional<float>> eval_lpips;
         lfs::core::reactive::Observable<std::uint64_t> scene_generation;
+        lfs::core::reactive::Observable<std::uint64_t> stored_session_generation;
         lfs::core::reactive::Observable<std::uint64_t> selection_generation;
-        lfs::core::reactive::Observable<float> fps;
         lfs::core::reactive::Observable<std::string> mode_text;
         lfs::core::reactive::Observable<std::optional<CameraMetrics>> camera_metrics;
         lfs::core::reactive::Observable<GTMetricsOverlayConfig> gt_metrics_overlay_config;
-        lfs::core::reactive::Observable<VramHud> vram_hud;
+        lfs::core::reactive::Observable<PerfHud> perf_hud;
         lfs::core::reactive::Observable<std::string> active_tool;
         lfs::core::reactive::Observable<std::string> active_submode;
         lfs::core::reactive::Observable<int> transform_space;
         lfs::core::reactive::Observable<int> pivot_mode;
+        lfs::core::reactive::Observable<int> multi_transform_mode;
         lfs::core::reactive::Observable<ImportOverlayState> import_overlay_state;
+        lfs::core::reactive::Observable<AccountState> account_state;
+        lfs::core::reactive::Observable<GalleryState> gallery_state;
         lfs::core::reactive::Observable<VideoExportOverlayState> video_export_overlay_state;
         lfs::core::reactive::Observable<ExportProgressState> export_progress_state;
         lfs::core::reactive::Observable<TaskProgressState> mesh2splat_state;
         lfs::core::reactive::Observable<TaskProgressState> splat_simplify_state;
         lfs::core::reactive::Observable<std::uint64_t> scripts_generation;
         lfs::core::reactive::Observable<std::uint64_t> language_generation;
+        lfs::core::reactive::Observable<std::uint64_t> render_settings_generation;
+        lfs::core::reactive::Observable<std::uint64_t> viewport_toolbar_generation;
+        lfs::core::reactive::Observable<std::uint64_t> align_state_generation;
 
     private:
         lfs::core::reactive::Store store_;
     };
 
     LFS_VIS_API AppStore& app_store();
+    LFS_VIS_API void publish_align_state_generation();
     LFS_VIS_API void publish_language_generation();
+    LFS_VIS_API void publish_viewport_toolbar_generation();
 
 } // namespace lfs::vis

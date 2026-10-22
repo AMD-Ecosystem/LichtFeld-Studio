@@ -17,6 +17,56 @@ DirtySpec: TypeAlias = str | Iterable[str] | None
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ACCOUNT_STATE: dict[str, object] = {
+    "signed_in": False,
+    "authorized": False,
+    "linking": False,
+    "disconnecting": False,
+    "error": "",
+    "membership_required": False,
+    "label": "",
+    "email": "",
+    "connected_since": "",
+    "display_name": "",
+    "tier": "",
+    "tooltip": "",
+}
+
+DEFAULT_GALLERY_STATE: dict[str, object] = {
+    "signed_in": False,
+    "relink_required": False,
+    "active_uploads": 0,
+    "active_downloads": 0,
+    "paused": 0,
+    "attention": 0,
+    "percent": -1,
+    "label": "",
+    "detail": "",
+    "tooltip": "",
+    "tone": "idle",
+    "epoch": 0,
+}
+
+DEFAULT_BUG_REPORT_STATE: dict[str, object] = {
+    "submitting": False,
+    "success": False,
+    "error": "",
+    "retry_after": None,
+    "detail": {},
+    "url": "",
+    "status": "",
+    "completeness_problems": [],
+}
+
+
+def new_bug_report_state() -> dict[str, object]:
+    """Return a fresh bug-report state, including fresh nested containers."""
+    return {
+        **DEFAULT_BUG_REPORT_STATE,
+        "detail": {},
+        "completeness_problems": [],
+    }
+
 
 def _native_store():
     try:
@@ -174,22 +224,41 @@ class PanelStateBinding:
     def watch(
         self,
         *signals: StateSignal[object] | Signal[object] | ComputedSignal[object],
-        refresh: Callable[[], None] | None = None,
+        refresh: Callable[[], bool | None] | None = None,
         dirty: DirtySpec = None,
         immediate: bool = False,
     ) -> PanelStateBinding:
-        """Refresh and invalidate the panel when any runtime-state signal changes."""
+        """Refresh and invalidate on signal changes unless refresh returns False."""
 
-        def on_change(_value: object) -> None:
-            if refresh is not None:
-                refresh()
-            invalidate_panel(self._handle, dirty)
+        def make_on_change():
+            last_value = None
+            has_last_value = False
+
+            def on_change(value: object) -> None:
+                nonlocal has_last_value, last_value
+                if has_last_value and value == last_value:
+                    return
+                has_last_value = True
+                last_value = value
+
+                refresh_result = None
+                if refresh is not None:
+                    refresh_result = refresh()
+                if refresh_result is False:
+                    return
+                invalidate_panel(self._handle, dirty)
+
+            return on_change
 
         for signal in signals:
-            self._unsubscribers.append(signal.subscribe(on_change))
+            self._unsubscribers.append(signal.subscribe(make_on_change()))
 
         if immediate:
-            on_change(None)
+            refresh_result = None
+            if refresh is not None:
+                refresh_result = refresh()
+            if refresh_result is not False:
+                invalidate_panel(self._handle, dirty)
 
         return self
 
@@ -221,15 +290,28 @@ class RuntimeState:
     trainer_loaded = StateSignal[bool]("trainer_loaded", False)
     eval_psnr = StateSignal[float | None]("eval_psnr", None)
     eval_ssim = StateSignal[float | None]("eval_ssim", None)
+    eval_lpips = StateSignal[float | None]("eval_lpips", None)
     scene_generation = StateSignal[int]("scene_generation", 0)
+    stored_session_generation = StateSignal[int]("stored_session_generation", 0)
     selection_generation = StateSignal[int]("selection_generation", 0)
-    fps = StateSignal[float]("fps", 0.0)
     mode_text = StateSignal[str]("mode_text", "")
     active_tool = StateSignal[str]("active_tool", "")
     active_submode = StateSignal[str]("active_submode", "")
     transform_space = StateSignal[int]("transform_space", 0)
     pivot_mode = StateSignal[int]("pivot_mode", 0)
+    multi_transform_mode = StateSignal[int]("multi_transform_mode", 0)
     import_overlay_state = StateSignal[dict[str, object]]("import_overlay_state", {})
+    account_state = StateSignal[dict[str, object]](
+        "account_state",
+        DEFAULT_ACCOUNT_STATE.copy(),
+    )
+    gallery_state = StateSignal[dict[str, object]](
+        "gallery_state",
+        DEFAULT_GALLERY_STATE.copy(),
+    )
+    gallery_transfers = Signal({}, "gallery_transfers")
+    projects_panel_visible = Signal(False, "projects_panel_visible")
+    bug_report_state = Signal(new_bug_report_state(), "bug_report_state")
     video_export_overlay_state = StateSignal[dict[str, object]](
         "video_export_overlay_state",
         {},
@@ -239,6 +321,7 @@ class RuntimeState:
     splat_simplify_state = StateSignal[dict[str, object]]("splat_simplify_state", {})
     scripts_generation = StateSignal[int]("scripts_generation", 0)
     language_generation = StateSignal[int]("language_generation", 0)
+    render_settings_generation = StateSignal[int]("render_settings_generation", 0)
 
     # Compatibility names from the old AppState surface.
     is_training = training_running
@@ -289,15 +372,21 @@ class RuntimeState:
         cls.max_gaussians.value = 0
         cls.eval_psnr.value = None
         cls.eval_ssim.value = None
+        cls.eval_lpips.value = None
         cls.scene_generation.value = 0
+        cls.stored_session_generation.value = 0
         cls.selection_generation.value = 0
-        cls.fps.value = 0.0
         cls.mode_text.value = ""
         cls.active_tool.value = ""
         cls.active_submode.value = ""
         cls.transform_space.value = 0
         cls.pivot_mode.value = 0
         cls.import_overlay_state.value = {}
+        cls.account_state.value = DEFAULT_ACCOUNT_STATE.copy()
+        cls.gallery_transfers.value = {}
+        cls.projects_panel_visible.value = False
+        cls.gallery_state.value = DEFAULT_GALLERY_STATE.copy()
+        cls.bug_report_state.value = new_bug_report_state()
         cls.video_export_overlay_state.value = {}
         cls.export_progress_state.value = {}
         cls.mesh2splat_state.value = {}

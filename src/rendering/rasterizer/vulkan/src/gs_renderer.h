@@ -2,10 +2,64 @@
 
 #include "gs_pipeline.h"
 
+#include "../shader/src/slang/overlay_flags.inc"
+#include "indirect_layout.h"
 #include "perf_timer.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
+#include <vector>
+
+// Descriptor layouts for q16/f16 projection skip binding 2 (shN is a 64-bit
+// buffer device address in push constants, not a storage-buffer descriptor).
+[[nodiscard]] inline std::vector<int> vksplatSkipBinding(const int binding_count, const int skip) {
+    std::vector<int> layouts;
+    layouts.reserve(static_cast<std::size_t>(binding_count > 0 ? binding_count - 1 : 0));
+    for (int i = 0; i < binding_count; ++i) {
+        if (i != skip) {
+            layouts.push_back(i);
+        }
+    }
+    return layouts;
+}
+
+[[nodiscard]] inline std::vector<int> vksplatSkipBindings(const int binding_count,
+                                                          std::initializer_list<int> skips) {
+    std::vector<int> layouts;
+    layouts.reserve(static_cast<std::size_t>(binding_count > 0 ? binding_count : 0));
+    for (int i = 0; i < binding_count; ++i) {
+        bool skip = false;
+        for (const int s : skips) {
+            if (i == s) {
+                skip = true;
+                break;
+            }
+        }
+        if (!skip) {
+            layouts.push_back(i);
+        }
+    }
+    return layouts;
+}
+
+[[nodiscard]] inline std::vector<int> vksplatWithout(const std::initializer_list<int> bindings,
+                                                     const int skip) {
+    std::vector<int> layouts;
+    layouts.reserve(bindings.size());
+    for (const int binding : bindings) {
+        if (binding != skip) {
+            layouts.push_back(binding);
+        }
+    }
+    return layouts;
+}
+
+// lod_enabled bit 6: projection writes overlay_flags. Clear when the bound
+// buffer is the one-word dummy (raster overlays idle).
+constexpr uint32_t kLodEnabledWriteOverlayFlags = LFS_VK_OVERLAY_WRITE_BIT;
+constexpr uint32_t kLodEnabledDeletedMask = 128u;
 
 PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t image_height;
@@ -18,16 +72,89 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t camera_model;
     uint32_t sort_capacity;
     uint32_t shN_layout_slots;
+    uint32_t lod_enabled;
+    uint32_t lod_count;
     uint32_t mip_filter;
-    uint32_t pad2;
+    uint32_t render_origin_x;
+    uint32_t render_origin_y;
+    uint32_t camera_width;
+    uint32_t camera_height;
+    uint32_t model_num_splats;
     float fx;
     float fy;
     float cx;
     float cy;
+    // HiGS raster/compose wave window start; occupies the former alignment
+    // padding before dist_coeffs (match shader).
+    uint32_t wave_base;
+    // Splats per LOD pool page for the quant-pool projection variants.
+    uint32_t lod_page_splats;
+    // 0 = median depth; > 0 = alpha-weighted (expected, hole-free) depth, with
+    // this value as the far bound (splats beyond it are model junk that 3DGUT
+    // projects onto sky pixels — excluded so they can't pollute the average).
+    // Honored by the per-pixel rasterizer (alphablend_shader) regardless of backend.
+    float expected_far;
+    // Explicit padding: dist_coeffs is a float4 on the shader side and must
+    // sit on a 16-byte boundary. shN_address occupies the former pad1/pad2
+    // (8-byte aligned at offset 104) to preserve the camera field offsets.
+    uint32_t depth_wave;
+    uint64_t shN_address;
     float dist_coeffs[4];
     float world_view_transform[16];
+    float color_exposure;
+    uint32_t color_tonemapping;
+    uint32_t splat_render_profile;
+    float rasterization_scale;
+    // Orthographic views move the eye back along the view axis so nothing lies behind it; depth outputs subtract
+    // this distance again, so they stay measured from the viewport camera (match shader).
+    float depth_offset;
+    uint32_t depth_offset_pad0;
+    uint32_t depth_offset_pad1;
+    uint32_t depth_offset_pad2;
 });
-static_assert(sizeof(VulkanGSRendererUniforms) == 144);
+static_assert(sizeof(VulkanGSRendererUniforms) == 224);
+static_assert(offsetof(VulkanGSRendererUniforms, shN_address) % 8 == 0);
+static_assert(offsetof(VulkanGSRendererUniforms, dist_coeffs) % 16 == 0);
+
+PACK_STRUCT(struct VulkanGSLodCompactUniforms {
+    uint32_t chunk_count;
+    uint32_t protected_capacity;
+    uint32_t miss_capacity;
+    uint32_t pad0;
+});
+static_assert(sizeof(VulkanGSLodCompactUniforms) == 16);
+
+PACK_STRUCT(struct VulkanGSLodSelectUniforms {
+    uint32_t node_count;
+    uint32_t output_capacity;
+    uint32_t chunk_splats;
+    uint32_t invalid_page;
+    float pixel_scale_limit;
+    float object_scale;
+    float behind_camera_penalty;
+    float cone_foveation;
+    float cone_dot0;
+    float cone_dot;
+    float cone_blend_denominator;
+    float cone_tail_valid;
+    float view_row0[4];
+    float view_row1[4];
+    float view_row2[4];
+    float outside_view_foveation;
+    float viewport_half_tan_x;
+    float viewport_half_tan_y;
+    float ortho_half_width;
+    float ortho_half_height;
+    uint32_t viewport_foveation;
+    uint32_t orthographic;
+    uint32_t physical_node_count;
+    uint32_t logical_chunk_count;
+    // Frame clock + fade window for newly streamed pages (0 disables fading).
+    uint32_t current_frame;
+    uint32_t fade_frames;
+    uint32_t budget_pass;
+});
+static_assert(sizeof(VulkanGSLodSelectUniforms) == 144);
 
 PACK_STRUCT(struct VulkanGSSelectionMaskUniforms {
     uint32_t num_splats;
@@ -40,7 +167,7 @@ PACK_STRUCT(struct VulkanGSSelectionMaskUniforms {
     uint32_t image_height;
     uint32_t image_width;
     uint32_t camera_model;
-    uint32_t pad0;
+    uint32_t deleted_mask_enabled;
     uint32_t pad1;
     float fx;
     float fy;
@@ -52,7 +179,12 @@ PACK_STRUCT(struct VulkanGSSelectionMaskUniforms {
     uint32_t aabb_y0;
     uint32_t aabb_w;
     uint32_t aabb_h;
+    float ring_width;
+    uint32_t mip_filter;
+    uint32_t ring_pick_phase;
+    uint32_t pad2;
 });
+static_assert(sizeof(VulkanGSSelectionMaskUniforms) == 176);
 
 PACK_STRUCT(struct VulkanGSSelectionPolygonRasterizeUniforms {
     uint32_t vertex_count;
@@ -64,16 +196,44 @@ PACK_STRUCT(struct VulkanGSSelectionPolygonRasterizeUniforms {
     uint32_t pad1;
     uint32_t pad2;
 });
+static_assert(sizeof(VulkanGSSelectionPolygonRasterizeUniforms) == 32);
+
+inline constexpr uint32_t kLodCompactProtectedCap = 98304;
+inline constexpr uint32_t kLodCompactMissCap = 16384;
 
 class VulkanGSRenderer : public VulkanGSPipeline {
 public:
     struct PrimitiveVisibilityStats {
-        size_t visible_count = 0;
+        size_t visible_count = 0; // clamped to the frame's visible capacity
+        size_t raw_count = 0;     // unclamped emit total; > visible_count means clamping
         size_t num_splats = 0;
+    };
+    struct TileInstanceStats {
+        size_t raw_count = 0;
+        size_t waves_needed = 0;
+        size_t waves_armed = 0;
+        bool count_overflow = false;
+    };
+    struct TileInstanceGate {
+        size_t raw_count = 0;
+        bool count_overflow = false;
+    };
+    struct LodSelectionStats {
+        float threshold_scale = 1.0f;
+        size_t candidate_count = 0;
+        size_t rendered_capacity = 0;
+        size_t overflow_count = 0;
+        // GPU-compacted traversal interest: chunks the cut renders from, and
+        // (chunk, priority) misses with priority = float bits of the touching
+        // node's pixel scale (orderable as uint).
+        std::vector<uint32_t> protected_chunks;
+        std::vector<std::pair<uint32_t, uint32_t>> miss_candidates;
+        uint32_t protected_overflow = 0;
+        uint32_t miss_overflow = 0;
     };
 
     VulkanGSRenderer();
-    ~VulkanGSRenderer();
+    ~VulkanGSRenderer() noexcept;
 
     void initializeExternal(const std::map<std::string, std::string>& spirv_paths,
                             VkInstance external_instance,
@@ -81,13 +241,24 @@ public:
                             VkDevice external_device,
                             VkQueue external_queue,
                             uint32_t external_queue_family_index,
-                            VmaAllocator external_allocator);
+                            VmaAllocator external_allocator,
+                            VkPipelineCache external_pipeline_cache = VK_NULL_HANDLE,
+                            bool supports_conditional_rendering = false,
+                            PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr,
+                            PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr);
     void cleanup();
 
     void tagDeferredVisibleCountReadback(VkSemaphore semaphore, std::uint64_t value);
+    void tagDeferredLodSelectionReadback(VkSemaphore semaphore, std::uint64_t value);
+    void tagDeferredInstanceCountReadback(VkSemaphore semaphore, std::uint64_t value);
     [[nodiscard]] std::optional<PrimitiveVisibilityStats> pollDeferredPrimitiveVisibilityStats();
-    [[nodiscard]] bool shrinkSortBuffersForCapacity(VulkanGSPipelineBuffers& buffers,
-                                                    size_t target_capacity);
+    [[nodiscard]] std::optional<LodSelectionStats> pollDeferredLodSelectionStats();
+    [[nodiscard]] std::optional<TileInstanceStats> pollDeferredTileInstanceStats();
+    // Export-only exact gate. Records the raw count/sentinel, submits
+    // and fence-waits batch A, invalidates the mapped allocation, then starts
+    // batch B before returning the raw count/sentinel result.
+    [[nodiscard]] TileInstanceGate synchronizeTileInstanceGate(
+        VulkanGSPipelineBuffers& buffers);
 
     void executeProjectionForward(const VulkanGSRendererUniforms& uniforms,
                                   VulkanGSPipelineBuffers& buffers,
@@ -96,11 +267,93 @@ public:
                                   const _VulkanBuffer& overlay_params,
                                   const _VulkanBuffer& model_transforms,
                                   size_t alloc_reserve = 0,
-                                  bool use_gut_projection = false);
-    void executeGenerateKeys(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
-    void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
-    void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms,
+                                  bool use_gut_projection = false,
+                                  const _VulkanBuffer& lod_indices = _VulkanBuffer(),
+                                  const _VulkanBuffer& lod_logical_indices = _VulkanBuffer(),
+                                  const _VulkanBuffer& lod_levels = _VulkanBuffer(),
+                                  const _VulkanBuffer& lod_weights = _VulkanBuffer(),
+                                  const _VulkanBuffer& lod_counts = _VulkanBuffer(),
+                                  bool write_overlay_flags = true);
+    // HiGS viewer chain. The cull prepass + survivor projection replace the
+    // N-wide projection / visible-flag / compact passes: per-splat outputs are
+    // written at wave-appended compact slots and the depth-sort input is
+    // appended directly, so every downstream pass is bounded by the visible
+    // count (GPU-resident) instead of N.
+    void executeCullSplats(const VulkanGSRendererUniforms& uniforms,
+                           VulkanGSPipelineBuffers& buffers,
+                           const _VulkanBuffer& transform_indices,
+                           const _VulkanBuffer& node_mask,
+                           const _VulkanBuffer& overlay_params,
+                           const _VulkanBuffer& model_transforms,
+                           const _VulkanBuffer& lod_indices = _VulkanBuffer(),
+                           const _VulkanBuffer& lod_logical_indices = _VulkanBuffer(),
+                           const _VulkanBuffer& lod_counts = _VulkanBuffer());
+    void executeProjectionForwardSurvivors(const VulkanGSRendererUniforms& uniforms,
+                                           VulkanGSPipelineBuffers& buffers,
+                                           const _VulkanBuffer& transform_indices,
+                                           const _VulkanBuffer& node_mask,
+                                           const _VulkanBuffer& overlay_params,
+                                           const _VulkanBuffer& model_transforms,
+                                           size_t visible_capacity,
+                                           const _VulkanBuffer& lod_indices = _VulkanBuffer(),
+                                           const _VulkanBuffer& lod_logical_indices = _VulkanBuffer(),
+                                           const _VulkanBuffer& lod_levels = _VulkanBuffer(),
+                                           const _VulkanBuffer& lod_weights = _VulkanBuffer(),
+                                           const _VulkanBuffer& lod_counts = _VulkanBuffer(),
+                                           bool write_overlay_flags = true);
+    // prepare_visible_chain fan-out + indirect depth sort + sorted-id snapshot.
+    void executeSortPrimitivesByDepthVisible(const VulkanGSRendererUniforms& uniforms,
+                                             VulkanGSPipelineBuffers& buffers,
+                                             size_t visible_capacity,
+                                             bool deterministic_ties = false);
+    // Per depth rank: conservative macro-tile coverage count, written in rank
+    // order (combines the legacy apply-depth-ordering reorder with the
+    // macro-granularity coverage). Feeds the visible-bounded cumsum.
+    void executeMacroCoverage(const VulkanGSRendererUniforms& uniforms,
+                              VulkanGSPipelineBuffers& buffers,
+                              size_t visible_capacity);
+    void executeMacroDepthWaves(const VulkanGSRendererUniforms& uniforms,
+                                VulkanGSPipelineBuffers& buffers,
+                                size_t armed,
+                                int sort_bits,
+                                const _VulkanBuffer& selection_mask,
+                                const _VulkanBuffer& preview_mask,
+                                const _VulkanBuffer& selection_colors,
+                                const _VulkanBuffer& overlay_params,
+                                bool overlays_active,
+                                bool predicate_waves = true,
+                                std::span<const uint32_t> exact_depth_sample_mask = {});
+    [[nodiscard]] bool supportsFloat16Storage() const { return supports_float16_storage_; }
+    [[nodiscard]] bool supportsConditionalRendering() const {
+        return supports_conditional_rendering_;
+    }
+    // Indirect visible-bounded cumsum of tiles_touched_depth_ordered followed
+    // by GPU count/dispatch preparation and deferred count readback.
+    void executeCalculateIndexBufferOffsetVisible(const VulkanGSRendererUniforms& uniforms,
+                                                  VulkanGSPipelineBuffers& buffers,
+                                                  size_t visible_capacity);
+    void executeWavePartition(const VulkanGSRendererUniforms& uniforms,
+                              VulkanGSPipelineBuffers& buffers,
+                              size_t armed,
+                              bool visible_bounded);
+
+    void executeMapLodIndices(std::uint32_t lod_count,
+                              std::uint32_t chunk_splats,
+                              std::uint32_t invalid_page,
+                              VulkanGSPipelineBuffers& buffers,
+                              const _VulkanBuffer& chunk_to_page);
+    void executeSelectLodThreshold(const VulkanGSLodSelectUniforms& uniforms,
+                                   VulkanGSPipelineBuffers& buffers,
+                                   const _VulkanBuffer& node_bounds,
+                                   const _VulkanBuffer& node_links,
+                                   const _VulkanBuffer& chunk_to_page,
+                                   const _VulkanBuffer& page_age,
+                                   const _VulkanBuffer& page_frames,
+                                   const _VulkanBuffer& page_to_chunk);
+    void executeLegacyDepthWaves(const VulkanGSRendererUniforms& uniforms,
                                  VulkanGSPipelineBuffers& buffers,
+                                 size_t armed,
+                                 int sort_bits,
                                  const _VulkanBuffer& selection_mask,
                                  const _VulkanBuffer& preview_mask,
                                  const _VulkanBuffer& selection_colors,
@@ -109,7 +362,14 @@ public:
                                  const _VulkanBuffer& transform_indices,
                                  const _VulkanBuffer& model_transforms,
                                  bool use_gut_rasterization = false,
-                                 bool overlays_active = true);
+                                 bool overlays_active = true,
+                                 bool predicate_waves = true);
+    // When set, forward forces the non-batched per-pixel rasterizer: the
+    // load-balanced batched compose only covers a subset of pixels, leaving the
+    // rest with shared-buffer residue, which corrupts a one-shot depth readback.
+    // (Whether that rasterizer writes median or expected depth is carried per
+    // render by VulkanGSRendererUniforms::expected_far.)
+    void setDepthCapture(bool on) { depth_capture_ = on; }
     void executeSelectionMask(const VulkanGSSelectionMaskUniforms& uniforms,
                               VulkanGSPipelineBuffers& buffers,
                               const _VulkanBuffer& transform_indices,
@@ -117,7 +377,8 @@ public:
                               const _VulkanBuffer& primitives,
                               const _VulkanBuffer& model_transforms,
                               const _VulkanBuffer& selection_out,
-                              const _VulkanBuffer& polygon_mask);
+                              const _VulkanBuffer& polygon_mask,
+                              const _VulkanBuffer& ring_pick_out);
 
     void executeSelectionPolygonRasterize(const VulkanGSSelectionPolygonRasterizeUniforms& uniforms,
                                           const _VulkanBuffer& polygon_vertices,
@@ -125,12 +386,6 @@ public:
 
     void executeCalculateIndexBufferOffset(const VulkanGSRendererUniforms& uniforms,
                                            VulkanGSPipelineBuffers& buffers);
-    // num_elements_override < 0 → use buffers.unsorted_keys().deviceSize().
-    void executeSort(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers,
-                     int num_bits, int64_t num_elements_override = -1);
-    void executeSortTileInstances(const VulkanGSRendererUniforms& uniforms,
-                                  VulkanGSPipelineBuffers& buffers,
-                                  int num_bits);
 
     // Two-stage sort stage 1: sort the N primitives by depth (radial distance
     // squared, written into buffers.primitive_depth_keys by projection_forward).
@@ -145,63 +400,145 @@ public:
                                    VulkanGSPipelineBuffers& buffers);
 
 protected:
+    // Projection ORs individual bytes into zeroed words. Raster-only overlay
+    // refreshes retain these flags and must not clear them.
+    _VulkanBuffer& prepareOverlayFlags(VulkanGSPipelineBuffers& buffers,
+                                       size_t num_splats,
+                                       bool write_overlay_flags);
+
+    // Export W_rec can exceed the interactive wave budget. Callers disable
+    // timestamps after W_MAX so fixed-size query rings remain bounded while all
+    // scan work is still recorded and executed.
     void executeCumsum(
         VulkanGSPipelineBuffers& buffers,
         Buffer<int32_t>& input_buffer,
-        Buffer<int32_t>& output_buffer);
+        Buffer<int32_t>& output_buffer,
+        bool record_timestamps = true);
 
     void executeSortIndirectCount(const VulkanGSRendererUniforms& uniforms,
                                   VulkanGSPipelineBuffers& buffers,
                                   int num_bits,
                                   const _VulkanBuffer& count_buffer,
                                   const _VulkanBuffer& dispatch_args_buffer,
-                                  size_t capacity);
+                                  size_t capacity,
+                                  const lfs::rendering::vulkan::indirect_layout::Layout& dispatch_layout,
+                                  size_t radix_word_offset);
     void executeSortIndirectCountImpl(const VulkanGSRendererUniforms& uniforms,
                                       VulkanGSPipelineBuffers& buffers,
                                       int num_bits,
                                       const _VulkanBuffer& count_buffer,
                                       const _VulkanBuffer& dispatch_args_buffer,
                                       size_t capacity,
-                                      const char* cpu_timer_prefix);
+                                      const lfs::rendering::vulkan::indirect_layout::Layout& dispatch_layout,
+                                      size_t radix_word_offset,
+                                      const char* cpu_timer_prefix,
+                                      bool wave_barriers_hoisted);
     void executePrepareTileSort(const VulkanGSRendererUniforms& uniforms,
                                 VulkanGSPipelineBuffers& buffers);
 
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(19);
-    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(19);
-    _ComputePipeline pipeline_selection_mask = _ComputePipeline(9);
+    // Binding 8 is unused (legacy write-only radii buffer deleted). Shader
+    // binding numbers stay stable so tagged lists keep placeholder slot 8.
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(vksplatSkipBinding(25, 8));
+    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(vksplatSkipBinding(25, 8));
+    // Canonical quantized LOD pool variants: same binding sets plus the
+    // per-page dequant frames precede the deleted-mask binding.
+    _ComputePipeline pipeline_projection_forward_quant = _ComputePipeline(vksplatSkipBindings(26, {8}));
+    _ComputePipeline pipeline_projection_forward_quant_3dgut = _ComputePipeline(vksplatSkipBindings(26, {8}));
+    // IEEE f16 SH rest (standalone PLY/SOG): fp32's 24 bindings minus shN (BDA)
+    // and radii (8).
+    _ComputePipeline pipeline_projection_forward_shn_f16 = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
+    _ComputePipeline pipeline_projection_forward_shn_f16_3dgut = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
+    // Pad-dropped q16 SH rest: 25 bindings minus shN (BDA) and radii (8).
+    _ComputePipeline pipeline_projection_forward_shn_q16 = _ComputePipeline(vksplatSkipBindings(26, {2, 8}));
+    _ComputePipeline pipeline_projection_forward_shn_q16_3dgut = _ComputePipeline(vksplatSkipBindings(26, {2, 8}));
+    _ComputePipeline pipeline_selection_mask = _ComputePipeline(12);
     _ComputePipeline pipeline_selection_polygon_rasterize = _ComputePipeline(2);
-    _ComputePipeline pipeline_generate_keys = _ComputePipeline(7);
-    _ComputePipeline pipeline_seed_primitive_indices = _ComputePipeline(1);
+    _ComputePipeline pipeline_generate_keys_wave = _ComputePipeline(8);
     _ComputePipeline pipeline_apply_depth_ordering = _ComputePipeline(4);
-    _ComputePipeline pipeline_visible_flags = _ComputePipeline(2);
-    _ComputePipeline pipeline_prepare_visible_sort = _ComputePipeline(3);
-    _ComputePipeline pipeline_prepare_tile_sort = _ComputePipeline(3);
+    _ComputePipeline pipeline_visible_flags = _ComputePipeline(3);
+    _ComputePipeline pipeline_prepare_visible_sort = _ComputePipeline(4);
+    _ComputePipeline pipeline_prepare_tile_sort = _ComputePipeline(2);
     _ComputePipeline pipeline_compact_visible_primitives = _ComputePipeline(5);
-    // 3 bindings: sorted_keys, out_tile_ranges, index_buffer_offset (for num_isects).
+    _ComputePipeline pipeline_lod_map_indices = _ComputePipeline(3);
+    _ComputePipeline pipeline_lod_select_threshold = _ComputePipeline(12);
+    _ComputePipeline pipeline_lod_compact_touch = _ComputePipeline(4);
+    // HiGS viewer chain
+    _ComputePipeline pipeline_cull_splats = _ComputePipeline(10);
+    _ComputePipeline pipeline_cull_prepare = _ComputePipeline(2);
+    // Bindings 6 (tiles_touched) and 8 (legacy radii, now unused) are
+    // absent from the survivor variant.
+    _ComputePipeline pipeline_projection_forward_survivors = _ComputePipeline(std::vector<int>{
+        0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29});
+    _ComputePipeline pipeline_projection_forward_quant_survivors = _ComputePipeline(std::vector<int>{
+        0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30});
+    _ComputePipeline pipeline_projection_forward_shn_f16_survivors = _ComputePipeline(vksplatWithout(
+        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29},
+        2));
+    _ComputePipeline pipeline_projection_forward_shn_q16_survivors = _ComputePipeline(vksplatWithout(
+        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30},
+        2));
+    _ComputePipeline pipeline_prepare_visible_chain = _ComputePipeline(4);
+    _ComputePipeline pipeline_copy_visible_indices = _ComputePipeline(3);
+    _ComputePipeline pipeline_prepare_stable_depth_sort = _ComputePipeline(6);
+    struct _CumsumIndirectComputePipeline {
+        _ComputePipeline block_scan = _ComputePipeline(4);
+        _ComputePipeline scan_block_sums = _ComputePipeline(4);
+        _ComputePipeline add_block_offsets = _ComputePipeline(4);
+    } pipeline_cumsum_indirect;
+    _ComputePipeline pipeline_prepare_tile_sort_visible = _ComputePipeline(3);
+    _ComputePipeline pipeline_wave_partition = _ComputePipeline(4);
+    _ComputePipeline pipeline_wave_partition_visible = _ComputePipeline(5);
+    // HiGS macro chain
+    _ComputePipeline pipeline_macro_coverage = _ComputePipeline(6);
+    _ComputePipeline pipeline_generate_macro_keys_wave = _ComputePipeline(9);
+    _ComputePipeline pipeline_compute_macro_ranges[2] = {
+        _ComputePipeline(4),
+        _ComputePipeline(4)};
+    _ComputePipeline pipeline_macro_batch_prepare = _ComputePipeline(2);
+    _ComputePipeline pipeline_radix_histogram_clear = _ComputePipeline(2);
+    _ComputePipelinePair pipeline_macro_raster = _ComputePipelinePair(8);
+    _ComputePipelinePair pipeline_macro_raster_fp32 = _ComputePipelinePair(8);
+    _ComputePipelinePair pipeline_macro_raster_overlays = _ComputePipelinePair(14);
+    _ComputePipelinePair pipeline_macro_raster_overlays_fp32 = _ComputePipelinePair(14);
+    _ComputePipelinePair pipeline_macro_compose = _ComputePipelinePair(13);
+    _ComputePipelinePair pipeline_macro_compose_overlays = _ComputePipelinePair(19);
+    bool supports_float16_storage_ = false;
+    bool supports_conditional_rendering_ = false;
+    PFN_vkCmdBeginConditionalRenderingEXT vk_cmd_begin_conditional_rendering_ = nullptr;
+    PFN_vkCmdEndConditionalRenderingEXT vk_cmd_end_conditional_rendering_ = nullptr;
+    // 3 bindings: sorted_keys, out_tile_ranges, GPU tile-instance count.
     _ComputePipeline pipeline_compute_tile_ranges[2] = {
         _ComputePipeline(3),
         _ComputePipeline(3)};
-    _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(14);
-    _ComputePipelinePair pipeline_rasterize_forward_3dgut = _ComputePipelinePair(20);
-    _ComputePipelinePair pipeline_rasterize_forward_plain = _ComputePipelinePair(14);
-    _ComputePipelinePair pipeline_rasterize_forward_3dgut_plain = _ComputePipelinePair(20);
+    _ComputePipeline pipeline_compute_tile_ranges_and_batch_counts[2] = {
+        _ComputePipeline(4),
+        _ComputePipeline(4)};
+    _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(15);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut = _ComputePipelinePair(24);
+    _ComputePipelinePair pipeline_rasterize_forward_plain = _ComputePipelinePair(15);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut_plain = _ComputePipelinePair(24);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut_rad = _ComputePipelinePair(24);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut_plain_rad = _ComputePipelinePair(24);
+    _ComputePipelinePair pipeline_rasterize_forward_light = _ComputePipelinePair(15);
+    _ComputePipelinePair pipeline_rasterize_forward_light_plain = _ComputePipelinePair(15);
+    _ComputePipeline pipeline_tile_batch_descriptors = _ComputePipeline(4);
+    _ComputePipelinePair pipeline_rasterize_forward_batches = _ComputePipelinePair(12);
+    _ComputePipelinePair pipeline_rasterize_forward_batches_plain = _ComputePipelinePair(7);
+    _ComputePipeline pipeline_compose_tile_batches = _ComputePipeline(17);
+    _ComputePipeline pipeline_compose_tile_batches_plain = _ComputePipeline(12);
+    _ComputePipeline pipeline_expected_depth_finalize = _ComputePipeline(2);
+    bool depth_capture_ = false;
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);
         _ComputePipeline block_scan = _ComputePipeline(3);
         _ComputePipeline scan_block_sums = _ComputePipeline(3);
         _ComputePipeline add_block_offsets = _ComputePipeline(3);
     } pipeline_cumsum;
-    struct _RadixSortComputePipeline {
-        _ComputePipeline upsweep = _ComputePipeline(3);
-        _ComputePipeline spine = _ComputePipeline(2);
-        _ComputePipeline downsweep = _ComputePipeline(6);
-    } pipeline_sorting_1, pipeline_sorting_2;
     struct _RadixSortIndirectComputePipeline {
         _ComputePipeline upsweep = _ComputePipeline(std::vector<int>{0, 1, 2, 3});
         _ComputePipeline spine = _ComputePipeline(std::vector<int>{0, 1, 2});
         _ComputePipeline downsweep = _ComputePipeline(std::vector<int>{0, 1, 2, 3, 4, 5, 6});
     } pipeline_sorting_indirect_1, pipeline_sorting_indirect_2;
-    _ComputePipeline pipeline_null = _ComputePipeline(0);
 
     bool invalidateReadbackBuffer(_VulkanBuffer& buffer, VkDeviceSize size);
 
@@ -217,7 +554,40 @@ protected:
     std::uint64_t visible_count_readback_value_ = 0;
     size_t visible_count_readback_num_splats_ = 0;
 
+    _VulkanBuffer instance_count_readback_buffer_{};
+    uint32_t* instance_count_readback_mapped_ = nullptr;
+    bool instance_count_readback_initialized_ = false;
+    bool instance_count_readback_pending_ = false;
+    VkSemaphore instance_count_readback_signal_ = VK_NULL_HANDLE;
+    std::uint64_t instance_count_readback_value_ = 0;
+
+    _VulkanBuffer instance_gate_readback_buffer_{};
+    uint32_t* instance_gate_readback_mapped_ = nullptr;
+    bool instance_gate_readback_initialized_ = false;
+
+    _VulkanBuffer lod_selection_readback_buffer_{};
+    uint32_t* lod_selection_readback_mapped_ = nullptr;
+    bool lod_selection_readback_initialized_ = false;
+    bool lod_selection_readback_pending_ = false;
+    VkSemaphore lod_selection_readback_signal_ = VK_NULL_HANDLE;
+    std::uint64_t lod_selection_readback_value_ = 0;
+    size_t lod_selection_readback_capacity_ = 0;
+    size_t lod_selection_readback_chunk_capacity_ = 0;
+
     void ensureVisibleCountReadback();
     void destroyVisibleCountReadback();
     void recordVisibleCountReadback(VulkanGSPipelineBuffers& buffers, size_t num_splats);
+    void ensureInstanceCountReadback();
+    void destroyInstanceCountReadback();
+    void recordInstanceCountReadback(VulkanGSPipelineBuffers& buffers, size_t armed);
+    void ensureInstanceGateReadback();
+    void destroyInstanceGateReadback();
+    void ensureLodSelectionReadback(size_t chunk_capacity);
+    void destroyLodSelectionReadback();
+    void recordLodSelectionReadback(VulkanGSPipelineBuffers& buffers,
+                                    size_t rendered_capacity);
+
+    // Last logged private viewport-scratch bucket (alloc extent); debug only.
+    uint32_t scratch_bucket_alloc_w_ = 0;
+    uint32_t scratch_bucket_alloc_h_ = 0;
 };

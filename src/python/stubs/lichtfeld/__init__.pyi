@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Sequence
 import enum
-from typing import TypeAlias, overload
+from typing import Annotated, TypeAlias, overload
 
 from numpy.typing import NDArray
 import typing_extensions
@@ -11,6 +11,7 @@ from . import (
     animation as animation,
     app as app,
     build_info as build_info,
+    diagnostics as diagnostics,
     io as io,
     keymap as keymap,
     log as log,
@@ -28,6 +29,25 @@ from . import (
 )
 
 
+class Error(RuntimeError):
+    """
+    Base class for every typed LichtFeld error crossing the Python boundary. Derives RuntimeError for backward compatibility. Carries .code, .domain, .user_message, .operation_id, .retryable, .details, and .context.
+    """
+
+class InvalidArgumentError(Error, ValueError):
+    """Raised for InvalidArgument / BoundsViolation errors."""
+
+class NotFoundError(Error, FileNotFoundError):
+    """Raised for NotFound errors; also a FileNotFoundError."""
+
+class CancelledError(Error):
+    """Raised when an operation was cancelled."""
+
+class ResourceError(Error):
+    """
+    Raised for ResourceExhausted errors (memory/disk/queue). Carries .requested_bytes / .available_bytes (int or None).
+    """
+
 class RenderMode(enum.Enum):
     SPLATS = 0
 
@@ -43,6 +63,11 @@ class OperatorResult(enum.Enum):
     CANCELLED = 1
 
     RUNNING = 2
+
+class ProjectOpenOutcome(enum.Enum):
+    OPENED = 0
+
+    RECOVERY_PROMPT_PENDING = 1
 
 class Hook(enum.Enum):
     training_start = 0
@@ -208,17 +233,28 @@ def session() -> Session:
 def trainer_state() -> str:
     """Get trainer state"""
 
+def trainer_saving_model() -> bool:
+    """Whether the terminal stop/completion model save is in progress"""
+
 def finish_reason() -> str | None:
     """Get finish reason if training finished"""
 
 def trainer_error() -> str | None:
     """Get trainer error message"""
 
+def trainer_error_key() -> str | None:
+    """Get the optional localization key for the trainer error message"""
+
 def prepare_training_from_scene() -> None:
     """Initialize trainer from existing scene cameras and point cloud"""
 
 def start_training() -> None:
-    """Start training with current parameters"""
+    """
+    Start training with current parameters. Returns after dispatch on the viewer thread; other callers wait for initialization. Asynchronous failures are reported through training state.
+    """
+
+def training_start_overwrite_conflict() -> int | None:
+    """Return the blocking training-start overwrite conflict, if any"""
 
 def pause_training() -> None:
     """Pause the current training run"""
@@ -226,17 +262,128 @@ def pause_training() -> None:
 def resume_training() -> None:
     """Resume a paused training run"""
 
+def project_training_session_state() -> dict:
+    """Return the stored training-session restore state for the open project"""
+
+def restore_training_session(then_start: bool = False) -> None:
+    """Hydrate the stored training session on demand"""
+
+def training_get_state() -> dict:
+    """
+    Return the live trainer state, or the stored session when the trainer is not hydrated
+    """
+
 def stop_training() -> None:
     """Stop the current training run"""
 
 def reset_training() -> None:
     """Reset training state to initial"""
 
-def save_checkpoint() -> None:
-    """Save a training checkpoint to disk"""
+def is_training_active() -> bool:
+    """Whether training is starting, running, or paused"""
 
-def new_project() -> None:
+def new_project(discard_changes: bool = False, stop_training: bool = False) -> None:
     """Clear all project state and start a new project"""
+
+def project_create(path: str, discard_changes: bool = False, stop_training: bool = False, overwrite: bool = False) -> bool:
+    """Create and bind a new .licht project at path"""
+
+def project_create_pending() -> bool:
+    """Whether a stop-then-create is queued and has not bound yet"""
+
+def project_embed_dataset() -> None:
+    """Embed the active project's external dataset verbatim"""
+
+def project_save(wait: bool = False, regenerate_preview: bool = True) -> bool:
+    """Save the active .licht project, prompting for a path when needed"""
+
+def project_save_as(path: str = '', wait: bool = False) -> bool:
+    """Save the active project to a new .licht path"""
+
+def project_save_as_for_training_start(path: str = '', wait: bool = False) -> bool:
+    """Save a clean project for a new training run"""
+
+def project_get_license() -> dict | None:
+    """Return the license metadata for the active project, or None"""
+
+def project_set_license(identifier: str, notice: str = '') -> None:
+    """Set the license metadata for the active project"""
+
+def project_clear_license() -> None:
+    """Clear the license metadata for the active project"""
+
+def project_set_preview(png_bytes: bytes, wait: bool = False, path: str = '', project_uuid: str = '') -> bool:
+    """Write a thumbnail onto the active project without saving unsaved edits"""
+
+def project_poll_write() -> dict:
+    """Return the active .licht project write state"""
+
+def project_open(path: str = '', discard_changes: bool = False, stop_training: bool = False, keep_asset_manager_open: bool = False) -> ProjectOpenOutcome:
+    """Open a .licht project"""
+
+def project_compact() -> None:
+    """Compact the active .licht project in the background"""
+
+def project_cancel_cleanup() -> None: ...
+
+def project_clean(destination: str = '', expected_commit: str = '') -> bool:
+    """
+    Clean the active saved project in the background, preserving its current resume point
+    """
+
+def project_is_dirty() -> bool:
+    """Return whether the active project has unsaved chapters"""
+
+def project_has_path() -> bool:
+    """Return whether the active project has a bound .licht path"""
+
+def project_path() -> str | None:
+    """Return the active project's bound .licht path, or None"""
+
+def project_uuid() -> str | None:
+    """Return the active project UUID (kept across saves), or None"""
+
+def project_can_embed_dataset() -> bool:
+    """Return whether the active project can embed its external dataset"""
+
+def project_recent_files() -> list[str]:
+    """Return the most-recently-used .licht project paths"""
+
+def project_clear_recent_files() -> None:
+    """Clear the most-recently-used .licht project list"""
+
+def project_remove_recent_file(path: str) -> None:
+    """Remove one path from the most-recently-used .licht project list"""
+
+def project_autosave_recovery_disposition(path: str) -> str:
+    """
+    Return autosave recovery disposition for a .licht master path ("none", "offer", "stale_deleted", "invalid", "ambiguous", "busy", "unavailable")
+    """
+
+def project_reopen_last_enabled() -> bool:
+    """Return whether the last project is reopened at startup"""
+
+def project_set_reopen_last(enabled: bool) -> None:
+    """Enable or disable reopening the last project at startup"""
+
+def project_auto_save_on_close_enabled() -> bool:
+    """Return whether dirty projects are saved automatically on close"""
+
+def project_set_auto_save_on_close(enabled: bool) -> None:
+    """Enable or disable automatic project save on close"""
+
+def project_embed_dataset_by_default_enabled() -> bool: ...
+
+def project_set_embed_dataset_by_default(enabled: bool) -> None:
+    """Set whether new projects copy datasets into the project by default"""
+
+def project_autosave_interval_seconds() -> int:
+    """Return the timed project autosave interval in seconds"""
+
+def project_set_autosave_interval_seconds(seconds: int) -> None:
+    """
+    Set the timed project autosave interval in seconds; zero disables the timer trigger
+    """
 
 def clear_scene() -> None:
     """Remove all nodes from the scene"""
@@ -244,8 +391,11 @@ def clear_scene() -> None:
 def switch_to_edit_mode() -> None:
     """Switch from training to edit mode"""
 
-def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False) -> None:
+def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False, images_folder: str = '') -> None:
     """Load a file (PLY, checkpoint) or dataset into the scene."""
+
+def load_files(paths: Sequence[str], stop_training: bool = False, discard_changes: bool = False, replace: bool = False, _user_batch: bool = False) -> None:
+    """Import splat and mesh files as one ordered batch."""
 
 def load_config_file(path: str) -> None:
     """Load a JSON configuration file."""
@@ -258,12 +408,41 @@ def load_checkpoint_for_training(checkpoint_path: str, dataset_path: str, output
 def request_exit() -> None:
     """Request application exit (shows confirmation if needed)."""
 
-def force_exit() -> None:
-    """Force immediate application exit (bypasses confirmation)."""
+def save_and_exit() -> None:
+    """Save the named project explicitly and exit after the save succeeds."""
 
-def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int, rad_lod_ratios: Sequence[float] | None = None, rad_flip_y: bool = False) -> None:
+def save_as_and_exit() -> None:
     """
-    Export scene nodes to file. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP.
+    Choose a project path, save explicitly, and exit after the save succeeds.
+    """
+
+def stop_save_and_exit() -> None:
+    """Stop training if needed, save the project explicitly, then exit."""
+
+def cancel_exit() -> None:
+    """Cancel the pending application exit."""
+
+def force_exit() -> None:
+    """Explicitly discard unsaved changes and exit."""
+
+def load_gallery_scene(nodes: list, name: str, hidden: bool = False) -> None:
+    """
+    Load verified gallery nodes on the managed import worker, then attach a complete group. Nodes contain path, affine transform and shDegree. A failed or canceled batch adds no group.
+    """
+
+def prepare_gallery_scene(path: str, payload_format: str = 'ply') -> None:
+    """
+    Publish visible splats and appearance into a fresh native .licht file. The selected PLY, SOG, SSOG or SPZ v4 data and HDR assets are embedded; training and editor state are excluded.
+    """
+
+def prepare_gallery_project(source_path: str, destination: str, payload_format: str = 'sog', expected_commit_uuid: str = '') -> None:
+    """
+    Prepare a saved .licht project on the managed export worker without opening it in the editor. Destination must be a fresh staging directory. Poll ui.get_export_state() for progress, errors and commit_uuid.
+    """
+
+def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int, rad_flip_y: bool = False, rad_streamable: bool = True, spz_version: int = 4, include_provenance: bool = True, *, lod_levels: int = 4, lod_ratio: float = 0.5, chunk_count_k: int = 512, chunk_extent: float = 16.0, chunk_min_k: int = 8, kmeans_iterations: int = 10) -> None:
+    """
+    Export scene nodes to file or directory. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP, 8=SSOG, 13=GLB. For SSOG, path names a .ssog bundle or directory; lod_levels, lod_ratio, chunk_count_k, chunk_extent, chunk_min_k and kmeans_iterations control its LODs and chunks. spz_version is 3 (legacy gzip) or 4 (zstd, default) and is only used for SPZ. include_provenance (default true) writes a full provenance stamp into the format metadata slot; when false, a minimal build stamp is still embedded. Ignored for COLMAP and SPZ v3.
     """
 
 def save_config_file(path: str) -> None:
@@ -316,6 +495,9 @@ def set_vram_profiler_enabled(enabled: bool) -> None:
 
 def get_vram_profiler_enabled() -> bool:
     """Return whether the live VRAM diagnostics profiler is enabled"""
+
+def vram_owner_breakdown() -> dict:
+    """Return a sampled process VRAM breakdown by owner category"""
 
 def set_node_visibility(name: str, visible: bool) -> None:
     """Set visibility of a scene node by name"""
@@ -394,11 +576,25 @@ def get_colmap_sparse_source_path() -> str | None:
 def get_node_visualizer_world_transform(name: str) -> list[float] | None:
     """Get node visualizer-world transform matrix (16 floats, column-major)"""
 
-def set_node_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node transform matrix (16 floats, column-major)"""
+def commit_node_transforms(node_names: Sequence[str], old_transforms: Sequence[Sequence[float]]) -> None:
+    """
+    Record a completed preview edit as one undo step using its original local transforms
+    """
 
-def set_node_visualizer_world_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node visualizer-world transform matrix (16 floats, column-major)"""
+def set_node_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
+
+def set_node_visualizer_world_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node visualizer-world transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
+
+def bake_selected_node_transforms() -> int:
+    """
+    Bake selected SPLAT, POINTCLOUD, and MESH node transforms into their payloads
+    """
 
 def capture_selection_transforms() -> dict:
     """Capture transforms of all selected nodes"""
@@ -422,11 +618,48 @@ def free_icon(texture_id: int) -> None:
 def reset_camera() -> None:
     """Reset camera to default position and orientation"""
 
+def focus_selection() -> bool:
+    """
+    Focus the active viewport on the selection, or the whole scene when nothing is selected
+    """
+
+def go_home() -> None:
+    """Move the active viewport to its home view"""
+
+def set_home() -> None:
+    """Make the active viewport's current view its home view"""
+
+def reset_home() -> None:
+    """
+    Restore the default home view of the active viewport and move the camera there
+    """
+
 def get_camera_navigation_mode() -> str:
-    """Get the active camera navigation mode ('orbit', 'trackball', or 'fpv')"""
+    """
+    Get the active camera navigation mode ('orbit', 'trackball', 'fpv', or 'drone')
+    """
 
 def set_camera_navigation_mode(mode: str) -> None:
     """Set the active camera navigation mode"""
+
+def get_new_project_navigation_up_axis() -> str:
+    """Get the navigation vertical used only for new projects"""
+
+def get_new_project_align_grid() -> bool:
+    """
+    Get whether new projects start with a grid perpendicular to their navigation vertical
+    """
+
+def set_new_project_navigation_defaults(axis: str, align_grid: bool) -> None:
+    """Set new-project defaults without modifying the current project"""
+
+def get_navigation_up_axis() -> str:
+    """Get the project navigation vertical: legacy_y or data_z"""
+
+def set_navigation_up_axis(axis: str, align_grid: bool = False) -> None:
+    """
+    Set the project navigation vertical without transforming scene data or camera poses; optionally align both panel grids
+    """
 
 def get_camera_view_snap_enabled() -> bool:
     """Check whether camera axis-view snapping is enabled"""
@@ -434,11 +667,24 @@ def get_camera_view_snap_enabled() -> bool:
 def set_camera_view_snap_enabled(enabled: bool) -> None:
     """Enable or disable camera axis-view snapping"""
 
+def file_associations_status() -> list:
+    """
+    Return whether LichtFeld Studio is registered as a handler for each known file extension (Windows only)
+    """
+
+def file_association_set(extension: str, enabled: bool) -> bool:
+    """
+    Register or unregister LichtFeld Studio as a handler for one file extension (Windows only)
+    """
+
 def toggle_fullscreen() -> None:
     """Toggle fullscreen mode"""
 
 def is_fullscreen() -> bool:
     """Check if the window is in fullscreen mode"""
+
+def get_vulkan_capabilities() -> dict:
+    """Return Vulkan device capabilities used to gate rendering controls"""
 
 def toggle_ui() -> None:
     """Toggle UI overlay visibility"""
@@ -447,6 +693,12 @@ def toggle_vram_hud() -> None:
     """
     Toggle the VRAM diagnostics HUD overlay (requires vram profiler enabled)
     """
+
+def toggle_perf_hud_expanded() -> None:
+    """Toggle the performance HUD between its full and compact views"""
+
+def is_perf_hud_visible() -> bool:
+    """True when the performance HUD is currently shown"""
 
 def toggle_independent_split_view() -> None:
     """Toggle independent split view"""
@@ -466,8 +718,22 @@ def get_depth_view() -> bool:
 def set_depth_view(enabled: bool) -> None:
     """Enable or disable depth-map view"""
 
-def set_orthographic(ortho: bool) -> None:
-    """Enable or disable orthographic projection"""
+def get_depth_view_range() -> tuple[float, float]:
+    """Get depth-map visualization range: (near, far)"""
+
+def set_depth_view_range(depth_min: float, depth_max: float) -> None:
+    """Set depth-map visualization range"""
+
+def get_depth_view_mode() -> str:
+    """Get depth-map visualization mode: 'palette' or 'gray'"""
+
+def set_depth_view_mode(mode: str) -> None:
+    """Set depth-map visualization mode"""
+
+def set_orthographic(ortho: bool, extent_world: float | None = None) -> None:
+    """
+    Enable or disable orthographic projection, optionally setting its vertical world extent
+    """
 
 def on_training_start(callback: Callable) -> Callable:
     """Decorator for training start handler"""
@@ -546,7 +812,7 @@ class Tensor:
         """Count non-zero elements"""
 
     @staticmethod
-    def from_numpy(arr: NDArray, copy: bool = True) -> Tensor:
+    def from_numpy(arr: Annotated[NDArray, dict(device='cpu')], copy: bool = True) -> Tensor:
         """Create tensor from NumPy array"""
 
     @staticmethod
@@ -595,10 +861,10 @@ class Tensor:
     def from_dlpack(obj: object) -> Tensor:
         """Create tensor from DLPack capsule or object"""
 
-    def __getitem__(self, arg: object, /) -> Tensor:
+    def __getitem__(self, key: object | None) -> Tensor:
         """Get item/slice"""
 
-    def __setitem__(self, arg0: object, arg1: object, /) -> None:
+    def __setitem__(self, key: object | None, value: object) -> None:
         """Set item/slice"""
 
     @overload
@@ -1098,12 +1364,8 @@ class SplatSimplifyMergeTree:
         """Requested simplify ratio"""
 
     @property
-    def requested_knn_k(self) -> int:
-        """Requested kNN neighborhood size"""
-
-    @property
-    def requested_merge_cap(self) -> float:
-        """Requested per-pass merge cap"""
+    def requested_lod_base(self) -> float:
+        """Requested LOD base factor"""
 
     @property
     def requested_opacity_prune_threshold(self) -> float:
@@ -1144,10 +1406,10 @@ class SplatSimplifyResult:
     def merge_tree(self) -> SplatSimplifyMergeTree:
         """Merge tree describing how the output was formed"""
 
-def simplify_splats(source_name: str, ratio: float = 0.1, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612) -> None:
+def simplify_splats(source_name: str, ratio: float = 0.1, lod_base: float = 2.0, opacity_prune_threshold: float = 0.10000000149011612) -> None:
     """Simplify a splat node asynchronously and create a new output node."""
 
-def simplify_splat_data_with_history(source: scene.SplatData, ratio: float = 0.1, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612, progress: object | None = None) -> SplatSimplifyResult:
+def simplify_splat_data_with_history(source: scene.SplatData, ratio: float = 0.1, lod_base: float = 2.0, opacity_prune_threshold: float = 0.10000000149011612, progress: object | None = None) -> SplatSimplifyResult:
     """
     Synchronously simplify SplatData and return both the simplified output and its merge tree.
     """
@@ -1219,7 +1481,24 @@ def capture_viewport() -> ViewportRender | None:
     Capture viewport render explicitly (may read back from GPU; clones data, safe to use from background threads)
     """
 
-def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None) -> Tensor | None:
+def export_viewport_image(path: str, format: str = '', width: int = 0, height: int = 0, transparent: bool = False, jpeg_quality: int = 95, include_provenance: bool = True) -> dict:
+    """
+    Export the active viewport image to PNG or JPEG.
+
+    Args:
+        path: Output path. The selected format extension is enforced when needed.
+        format: 'png', 'jpg', or empty to infer from path.
+        width: Target width in pixels. If zero with a positive height, preserves viewport aspect.
+        height: Target height in pixels. If both dimensions are zero, captures the current viewport.
+        transparent: For PNG only, export straight RGBA from the preview renderer.
+        jpeg_quality: JPEG compression quality in [1, 100].
+        include_provenance: When true, writes a full Comment stamp on PNG and JPEG; when false, a minimal build stamp is still embedded.
+
+    Returns:
+        Dict with path, width, height, channels, format, and transparent.
+    """
+
+def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None, with_depth: bool = False, depth_mode: str = 'median') -> object:
     """
     Render scene from arbitrary camera parameters.
 
@@ -1229,10 +1508,33 @@ def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, 
         width: Render width in pixels
         height: Render height in pixels
         fov: Vertical field of view in degrees (default: 60)
-        bg_color: Optional [3] RGB background color
+        bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
+        with_depth: If True, also return the per-pixel linear depth from the same render
+        depth_mode: "median" (default) = depth at 50% transmittance (sharp, undefined where
+            coverage < 50%); "expected" = alpha-weighted depth (dense/hole-free, softer at edges)
 
     Returns:
-        Tensor [H, W, 3] RGB image on CUDA, or None if scene not available
+        with_depth=False: CPU Tensor [H, W, 3] RGB image
+        with_depth=True: tuple (image [H, W, 3], depth [H, W]) of CPU float tensors
+        or None if no active visualizer scene is available
+    """
+
+def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None, orthographic: bool | None = None, ortho_scale: float | None = None) -> Tensor | None:
+    """
+    Render scene from arbitrary camera parameters as an 8-bit RGB image.
+
+    Args:
+        rotation: [3, 3] camera-to-world rotation in visualizer coordinates
+        translation: [3] camera position in visualizer world coordinates
+        width: Render width in pixels
+        height: Render height in pixels
+        fov: Vertical field of view in degrees (default: 60)
+        bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
+        orthographic: Optional projection override. None uses current render settings.
+        ortho_scale: Optional orthographic pixels-per-world-unit override.
+
+    Returns:
+        CPU uint8 Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
     """
 
 def compute_screen_positions(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0) -> Tensor | None:
@@ -1342,6 +1644,11 @@ class RenderSettings:
     def __dir__(self) -> list: ...
 
 def get_render_settings() -> RenderSettings | None: ...
+
+def get_lod_stats() -> dict:
+    """
+    Get LOD statistics: {enabled, selected, budget, levels:[{level, count}, ...]}
+    """
 
 def register_class(cls: object) -> None:
     """Register a class (Panel, Operator, or Menu)"""
@@ -1709,7 +2016,37 @@ class MaskMode(enum.Enum):
 
     IGNORE = 2
 
-    ALPHA_CONSISTENT = 3
+    SEGMENT_AND_IGNORE = 3
+
+    ALPHA_CONSISTENT = 4
+
+class EvalSpace(enum.Enum):
+    DISTORTED = 0
+
+    UNDISTORTED = 1
+
+class EvalBitDepth(enum.Enum):
+    AUTO = 0
+
+    EIGHT = 1
+
+    SIXTEEN = 2
+
+    FLOAT = 3
+
+class DensifyErrorMap(enum.Enum):
+    SSIM = 0
+
+    SSIM_CS = 1
+
+class NormalLossSpace(enum.Enum):
+    AUTO = 0
+
+    CAMERA_OPENCV = 1
+
+    CAMERA_OPENGL = 2
+
+    WORLD = 3
 
 class BackgroundMode(enum.Enum):
     SOLID_COLOR = 0
@@ -1811,6 +2148,29 @@ class OptimizationParams:
     def rotation_lr(self, arg: float, /) -> None: ...
 
     @property
+    def cropbox_lr_scale(self) -> float:
+        """
+        Scales Adam steps and refinement signals for rejected splats; strategy noise, decay, and resets remain active
+        """
+
+    @cropbox_lr_scale.setter
+    def cropbox_lr_scale(self, arg: float, /) -> None: ...
+
+    @property
+    def cropbox_loss_weight(self) -> float:
+        """Scales pixel losses for camera rays outside the active crop box"""
+
+    @cropbox_loss_weight.setter
+    def cropbox_loss_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def cropbox_growth_inside(self) -> float:
+        """Share of new splats placed inside the active crop box"""
+
+    @cropbox_growth_inside.setter
+    def cropbox_growth_inside(self, arg: float, /) -> None: ...
+
+    @property
     def lambda_dssim(self) -> float:
         """Weight for structural similarity loss"""
 
@@ -1850,13 +2210,70 @@ class OptimizationParams:
     def enable_eval(self, arg: bool, /) -> None: ...
 
     @property
-    def tile_mode(self) -> int:
+    def eval_all(self) -> bool:
+        """Train on every image and evaluate all of them; no image is held out"""
+
+    @eval_all.setter
+    def eval_all(self, arg: bool, /) -> None: ...
+
+    @property
+    def eval_flip(self) -> bool:
         """
-        Tile mode for 3DGUT training only (1, 2, or 4; ignored for 3DGS/FastGS)
+        Also compute FLIP per evaluated image and save its error map next to the evaluation images
         """
 
-    @tile_mode.setter
-    def tile_mode(self, arg: int, /) -> None: ...
+    @eval_flip.setter
+    def eval_flip(self, arg: bool, /) -> None: ...
+
+    @property
+    def eval_mask(self) -> str:
+        """
+        Scores only part of each evaluated image (a mesh, a box, the crop box, a mask folder, a depth range, points or a splat); training is not affected
+        """
+
+    @eval_mask.setter
+    def eval_mask(self, arg: str, /) -> None: ...
+
+    @property
+    def eval_mask_report(self) -> str:
+        """
+        Pixel sets scored with the evaluation mask, comma list of mask, unmasked and inverted; the first is the headline set, whose scores go to metrics.csv, the log and the training panel. Empty: the mask
+        """
+
+    @eval_mask_report.setter
+    def eval_mask_report(self, arg: str, /) -> None: ...
+
+    @property
+    def eval_mask_opacity(self) -> float:
+        """
+        Rendered opacity a pixel needs to count as covered by a splat mask; lower widens the mask past the outline, higher pulls it in
+        """
+
+    @eval_mask_opacity.setter
+    def eval_mask_opacity(self, arg: float, /) -> None: ...
+
+    @property
+    def densify_error_map(self) -> DensifyErrorMap:
+        """Densification error map: full SSIM or contrast-structure only"""
+
+    @densify_error_map.setter
+    def densify_error_map(self, arg: DensifyErrorMap, /) -> None: ...
+
+    @property
+    def max_screen_share(self) -> float:
+        """
+        Shrink Gaussians that cover more than this share of the view; 0 or 1 disables
+        """
+
+    @max_screen_share.setter
+    def max_screen_share(self, arg: float, /) -> None: ...
+
+    @property
+    def screen_share_penalty(self) -> float:
+        """Soft hinge weight on log-scale for Gaussians over the screen-share cap"""
+
+    @screen_share_penalty.setter
+    def screen_share_penalty(self, arg: float, /) -> None: ...
 
     @property
     def steps_scaler(self) -> float:
@@ -1879,6 +2296,20 @@ class OptimizationParams:
     def gut(self, arg: bool, /) -> None: ...
 
     @property
+    def use_exposure_correction(self) -> bool:
+        """Enable combined per-photo exposure correction"""
+
+    @use_exposure_correction.setter
+    def use_exposure_correction(self, arg: bool, /) -> None: ...
+
+    @property
+    def exposure_correction_grid_start_iter(self) -> int:
+        """Iteration at which the local residual grid starts training"""
+
+    @exposure_correction_grid_start_iter.setter
+    def exposure_correction_grid_start_iter(self, arg: int, /) -> None: ...
+
+    @property
     def use_bilateral_grid(self) -> bool:
         """Enable bilateral grid color correction"""
 
@@ -1887,10 +2318,112 @@ class OptimizationParams:
 
     @property
     def enable_sparsity(self) -> bool:
-        """Enable sparsity optimization"""
+        """Run POPSpa sparsification after training"""
 
     @enable_sparsity.setter
     def enable_sparsity(self, arg: bool, /) -> None: ...
+
+    @property
+    def popspa_target_count(self) -> int: ...
+
+    @popspa_target_count.setter
+    def popspa_target_count(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_first_prune_count(self) -> int: ...
+
+    @popspa_first_prune_count.setter
+    def popspa_first_prune_count(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_sparsify_steps(self) -> int: ...
+
+    @popspa_sparsify_steps.setter
+    def popspa_sparsify_steps(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_refine_steps(self) -> int: ...
+
+    @popspa_refine_steps.setter
+    def popspa_refine_steps(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_projection_interval(self) -> int: ...
+
+    @popspa_projection_interval.setter
+    def popspa_projection_interval(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_seed(self) -> int: ...
+
+    @popspa_seed.setter
+    def popspa_seed(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_rho(self) -> float: ...
+
+    @popspa_rho.setter
+    def popspa_rho(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_erank_weight(self) -> float: ...
+
+    @popspa_erank_weight.setter
+    def popspa_erank_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_thin_scale_weight(self) -> float: ...
+
+    @popspa_thin_scale_weight.setter
+    def popspa_thin_scale_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_erank_epsilon(self) -> float: ...
+
+    @popspa_erank_epsilon.setter
+    def popspa_erank_epsilon(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_means_lr(self) -> float: ...
+
+    @popspa_means_lr.setter
+    def popspa_means_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_scales_lr(self) -> float: ...
+
+    @popspa_scales_lr.setter
+    def popspa_scales_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_opacities_lr(self) -> float: ...
+
+    @popspa_opacities_lr.setter
+    def popspa_opacities_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_quaternions_lr(self) -> float: ...
+
+    @popspa_quaternions_lr.setter
+    def popspa_quaternions_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_sh0_lr(self) -> float: ...
+
+    @popspa_sh0_lr.setter
+    def popspa_sh0_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_shn_lr(self) -> float: ...
+
+    @popspa_shn_lr.setter
+    def popspa_shn_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_ssim_weight(self) -> float: ...
+
+    @popspa_ssim_weight.setter
+    def popspa_ssim_weight(self, arg: float, /) -> None: ...
 
     @property
     def mip_filter(self) -> bool:
@@ -1905,6 +2438,13 @@ class OptimizationParams:
 
     @ppisp.setter
     def ppisp(self, arg: bool, /) -> None: ...
+
+    @property
+    def ppisp_exposure_from_exif(self) -> bool:
+        """Seed per-frame PPISP exposure from image EXIF"""
+
+    @ppisp_exposure_from_exif.setter
+    def ppisp_exposure_from_exif(self, arg: bool, /) -> None: ...
 
     @property
     def ppisp_use_controller(self) -> bool:
@@ -2000,22 +2540,129 @@ class OptimizationParams:
     def use_alpha_as_mask(self, arg: bool, /) -> None: ...
 
     @property
+    def use_depth_loss(self) -> bool:
+        """Load depth maps and use depth-map supervision during training"""
+
+    @use_depth_loss.setter
+    def use_depth_loss(self, arg: bool, /) -> None: ...
+
+    @property
+    def depth_loss_weight(self) -> float:
+        """Weight for depth-map supervision"""
+
+    @depth_loss_weight.setter
+    def depth_loss_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def depth_loss_mode(self) -> str:
+        """
+        Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', or 'ssi-depth'
+        """
+
+    @depth_loss_mode.setter
+    def depth_loss_mode(self, arg: str, /) -> None: ...
+
+    @property
+    def depth_auto_generate(self) -> bool:
+        """
+        Generate missing or size-mismatched depth maps with MoGe-2 from the full-resolution images/ folder
+        """
+
+    @depth_auto_generate.setter
+    def depth_auto_generate(self, arg: bool, /) -> None: ...
+
+    @property
+    def use_normal_loss(self) -> bool:
+        """Load normal maps and use normal-map supervision during training"""
+
+    @use_normal_loss.setter
+    def use_normal_loss(self, arg: bool, /) -> None: ...
+
+    @property
+    def normal_auto_generate(self) -> bool:
+        """
+        Generate missing or size-mismatched maps with MoGe-2 from the full-resolution images/ folder so they work at every training resolution
+        """
+
+    @normal_auto_generate.setter
+    def normal_auto_generate(self, arg: bool, /) -> None: ...
+
+    @property
+    def normal_loss_weight(self) -> float:
+        """Weight for prior normal supervision"""
+
+    @normal_loss_weight.setter
+    def normal_loss_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_consistency_weight(self) -> float:
+        """Weight for depth-normal consistency supervision"""
+
+    @normal_consistency_weight.setter
+    def normal_consistency_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_flatten_weight(self) -> float:
+        """Min-axis scale flattening weight while normal supervision is active"""
+
+    @normal_flatten_weight.setter
+    def normal_flatten_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_start_fraction(self) -> float:
+        """Fraction of total iterations at which normal supervision starts"""
+
+    @normal_start_fraction.setter
+    def normal_start_fraction(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_end_fraction(self) -> float:
+        """
+        Fraction of total iterations at which normal supervision stops; 1.0 keeps it on until the end
+        """
+
+    @normal_end_fraction.setter
+    def normal_end_fraction(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_loss_space(self) -> str:
+        """
+        Normal prior coordinate space: 'auto', 'camera-opencv', 'camera-opengl', or 'world'
+        """
+
+    @normal_loss_space.setter
+    def normal_loss_space(self, arg: str, /) -> None: ...
+
+    @property
     def undistort(self) -> bool:
-        """Undistort images on-the-fly before training"""
+        """
+        Remove lens distortion before training: each image and its mask, depth and normal map are resampled once from full resolution into a distortion-free pinhole camera, which training then uses. Alternative to --gut for distorted or non-pinhole cameras
+        """
 
     @undistort.setter
     def undistort(self, arg: bool, /) -> None: ...
 
     @property
-    def revised_opacity(self) -> bool:
-        """Use revised opacity calculation during densification"""
+    def eval_space(self) -> EvalSpace:
+        """
+        Reference images for evaluation with --undistort: distorted = the original images, with the render warped into the original lens; undistorted = the undistorted training images
+        """
 
-    @revised_opacity.setter
-    def revised_opacity(self, arg: bool, /) -> None: ...
+    @eval_space.setter
+    def eval_space(self, arg: EvalSpace, /) -> None: ...
+
+    @property
+    def eval_bit_depth(self) -> EvalBitDepth:
+        """
+        Grid the render is quantized to before evaluation metrics: auto = each reference image's own encoding (8-bit, 16-bit or float)
+        """
+
+    @eval_bit_depth.setter
+    def eval_bit_depth(self, arg: EvalBitDepth, /) -> None: ...
 
     @property
     def save_steps(self) -> list[int]:
-        """List of iterations at which to save checkpoints"""
+        """List of iterations at which to save the project (project.licht)"""
 
     def add_save_step(self, step: int) -> None:
         """Add a save step (ignored if duplicate)"""
@@ -2083,6 +2730,12 @@ class DatasetParams:
         """Subfolder name containing images"""
 
     @property
+    def init_path(self) -> str:
+        """
+        Training initialization file; empty when training starts from the dataset's points
+        """
+
+    @property
     def test_every(self) -> int:
         """Use every Nth image for testing"""
 
@@ -2104,6 +2757,13 @@ class DatasetParams:
     def max_width(self, arg: int, /) -> None: ...
 
     @property
+    def min_track_length(self) -> int:
+        """Minimum COLMAP sparse point track length; 0 disables filtering"""
+
+    @min_track_length.setter
+    def min_track_length(self, arg: int, /) -> None: ...
+
+    @property
     def use_cpu_cache(self) -> bool:
         """Cache images in CPU memory"""
 
@@ -2111,16 +2771,16 @@ class DatasetParams:
     def use_cpu_cache(self, arg: bool, /) -> None: ...
 
     @property
-    def use_fs_cache(self) -> bool:
-        """Use filesystem cache for images"""
+    def use_16bit_color(self) -> bool:
+        """Train with 16-bit color images (HDR); caches losslessly as JPEG 2000"""
 
-    @use_fs_cache.setter
-    def use_fs_cache(self, arg: bool, /) -> None: ...
+    @use_16bit_color.setter
+    def use_16bit_color(self, arg: bool, /) -> None: ...
 
     @property
     def centralize_dataset(self) -> str:
         """
-        Dataset centralization mode used for the last load: 'none', 'auto', 'by_pointcloud', 'by_cameras'
+        Dataset centralization mode used for the last load: 'off', 'by_pointcloud', 'by_cameras'
         """
 
 def dataset_params() -> DatasetParams:
@@ -2160,11 +2820,26 @@ def run(path: str) -> None:
 def list_scene() -> None:
     """Print the scene graph tree"""
 
-def on_frame(callback: Callable) -> None:
-    """Register a callback to be called each frame with delta time (seconds)"""
+def on_frame(callback: Callable, duration_s: object | None = None) -> None:
+    """
+    Register a frame callback with an optional positive lifetime in seconds (defaults to 10 seconds).
+    """
+
+def set_frame_callback(callback: Callable, duration_s: object | None = None) -> None:
+    """
+    Register a frame callback with an optional positive lifetime in seconds (defaults to 10 seconds).
+    """
 
 def stop_animation() -> None:
     """Stop any running animation (clears frame callback)"""
+
+def on_scene_time(callback: Callable) -> None:
+    """
+    Register a callback evaluated with the absolute scene clip time (seconds)
+    """
+
+def clear_scene_time() -> None:
+    """Clear the scene-time callback"""
 
 def colormap(values: Tensor, name: str = 'jet') -> Tensor:
     """
@@ -2197,8 +2872,16 @@ class DatasetInfo:
         """Path to the masks directory"""
 
     @property
+    def depths_path(self) -> str:
+        """Path to the depth maps directory"""
+
+    @property
     def has_masks(self) -> bool:
         """Whether the dataset includes masks"""
+
+    @property
+    def has_depths(self) -> bool:
+        """Whether the dataset includes depth maps"""
 
     @property
     def image_count(self) -> int:
@@ -2208,9 +2891,13 @@ class DatasetInfo:
     def mask_count(self) -> int:
         """Number of masks in the dataset"""
 
+    @property
+    def depth_count(self) -> int:
+        """Number of depth maps in the dataset"""
+
     def __repr__(self) -> str: ...
 
-def build_splat_lod_hierarchy(source: object | None = None, ratio: float = 0.5, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612, max_levels: int | None = None, min_points: int = 1, progress: object | None = None) -> object:
+def build_splat_lod_hierarchy(source: object | None = None, ratio: float = 0.5, lod_base: float = 2.0, opacity_prune_threshold: float = 0.10000000149011612, max_levels: int | None = None, min_points: int = 1, progress: object | None = None) -> object:
     """
     Build a script-side multi-level LOD hierarchy from SplatData or a scene node.
     """
@@ -2252,4 +2939,4 @@ class CheckpointParams:
 def read_checkpoint_params(path: str) -> CheckpointParams | None:
     """Read training parameters from a checkpoint (None if failed)"""
 
-__all__: tuple = ('context', 'gaussians', 'session', 'get_scene', 'Tensor', 'Hook', 'ScopedHandler', 'SplatSimplifyResult', 'SplatSimplifyMergeTree', 'on_training_start', 'on_iteration_start', 'on_post_step', 'on_pre_optimizer_step', 'on_training_end', 'mesh_to_splat', 'is_mesh2splat_active', 'get_mesh2splat_progress', 'get_mesh2splat_stage', 'get_mesh2splat_error', 'simplify_splats', 'simplify_splat_data_with_history', 'build_splat_lod_hierarchy', 'cancel_splat_simplify', 'is_splat_simplify_active', 'get_splat_simplify_progress', 'get_splat_simplify_stage', 'get_splat_simplify_error', 'on_frame', 'stop_animation', 'run', 'list_scene', 'mat4', 'colormap', 'help', 'scene', 'io', 'packages', 'mcp')
+__all__: tuple = ('context', 'gaussians', 'session', 'get_scene', 'Tensor', 'Hook', 'ScopedHandler', 'SplatSimplifyResult', 'SplatSimplifyMergeTree', 'on_training_start', 'on_iteration_start', 'on_post_step', 'on_pre_optimizer_step', 'on_training_end', 'mesh_to_splat', 'is_mesh2splat_active', 'get_mesh2splat_progress', 'get_mesh2splat_stage', 'get_mesh2splat_error', 'simplify_splats', 'simplify_splat_data_with_history', 'build_splat_lod_hierarchy', 'cancel_splat_simplify', 'is_splat_simplify_active', 'get_splat_simplify_progress', 'get_splat_simplify_stage', 'get_splat_simplify_error', 'on_frame', 'stop_animation', 'on_scene_time', 'clear_scene_time', 'run', 'list_scene', 'mat4', 'colormap', 'help', 'scene', 'io', 'packages', 'mcp')

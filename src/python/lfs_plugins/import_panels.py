@@ -1,376 +1,58 @@
 # SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Retained RmlUI panels for dataset, checkpoint, and URL import flows."""
+"""RmlUI panels for dataset and checkpoint import flows."""
 
-import logging
-import os
-import shutil
 import threading
-from pathlib import Path
-from typing import Any, Optional
+import time
+from _lfs_path_io import Path
 
 import lichtfeld as lf
 
-_logger = logging.getLogger(__name__)
-
-THREAD_JOIN_TIMEOUT_SEC = 5.0
-
-
-def _watch_log(level: str, message: str, *args, exc_info: bool = False) -> None:
-    if args:
-        try:
-            message = message % args
-        except Exception:
-            pass
-
-    prefixed = f"[AssetManagerWatch] {message}"
-    logger_fn = {
-        "debug": _logger.debug,
-        "info": _logger.info,
-        "warn": _logger.warning,
-        "error": _logger.error,
-    }.get(level, _logger.info)
-    logger_fn(prefixed, exc_info=exc_info)
-
-    try:
-        lf_log = getattr(lf, "log", None)
-        lf_level = "warn" if level == "warn" else level
-        lf_fn = getattr(lf_log, lf_level, None) if lf_log is not None else None
-        if callable(lf_fn):
-            lf_fn(prefixed)
-    except Exception:
-        pass
-
-
-def _join_thread(thread: Optional[threading.Thread], name: str, timeout: float = THREAD_JOIN_TIMEOUT_SEC) -> None:
-    if thread is None:
-        return
-    if threading.current_thread() is thread:
-        return
-    try:
-        thread.join(timeout=timeout)
-        if thread.is_alive():
-            _logger.warning("%s thread did not stop within %.1fs", name, timeout)
-    except Exception:
-        _logger.warning("Failed to join %s thread", name, exc_info=True)
-
-
 from . import rml_widgets as w
-from .asset_manager_integration import (
-    get_asset_manager_panel,
-    load_asset_index,
-    load_scanner,
-    load_thumbnails,
-    metadata_to_asset_kwargs,
-    refresh_active_panel,
-    register_catalog_asset_path,
-    select_asset_in_active_panel,
-)
-from .asset_index import resolve_asset_manager_storage_path
-from .types import Panel
 from .rml_keys import KI_ESCAPE, KI_RETURN
+from .training_confirm import confirm_discard_work_then
+from .types import Panel
+from .panels import panel_class
 from .ui import RuntimeState
-from .url_downloader import (
-    URLDownloadError,
-    UnsupportedURLError,
-    ExtractError,
-    normalize_url,
-    download_url,
-    extract_archive,
-    get_url_info,
-)
 
-
-_dataset_import_panel = None
+_new_project_panel = None
 _resume_checkpoint_panel = None
-_url_import_panel = None
-_watch_dirs_dialog_panel = None
-_watch_dirs_dialog_state = {
-    "project_id": None,
-    "project_name": "",
-    "watch_dirs": [],
-    "version": 0,
-}
+_SOURCE_PROBE_DEBOUNCE_SECONDS = 0.3
 
-__lfs_panel_classes__ = [
-    "DatasetImportPanel",
-    "ResumeCheckpointPanel",
-    "URLImportPanel",
-    "WatchDirsDialogPanel",
-]
-__lfs_panel_ids__ = [
-    "lfs.dataset_import",
-    "lfs.resume_checkpoint",
-    "lfs.url_import",
-    "lfs.watch_dirs_dialog",
-]
+__lfs_panel_classes__ = ["NewProjectPanel", "ResumeCheckpointPanel"]
+__lfs_panel_ids__ = ["lfs.new_project", "lfs.resume_checkpoint"]
 
 
-def open_dataset_import_panel(dataset_path: str) -> bool:
-    """Open the retained dataset import dialog for the given dataset path."""
-    if _dataset_import_panel is None:
+def open_new_project_panel(source_path: str = "") -> bool:
+    panel = _new_project_panel or lf.ui.get_panel_object("lfs.new_project")
+    if panel is None:
         return False
-    return _dataset_import_panel.show(dataset_path)
+    return panel.show(source_path)
 
 
 def open_resume_checkpoint_panel(checkpoint_path: str) -> bool:
-    """Open the retained checkpoint resume dialog for the given checkpoint path."""
-    if _resume_checkpoint_panel is None:
+    panel = _resume_checkpoint_panel or lf.ui.get_panel_object("lfs.resume_checkpoint")
+    if panel is None:
         return False
-    return _resume_checkpoint_panel.show(checkpoint_path)
+    return panel.show(checkpoint_path)
 
 
-def open_url_import_panel() -> bool:
-    """Open the retained URL import panel."""
-    if _url_import_panel is None:
-        return False
-    return _url_import_panel.show()
-
-
-def open_watch_dirs_dialog(project_id: str) -> bool:
-    """Open the watched directories dialog for the given project."""
-    global _watch_dirs_dialog_panel
-    if not project_id:
-        return False
-    if _watch_dirs_dialog_panel is None:
-        try:
-            lf.register_class(WatchDirsDialogPanel)
-        except Exception:
-            pass
-    try:
-        _watch_log(
-            "info",
-            "open dialog requested project_id=%s panel_object_id=%s",
-            project_id,
-            id(_watch_dirs_dialog_panel) if _watch_dirs_dialog_panel is not None else "None",
-        )
-        if not _load_watch_dirs_dialog_state(project_id):
-            return False
-        lf.ui.set_panel_enabled(WatchDirsDialogPanel.id, True)
-        if _watch_dirs_dialog_panel is not None:
-            _watch_dirs_dialog_panel._sync_from_shared_state()
-            _watch_dirs_dialog_panel._dirty_model()
-        return True
-    except Exception as e:
-        _logger.error("Failed to open watch dirs dialog: %s", e, exc_info=True)
-        return False
-
-
-def _set_watch_dirs_dialog_state(
-    project_id: Optional[str],
-    project_name: str = "",
-    watch_dirs: Optional[list[str]] = None,
-) -> None:
-    _watch_dirs_dialog_state["project_id"] = project_id
-    _watch_dirs_dialog_state["project_name"] = project_name
-    _watch_dirs_dialog_state["watch_dirs"] = list(watch_dirs or [])
-    _watch_dirs_dialog_state["version"] = int(_watch_dirs_dialog_state.get("version") or 0) + 1
-
-
-def _load_watch_dirs_dialog_state(project_id: str) -> bool:
-    index = load_asset_index()
-    if index is None:
-        _watch_log("error", "catalog load failed")
-        return False
-    project = index.get_project(project_id)
-    if project is None:
-        _watch_log(
-            "error",
-            "show aborted: project not found project_id=%s available=%s library=%s",
-            project_id,
-            list(getattr(index, "projects", {}).keys()),
-            _index_library_path(index),
-        )
-        return False
-    project_name = getattr(project, "name", "Unnamed Project")
-    watch_dirs = index.get_watch_dirs(project_id)
-    _set_watch_dirs_dialog_state(project_id, project_name, watch_dirs)
-    _watch_log(
-        "info",
-        "show loaded project_id=%s project_name=%s watch_dirs=%s library=%s",
-        project_id,
-        project_name,
-        watch_dirs,
-        _index_library_path(index),
+def _directory_has_colmap_file(path: str) -> bool:
+    """Return whether a sparse directory contains a COLMAP model."""
+    filenames = (
+        "cameras.bin",
+        "images.bin",
+        "points3D.bin",
+        "cameras.txt",
+        "images.txt",
+        "points3D.txt",
     )
-    return True
-
-
-def _tr(key: str) -> str:
-    return lf.ui.tr(key)
-
-
-def _index_library_path(index) -> str:
-    return str(getattr(index, "library_path", "<unknown library path>"))
-
-
-def _safe_count(mapping) -> int:
-    try:
-        return len(mapping)
-    except Exception:
-        return -1
-
-
-def _library_mtime(index) -> str:
-    try:
-        path = getattr(index, "library_path", None)
-        if path is not None and path.exists():
-            return str(path.stat().st_mtime)
-    except Exception:
-        pass
-    return "missing"
-
-
-def _discover_asset_metadata(scanner, path: str) -> list[dict[str, Any]]:
-    """Discover assets under a path using the shared scanner contract."""
-    _watch_log("info", "discover start path=%s exists=%s", path, os.path.exists(path))
-    if scanner is None:
-        _watch_log("error", "discover skipped because scanner is None")
-        return []
-
-    if hasattr(scanner, "scan_directory_deep"):
-        metadata_list = scanner.scan_directory_deep(path)
-        _watch_log(
-            "info",
-            "discover complete path=%s method=scan_directory_deep count=%d",
-            path,
-            len(metadata_list),
-        )
-        return metadata_list
-
-    metadata_list: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
-
-    root_metadata = scanner.scan_file(path)
-    root_type = root_metadata.get("type")
-    root_path = root_metadata.get("path")
-    if root_type is not None and root_path:
-        metadata_list.append(root_metadata)
-        seen_paths.add(root_path)
-
-    for metadata in scanner.scan_directory(path, recursive=True):
-        metadata_path = metadata.get("path")
-        if not metadata_path or metadata_path in seen_paths:
-            continue
-        metadata_list.append(metadata)
-        seen_paths.add(metadata_path)
-
-    _watch_log(
-        "info",
-        "discover complete path=%s method=scan_directory count=%d",
-        path,
-        len(metadata_list),
+    root = Path(path)
+    return any(
+        (candidate / filename).is_file()
+        for candidate in (root, root / "0")
+        for filename in filenames
     )
-    return metadata_list
-
-
-def _register_discovered_assets(
-    index,
-    thumbnails,
-    metadata_list: list[dict[str, Any]],
-    *,
-    project_id: Optional[str],
-    scene_id: Optional[str] = None,
-    name_override: Optional[str] = None,
-) -> list[Any]:
-    """Create catalog assets from discovered metadata using shared logic."""
-    created_assets = []
-    single_asset_override = name_override if len(metadata_list) == 1 else None
-    _watch_log(
-        "info",
-        "register start library=%s project_id=%s scene_id=%s metadata_count=%d",
-        _index_library_path(index),
-        project_id,
-        scene_id,
-        len(metadata_list),
-    )
-
-    for metadata in metadata_list:
-        file_path = metadata.get("path")
-        if not file_path or not os.path.exists(file_path):
-            _watch_log(
-                "warn",
-                "register skipped missing path metadata_path=%s name=%s type=%s",
-                file_path,
-                metadata.get("name"),
-                metadata.get("type"),
-            )
-            continue
-        existing = index.find_asset_by_path(file_path, project_id=project_id)
-        if existing is not None:
-            _watch_log(
-                "info",
-                "register skipped existing project asset path=%s project_id=%s asset_id=%s",
-                file_path,
-                project_id,
-                getattr(existing, "id", "<unknown>"),
-            )
-            continue
-
-        asset_name = (
-            single_asset_override
-            or metadata.get("name")
-            or Path(file_path).name
-        )
-        asset = index.create_asset(
-            project_id=project_id,
-            name=asset_name,
-            type=metadata.get("type", "unknown"),
-            path=file_path,
-            absolute_path=file_path,
-            scene_id=scene_id,
-            role=metadata.get("role", "reference"),
-            **metadata_to_asset_kwargs(metadata),
-        )
-        if asset is None:
-            _watch_log(
-                "error",
-                "register create_asset returned None path=%s type=%s role=%s library=%s",
-                file_path,
-                metadata.get("type"),
-                metadata.get("role"),
-                _index_library_path(index),
-            )
-            continue
-        created_assets.append(asset)
-        _watch_log(
-            "info",
-            "register created asset_id=%s name=%s type=%s path=%s",
-            asset.id,
-            asset.name,
-            asset.type,
-            file_path,
-        )
-        if thumbnails is not None:
-            try:
-                thumb_path = None
-                if asset.type == "dataset" and hasattr(thumbnails, "generate_dataset_preview"):
-                    thumb_path = thumbnails.generate_dataset_preview(
-                        asset.type,
-                        asset.id,
-                        file_path,
-                        metadata.get("format_specific", {}) or {},
-                    )
-                elif hasattr(thumbnails, "generate_rendered_preview"):
-                    thumb_path = thumbnails.generate_rendered_preview(
-                        asset.type,
-                        asset.id,
-                        file_path,
-                    )
-                if thumb_path is None:
-                    thumb_path = thumbnails.generate_placeholder(asset.type, asset.id)
-                index.update_asset(asset.id, thumbnail_path=str(thumb_path))
-            except Exception:
-                _watch_log(
-                    "warn",
-                    "thumbnail generation failed asset_id=%s path=%s",
-                    asset.id,
-                    file_path,
-                    exc_info=True,
-                )
-
-    _watch_log("info", "register complete created_count=%d", len(created_assets))
-    return created_assets
 
 
 class _ImportDialogPanel(Panel):
@@ -381,6 +63,8 @@ class _ImportDialogPanel(Panel):
 
     def on_mount(self, doc):
         super().on_mount(doc)
+        if hasattr(self, "_dialog_mounted"):
+            self._dialog_mounted = True
         self._last_lang = lf.ui.get_current_language()
         self._escape_revert = w.EscapeRevertController()
         doc.add_event_listener("keydown", self._on_keydown)
@@ -402,6 +86,14 @@ class _ImportDialogPanel(Panel):
         self._subscribe_reactive_state()
 
     def on_unmount(self, _doc):
+        if hasattr(self, "_dialog_mounted"):
+            self._dialog_mounted = False
+            if not lf.ui.is_panel_enabled(self.id):
+                self._dialog_requested = False
+            self._source_generation += 1
+            self._source_probe_update_generation += 1
+            self._source_probe_cancel.set()
+            self._source_probe_active = False
         self._unsubscribe_reactive_state()
 
     def _subscribe_reactive_state(self):
@@ -468,43 +160,67 @@ class _ImportDialogPanel(Panel):
         return False
 
 
-class DatasetImportPanel(_ImportDialogPanel):
-    """Floating panel for configuring dataset import paths."""
+@panel_class("new_project")
+class NewProjectPanel(_ImportDialogPanel):
+    """Floating panel for creating a project and optionally importing a source."""
 
-    id = "lfs.dataset_import"
-    label = "Load Dataset"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 11
-    template = "rmlui/dataset_import_panel.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
-    size = (560, 0)
-    form_id = "dataset-import-form"
+    form_id = "new-project-form"
 
     DEFAULT_MAX_WIDTH = 3840
+    _INVALID_NAME_CHARACTERS = set('<>:"|?*')
+    _WINDOWS_RESERVED_NAMES = {
+        "con", "prn", "aux", "nul",
+        *(f"com{i}" for i in range(1, 10)),
+        *(f"lpt{i}" for i in range(1, 10)),
+    }
 
     def __init__(self):
-        global _dataset_import_panel
-        _dataset_import_panel = self
+        global _new_project_panel
+        _new_project_panel = self
 
         self._handle = None
-        self._dataset_path = ""
+        self._name = ""
+        self._project_location = ""
+        self._source_path = ""
+        self._source_kind = "blank"
         self._dataset_info = None
-        self._dataset_valid = False
-        self._output_path = ""
         self._init_path = ""
         self._ppisp_sidecar_path = ""
         self._centralize_dataset = "off"
         self._max_width = self.DEFAULT_MAX_WIDTH
         self._max_width_str = str(self.DEFAULT_MAX_WIDTH)
+        self._min_track_length = 0
+        self._min_track_length_str = "0"
         self._apply_auto_crop = False
+        self._embed_dataset = False
+        self._advanced_expanded = False
         self._last_lang = ""
+        self._source_generation = 0
+        self._source_probe_due = 0.0
+        self._source_probe_update_generation = 0
+        self._source_probe_active = False
+        self._source_probe_cancel = threading.Event()
+        self._dialog_mounted = False
+        self._dialog_requested = False
+        self._colmap_available = False
+        self._target_exists_cached = False
+        self._dedupe_name_cache: dict[str, str] = {}
+        self._name_derived_from_source = False
 
     def on_bind_model(self, ctx):
-        model = ctx.create_data_model("dataset_import")
+        model = ctx.create_data_model("new_project")
         if model is None:
             return
 
-        model.bind_func("panel_label", lambda: lf.ui.tr("load_dataset_popup.title"))
+        model.bind_func("panel_label", lambda: lf.ui.tr("new_project.title"))
+        model.bind_func("source_is_dataset", lambda: self._source_kind == "dataset")
+        model.bind_func("embed_dataset_visible", lambda: self._source_kind == "dataset")
+        model.bind_func("advanced_expanded", lambda: self._advanced_expanded)
+        model.bind_func("name_valid", self._name_is_valid)
+        model.bind_func("target_exists", self._target_exists)
+        model.bind_func("can_create", self._can_create)
+        model.bind_func("location_preview", self._location_preview)
+        model.bind_func("create_hint", self._create_hint)
 
         model.bind_func("images_path", lambda: self._string_attr("images_path"))
         model.bind_func("sparse_path", lambda: self._string_attr("sparse_path"))
@@ -512,54 +228,93 @@ class DatasetImportPanel(_ImportDialogPanel):
         model.bind_func("images_count_text", self._images_count_text)
         model.bind_func("mask_count_text", self._mask_count_text)
         model.bind_func("show_masks", lambda: bool(self._dataset_info and getattr(self._dataset_info, "has_masks", False)))
-        model.bind_func("can_load", lambda: bool(self._dataset_valid and self._output_path.strip()))
+        model.bind_func("show_min_track_length", self._show_min_track_length)
+        model.bind_func("show_min_track_length_warning", self._show_min_track_length_warning)
+        model.bind("name", lambda: self._name, self._set_name)
+        model.bind("source_path", lambda: self._source_path, self._set_source_path)
 
-        model.bind("dataset_path", lambda: self._dataset_path, self._set_dataset_path)
-        model.bind("output_path", lambda: self._output_path, self._set_output_path)
         model.bind("init_path", lambda: self._init_path, self._set_init_path)
         model.bind("ppisp_sidecar_path", lambda: self._ppisp_sidecar_path, self._set_ppisp_sidecar_path)
         model.bind("centralize_dataset", lambda: self._centralize_dataset, self._set_centralize_dataset)
         model.bind("max_width_str", lambda: self._max_width_str, self._set_max_width_str)
         model.bind("max_width_disabled", lambda: self._max_width == 0, self._set_max_width_disabled)
+        model.bind("min_track_length_str", lambda: self._min_track_length_str, self._set_min_track_length_str)
         model.bind("apply_auto_crop", lambda: self._apply_auto_crop, self._set_apply_auto_crop)
+        model.bind("embed_dataset", lambda: self._embed_dataset, self._set_embed_dataset)
 
-        model.bind_event("browse_dataset", self._on_browse_dataset)
-        model.bind_event("browse_output", self._on_browse_output)
+        model.bind_event("browse_destination", self._on_browse_destination)
+        model.bind_event("browse_folder", self._on_browse_folder)
+        model.bind_event("browse_file", self._on_browse_file)
         model.bind_event("browse_init", self._on_browse_init)
         model.bind_event("browse_ppisp_sidecar", self._on_browse_ppisp_sidecar)
-        model.bind_event("do_load", self._on_do_load)
+        model.bind_event("min_track_length_step", self._on_min_track_length_step)
+        model.bind_event("toggle_advanced", self._on_toggle_advanced)
+        model.bind_event("do_create", self._on_do_create)
         model.bind_event("do_cancel", self._on_do_cancel)
 
         self._handle = model.get_handle()
 
     def on_update(self, doc):
         del doc
+        changed = False
         current_lang = lf.ui.get_current_language()
         if current_lang != self._last_lang:
             self._last_lang = current_lang
             self._dirty_model()
-            return True
-        return False
+            changed = True
+        if self._source_probe_due and time.monotonic() >= self._source_probe_due:
+            self._source_probe_due = 0.0
+            self._start_source_probe()
+            changed = True
+        return changed
 
-    def show(self, dataset_path: str) -> bool:
-        if not self._apply_dataset_path(dataset_path, reset_output=True):
-            return False
+    def poll(self, _context):
+        # Saved panel placement is not a request to start creating a project.
+        return self._dialog_requested
 
+    def apply_chrome(self, _payload):
+        lf.ui.set_panel_enabled(self.id, self._dialog_requested)
+
+    def show(self, source_path: str = "") -> bool:
+        self._name = ""
+        self._project_location = ""
+        self._source_path = ""
+        self._source_kind = "blank"
+        self._dataset_info = None
         self._init_path = ""
         self._centralize_dataset = "off"
         self._max_width = self.DEFAULT_MAX_WIDTH
         self._max_width_str = str(self.DEFAULT_MAX_WIDTH)
+        self._min_track_length = 0
+        self._min_track_length_str = "0"
         self._apply_auto_crop = False
+        self._embed_dataset = bool(getattr(lf.ui, "get_embed_dataset_by_default", lambda: False)())
+        self._advanced_expanded = False
+        self._source_generation += 1
+        self._source_probe_cancel.set()
+        self._source_probe_cancel = threading.Event()
+        self._source_probe_due = 0.0
+        self._colmap_available = False
+        self._target_exists_cached = False
+        self._dedupe_name_cache = {}
+        self._name_derived_from_source = False
         params = lf.optimization_params()
+        self._ppisp_sidecar_path = ""
+        self._set_source_path(source_path, derive_name=True)
+        self._start_source_probe()
         self._ppisp_sidecar_path = (
             str(params.ppisp_sidecar_path) if params and params.has_params() else ""
         )
+        self._dirty_model("ppisp_sidecar_path")
+        if not self._name:
+            self._set_name(self._dedupe_name("untitled"))
         self._dirty_model()
+        self._dialog_requested = True
         lf.ui.set_panel_enabled(self.id, True)
         return True
 
     def _can_submit_from_keyboard(self) -> bool:
-        return bool(self._dataset_valid and self._output_path.strip())
+        return self._can_create()
 
     def _preview_base_path(self, dataset_path: str) -> Path:
         path = Path(dataset_path)
@@ -567,52 +322,281 @@ class DatasetImportPanel(_ImportDialogPanel):
             return path.parent
         return path
 
-    def _default_output_path(self, dataset_path: str, info) -> str:
-        preview_root = self._preview_base_path(dataset_path)
-        base_path = Path(info.base_path) if info is not None else preview_root
-        return str(base_path / "output")
-
-    def _apply_dataset_path(self, dataset_path: str, reset_output: bool) -> bool:
-        next_value = str(dataset_path).strip()
-        dataset_changed = next_value != self._dataset_path
-        self._dataset_path = next_value
-        self._dataset_valid = bool(next_value) and lf.is_dataset_path(next_value)
+    def _apply_source_path(self, source_path: str) -> None:
+        next_value = str(source_path).strip()
+        self._source_path = next_value
         self._dataset_info = None
-
-        if dataset_changed:
-            self._init_path = ""
-            self._ppisp_sidecar_path = ""
-
-        if self._dataset_valid:
-            self._dataset_info = lf.detect_dataset_info(str(self._preview_base_path(next_value)))
-            if reset_output:
-                self._output_path = self._default_output_path(next_value, self._dataset_info)
-        elif reset_output:
-            self._output_path = ""
+        if not next_value:
+            self._source_kind = "blank"
+        elif self._is_splat_path(next_value):
+            self._source_kind = "splat"
+        else:
+            self._source_kind = "checking"
+            self._source_probe_due = time.monotonic() + _SOURCE_PROBE_DEBOUNCE_SECONDS
+            self._schedule_source_probe_update()
 
         self._dirty_model(
-            "dataset_path",
+            "source_path",
+            "source_is_dataset",
+            "embed_dataset_visible",
             "images_path",
             "sparse_path",
             "masks_path",
             "images_count_text",
             "mask_count_text",
             "show_masks",
-            "output_path",
+            "show_min_track_length",
+            "show_min_track_length_warning",
             "init_path",
             "ppisp_sidecar_path",
-            "can_load",
+            "can_create",
+            "target_exists",
+            "location_preview",
+            "create_hint",
+            "min_track_length_str",
+            "embed_dataset_visible",
         )
-        return self._dataset_valid
+
+    @staticmethod
+    def _is_splat_path(path: str) -> bool:
+        if lf.io.is_ssog_path(path):
+            return True
+        suffix = Path(path).suffix.lower()
+        return suffix in {".ply", ".sog", ".ssog", ".spz", ".glb", ".rad"} or suffix.startswith(".usd")
+
+    def _set_source_path(self, value, derive_name=False):
+        previous = self._source_path
+        self._apply_source_path(value)
+        if derive_name or (not self._name and str(value).strip()):
+            source = Path(str(value).strip())
+            stem = source.name if self._source_kind == "dataset" else source.stem
+            if stem:
+                self._set_name(self._dedupe_name(stem))
+                self._name_derived_from_source = True
+        if previous != self._source_path:
+            self._source_probe_active = False
+            self._source_generation += 1
+            self._source_probe_cancel.set()
+            self._source_probe_cancel = threading.Event()
+            self._init_path = ""
+            self._ppisp_sidecar_path = ""
+
+    def _start_source_probe(self) -> None:
+        if self._source_probe_active:
+            return
+        self._source_probe_due = 0.0
+        self._source_probe_active = True
+        path = self._source_path
+        name = self._name
+        location = self._destination_folder()
+        generation = self._source_generation
+        cancel = self._source_probe_cancel
+
+        def worker() -> None:
+            kind = "blank" if not path else "invalid"
+            info = None
+            colmap = False
+            try:
+                if cancel.is_set():
+                    if cancel is self._source_probe_cancel:
+                        self._source_probe_active = False
+                    return
+                if path and lf.is_dataset_path(path):
+                    kind = "dataset"
+                    info = lf.detect_dataset_info(str(self._preview_base_path(path)))
+                    colmap = bool(info and getattr(info, "sparse_path", "") and
+                                  _directory_has_colmap_file(str(info.sparse_path)))
+                elif path and Path(path).is_file() and self._is_splat_path(path):
+                    kind = "splat"
+            except Exception:
+                kind = "invalid"
+            base = name.strip() or "untitled"
+            candidate = Path(location) / f"{base}.licht"
+            target_exists = candidate.exists()
+            deduped = base
+            suffix = 2
+            while (Path(location) / f"{deduped}.licht").exists():
+                deduped = f"{base}-{suffix}"
+                suffix += 1
+            result = (kind, info, colmap, target_exists, base, deduped)
+
+            def complete() -> None:
+                if generation != self._source_generation or cancel.is_set():
+                    return
+                if not self._dialog_mounted:
+                    self._source_probe_active = False
+                    self._source_probe_due = time.monotonic() + 0.3
+                    return
+                self._source_probe_active = False
+                (
+                    self._source_kind,
+                    self._dataset_info,
+                    self._colmap_available,
+                    target_exists,
+                    base,
+                    deduped,
+                ) = result
+                # A name edit can race the source probe; never publish the
+                # old name's filesystem result over the current name.
+                if self._name == name:
+                    self._target_exists_cached = target_exists
+                    self._dedupe_name_cache[base] = deduped
+                    if self._name_derived_from_source and deduped != base:
+                        self._name = deduped
+                        self._target_exists_cached = False
+                self._dirty_model()
+
+            scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+            if callable(scheduler):
+                scheduler(complete)
+            else:
+                complete()
+
+        scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+        if callable(scheduler):
+            threading.Thread(
+                target=worker, daemon=True, name="ImportDatasetProbe"
+            ).start()
+        else:
+            worker()
+
+    def _refresh_target_cache(self) -> None:
+        location = self._destination_folder()
+        base = self._name.strip() or "untitled"
+        candidate = Path(location) / f"{base}.licht"
+        self._target_exists_cached = candidate.exists()
+        deduped = base
+        suffix = 2
+        while (Path(location) / f"{deduped}.licht").exists():
+            deduped = f"{base}-{suffix}"
+            suffix += 1
+        self._dedupe_name_cache[base] = deduped
+
+    def _set_name(self, value):
+        self._name = str(value)
+        self._name_derived_from_source = False
+        scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+        if callable(scheduler):
+            self._target_exists_cached = False
+            self._source_probe_due = time.monotonic() + _SOURCE_PROBE_DEBOUNCE_SECONDS
+            self._schedule_source_probe_update()
+        else:
+            self._refresh_target_cache()
+        self._dirty_model("name", "name_valid", "target_exists", "can_create", "location_preview", "create_hint")
+
+    def _schedule_source_probe_update(self) -> None:
+        self._source_probe_update_generation += 1
+        generation = self._source_probe_update_generation
+        due = self._source_probe_due
+        delay = max(0.0, due - time.monotonic())
+
+        def fire() -> None:
+            if (
+                generation != self._source_probe_update_generation
+                or self._source_probe_due != due
+            ):
+                return
+            scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+            if callable(scheduler):
+                scheduler(self._request_reactive_update)
+            else:
+                self._request_reactive_update()
+
+        timer = threading.Timer(delay, fire)
+        timer.daemon = True
+        timer.start()
+
+    def _name_is_valid(self) -> bool:
+        name = self._name.strip()
+        if not name or name[-1] in ". ":
+            return False
+        if any(character in name for character in "/\\" + "".join(self._INVALID_NAME_CHARACTERS)):
+            return False
+        return name.split(".", 1)[0].casefold() not in self._WINDOWS_RESERVED_NAMES
+
+    def _destination_folder(self) -> str:
+        return self._project_location or str(getattr(lf.ui, "get_project_location", lambda: "")() or "")
+
+    def _on_browse_destination(self, _handle=None, _ev=None, _args=None):
+        path = lf.ui.open_folder_dialog(lf.ui.tr("new_project.choose_folder"), self._destination_folder())
+        if not path or path == self._destination_folder():
+            return
+        self._project_location = str(path)
+        self._source_generation += 1
+        self._source_probe_cancel.set()
+        self._source_probe_cancel = threading.Event()
+        self._source_probe_active = False
+        self._target_exists_cached = False
+        self._dedupe_name_cache.clear()
+        self._start_source_probe()
+        self._dirty_model()
+
+    def _target_path(self) -> Path:
+        location = self._destination_folder()
+        return Path(location) / f"{self._name.strip()}.licht"
+
+    def _target_exists(self) -> bool:
+        return bool(self._name.strip()) and self._target_exists_cached
+
+    def _destination_exists(self) -> bool:
+        try:
+            exists = self._target_path().exists()
+        except OSError:
+            exists = False
+        self._target_exists_cached = exists
+        return bool(self._name.strip()) and exists
+
+    def _can_create(self) -> bool:
+        return (
+            self._name_is_valid()
+            and self._source_kind in {"blank", "dataset", "splat"}
+        )
+
+    def _confirm_overwrite(self, on_overwrite) -> None:
+        overwrite_label = lf.ui.tr("new_project.overwrite")
+        cancel_label = lf.ui.tr("common.cancel")
+        message = (
+            lf.ui.tr("new_project.overwrite_message") or ""
+        ).replace("{name}", self._name.strip())
+
+        def _on_result(button, _overwrite=overwrite_label):
+            if button == _overwrite:
+                on_overwrite()
+
+        lf.ui.confirm_dialog(
+            lf.ui.tr("new_project.overwrite_title"),
+            message,
+            [overwrite_label, cancel_label],
+            _on_result,
+        )
+
+    def _location_preview(self) -> str:
+        template = lf.ui.tr("new_project.location_preview") or "Will be created at: {path}"
+        return template.replace("{path}", str(self._target_path()))
+
+    def _create_hint(self) -> str:
+        if self._target_exists():
+            return lf.ui.tr("new_project.already_exists")
+        if not self._name_is_valid():
+            return lf.ui.tr("new_project.invalid_name")
+        if self._source_kind == "invalid":
+            return lf.ui.tr("new_project.source_invalid")
+        return ""
+
+    def _dedupe_name(self, name: str) -> str:
+        base = name.strip() or "untitled"
+        return self._dedupe_name_cache.get(base, base)
 
     def _dirty_model(self, *fields):
         if not self._handle:
             return
         if not fields:
             self._handle.dirty_all()
+            w.request_model_update(self._handle)
             return
         for field in fields:
             self._handle.dirty(field)
+        w.request_model_update(self._handle)
 
     def _string_attr(self, name: str) -> str:
         if self._dataset_info is None:
@@ -623,32 +607,34 @@ class DatasetImportPanel(_ImportDialogPanel):
     def _images_count_text(self) -> str:
         if self._dataset_info is None:
             return ""
-        return f"({int(getattr(self._dataset_info, 'image_count', 0))} images)"
+        return f"({int(getattr(self._dataset_info, 'image_count', 0)):,} images)"
 
     def _mask_count_text(self) -> str:
         if self._dataset_info is None or not getattr(self._dataset_info, "has_masks", False):
             return ""
-        return f"({int(getattr(self._dataset_info, 'mask_count', 0))} masks)"
+        return f"({int(getattr(self._dataset_info, 'mask_count', 0)):,} masks)"
 
-    def _set_output_path(self, value):
-        next_value = str(value)
-        if next_value == self._output_path:
-            return
-        self._output_path = next_value
-        self._dirty_model("output_path", "can_load")
+    def _show_min_track_length(self) -> bool:
+        if self._dataset_info is None:
+            return False
+        sparse_path = getattr(self._dataset_info, "sparse_path", "")
+        if not sparse_path:
+            return False
+        return self._colmap_available
 
-    def _set_dataset_path(self, value):
-        next_value = str(value)
-        if next_value == self._dataset_path:
-            return
-        self._apply_dataset_path(next_value, reset_output=True)
+    def _show_min_track_length_warning(self) -> bool:
+        return (
+            self._show_min_track_length()
+            and bool(self._init_path.strip())
+            and self._min_track_length > 0
+        )
 
     def _set_init_path(self, value):
         next_value = str(value)
         if next_value == self._init_path:
             return
         self._init_path = next_value
-        self._dirty_model("init_path")
+        self._dirty_model("init_path", "show_min_track_length_warning")
 
     def _set_ppisp_sidecar_path(self, value):
         next_value = str(value)
@@ -691,6 +677,32 @@ class DatasetImportPanel(_ImportDialogPanel):
             self._max_width_str = str(self.DEFAULT_MAX_WIDTH)
         self._dirty_model("max_width_str", "max_width_disabled")
 
+    def _set_min_track_length_str(self, value):
+        text = str(value).strip().replace(",", "")
+        try:
+            parsed = int(text) if text else 0
+        except ValueError:
+            self._dirty_model("min_track_length_str")
+            return
+        self._set_min_track_length(parsed)
+
+    def _set_min_track_length(self, value):
+        parsed = max(0, min(99, int(value)))
+        if parsed == self._min_track_length and self._min_track_length_str == str(parsed):
+            return
+        self._min_track_length = parsed
+        self._min_track_length_str = str(parsed)
+        self._dirty_model("min_track_length_str", "show_min_track_length_warning")
+
+    def _on_min_track_length_step(self, _handle=None, _ev=None, args=None):
+        delta = 0
+        if args:
+            try:
+                delta = int(args[0])
+            except (TypeError, ValueError, IndexError):
+                delta = 0
+        self._set_min_track_length(self._min_track_length + delta)
+
     def _set_apply_auto_crop(self, value):
         enabled = bool(value)
         if enabled == self._apply_auto_crop:
@@ -698,73 +710,152 @@ class DatasetImportPanel(_ImportDialogPanel):
         self._apply_auto_crop = enabled
         self._dirty_model("apply_auto_crop")
 
-    def _on_browse_dataset(self, _handle=None, _ev=None, _args=None):
-        path = lf.ui.open_dataset_folder_dialog()
-        if path:
-            self._set_dataset_path(path)
-
-    def _on_browse_output(self, _handle=None, _ev=None, _args=None):
-        path = lf.ui.open_dataset_folder_dialog()
-        if path:
-            self._set_output_path(path)
+    def _set_embed_dataset(self, value):
+        value = bool(value)
+        if value == self._embed_dataset:
+            return
+        self._embed_dataset = value
+        self._dirty_model("embed_dataset")
 
     def _on_browse_init(self, _handle=None, _ev=None, _args=None):
-        if not self._dataset_path.strip():
+        if self._source_kind != "dataset":
             return
-        path = lf.ui.open_ply_file_dialog(str(self._preview_base_path(self._dataset_path)))
+        path = lf.ui.open_init_file_dialog(str(self._preview_base_path(self._source_path)))
         if path:
             self._set_init_path(path)
 
     def _on_browse_ppisp_sidecar(self, _handle=None, _ev=None, _args=None):
-        start_dir = str(self._preview_base_path(self._dataset_path)) if self._dataset_path else ""
+        start_dir = str(self._preview_base_path(self._source_path)) if self._source_path else ""
         if self._ppisp_sidecar_path:
             start_dir = self._ppisp_sidecar_path
         path = lf.ui.open_ppisp_file_dialog(start_dir)
         if path:
             self._set_ppisp_sidecar_path(path)
 
-    def _on_do_load(self, _handle=None, _ev=None, _args=None):
-        if not self._dataset_valid or not self._output_path.strip():
+    def _on_toggle_advanced(self, _handle=None, _ev=None, _args=None):
+        self._advanced_expanded = not self._advanced_expanded
+        self._dirty_model("advanced_expanded")
+
+    def _on_browse_folder(self, _handle=None, _ev=None, _args=None):
+        path = lf.ui.open_dataset_folder_dialog()
+        if path:
+            self._set_source_path(path)
+            self._source_probe_due = 0.0
+            self._start_source_probe()
+
+    def _on_browse_file(self, _handle=None, _ev=None, _args=None):
+        path = lf.ui.open_ply_file_dialog("")
+        if path:
+            self._set_source_path(path)
+            self._source_probe_due = 0.0
+            self._start_source_probe()
+
+    def _on_do_create(self, _handle=None, _ev=None, _args=None):
+        if not self._can_create():
             return
 
-        dataset_path = self._dataset_path.strip()
+        source_path = self._source_path.strip()
+        source_kind = self._source_kind
+        target = self._target_path()
         init_path = self._init_path.strip()
         ppisp_sidecar_path = self._ppisp_sidecar_path.strip()
         centralize_dataset = self._centralize_dataset
+        max_width = self._max_width
+        apply_auto_crop = self._apply_auto_crop
+        min_track_length = self._min_track_length
+        embed_dataset = self._embed_dataset
+        images_folder = ""
+        if source_kind == "dataset" and self._dataset_info is not None:
+            images_folder = str(Path(self._dataset_info.images_path).relative_to(
+                Path(self._dataset_info.base_path)))
 
-        params = lf.optimization_params()
-        if params and params.has_params():
-            params.ppisp_sidecar_path = ppisp_sidecar_path
-            params.ppisp_freeze_from_sidecar = bool(ppisp_sidecar_path)
-            if ppisp_sidecar_path:
-                params.ppisp = True
+        def _commit(stop_training: bool, overwrite: bool) -> None:
+            if (
+                not self._name_is_valid()
+                or self._source_kind not in {"blank", "dataset", "splat"}
+                or self._target_path() != target
+            ):
+                self._dirty_model()
+                return
+            if self._destination_exists() and not overwrite:
+                self._confirm_overwrite(lambda: _commit(stop_training, True))
+                return
+            # Creation captures panel state; the command dialog must be closed.
+            self._dialog_requested = False
+            lf.ui.set_panel_enabled(self.id, False)
+            try:
+                created = lf.project_create(
+                    str(target),
+                    discard_changes=True,
+                    stop_training=stop_training,
+                    overwrite=overwrite,
+                )
+            except Exception:
+                self._dialog_requested = True
+                lf.ui.set_panel_enabled(self.id, True)
+                raise
+            pending = bool(
+                getattr(lf, "project_create_pending", lambda: False)()
+            )
+            if created is False and not pending:
+                self._dialog_requested = True
+                lf.ui.set_panel_enabled(self.id, True)
+                if self._destination_exists() and not overwrite:
+                    self._confirm_overwrite(lambda: _commit(stop_training, True))
+                    return
+                self._dirty_model()
+                return
+            params = lf.optimization_params()
+            if params and params.has_params():
+                params.ppisp_sidecar_path = ppisp_sidecar_path
+                params.ppisp_freeze_from_sidecar = bool(ppisp_sidecar_path)
+                if ppisp_sidecar_path:
+                    params.ppisp = True
 
-        lf.ui.set_panel_enabled(self.id, False)
-        register_catalog_asset_path(dataset_path, is_dataset=True, select=True)
-        lf.load_file(
-            dataset_path,
-            is_dataset=True,
-            output_path=self._output_path.strip(),
-            init_path=init_path,
-            centralize_dataset=centralize_dataset,
-            max_width=self._max_width,
-            apply_auto_crop=self._apply_auto_crop,
-        )
+            lf.ui.set_panel_enabled(self.id, False)
+            if source_kind == "dataset":
+                load_kwargs = {
+                    "path": source_path,
+                    "is_dataset": True,
+                    "images_folder": images_folder,
+                    "init_path": init_path,
+                    "centralize_dataset": centralize_dataset,
+                    "max_width": max_width,
+                    "apply_auto_crop": apply_auto_crop,
+                    "min_track_length": min_track_length,
+                    "discard_changes": True,
+                }
+                if stop_training:
+                    load_kwargs["stop_training"] = True
+                lf.load_file(**load_kwargs)
+                if embed_dataset:
+                    lf.project_embed_dataset()
+            elif source_kind == "splat":
+                lf.load_file(path=source_path, is_dataset=False, discard_changes=True)
+
+        def _after_consent(overwrite: bool) -> None:
+            confirm_discard_work_then(
+                lf.ui.tr("new_project.title"),
+                lambda stop_training: _commit(stop_training, overwrite),
+            )
+
+        if self._destination_exists():
+            self._confirm_overwrite(lambda: _after_consent(True))
+            return
+        _after_consent(False)
 
     def _on_do_cancel(self, _handle=None, _ev=None, _args=None):
+        self._dialog_requested = False
         lf.ui.set_panel_enabled(self.id, False)
 
+    def _on_do_load(self, _handle=None, _ev=None, _args=None):
+        self._on_do_create(_handle, _ev, _args)
 
+
+@panel_class("resume_checkpoint")
 class ResumeCheckpointPanel(_ImportDialogPanel):
     """Floating panel for configuring checkpoint resume paths."""
 
-    id = "lfs.resume_checkpoint"
-    label = "Resume Checkpoint"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 12
-    template = "rmlui/resume_checkpoint_panel.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
-    size = (580, 0)
     form_id = "resume-checkpoint-form"
 
     def __init__(self):
@@ -858,7 +949,7 @@ class ResumeCheckpointPanel(_ImportDialogPanel):
     def _checkpoint_metadata(self) -> str:
         if self._header is None:
             return ""
-        return f"(iter {int(self._header.iteration)}, {int(self._header.num_gaussians)} gaussians)"
+        return f"(iter {int(self._header.iteration):,}, {int(self._header.num_gaussians):,} gaussians)"
 
     def _stored_path_class(self) -> str:
         if self._stored_dataset_path and not self._stored_dataset_exists:
@@ -904,894 +995,23 @@ class ResumeCheckpointPanel(_ImportDialogPanel):
         if not self._dataset_valid or not self._checkpoint_path:
             return
 
-        lf.ui.set_panel_enabled(self.id, False)
-        register_catalog_asset_path(self._dataset_path, is_dataset=True)
-        register_catalog_asset_path(
-            self._checkpoint_path,
-            asset_type="checkpoint",
-            role="training_checkpoint",
-            select=True,
-        )
-        lf.load_checkpoint_for_training(
-            self._checkpoint_path,
-            self._dataset_path,
-            self._output_path,
+        checkpoint_path = self._checkpoint_path
+        dataset_path = self._dataset_path
+        output_path = self._output_path
+
+        def _commit(stop_training: bool) -> None:
+            del stop_training
+            lf.ui.set_panel_enabled(self.id, False)
+            lf.load_checkpoint_for_training(
+                checkpoint_path,
+                dataset_path,
+                output_path,
+            )
+
+        confirm_discard_work_then(
+            lf.ui.tr("resume_checkpoint_popup.title"),
+            _commit,
         )
 
     def _on_do_cancel(self, _handle=None, _ev=None, _args=None):
         lf.ui.set_panel_enabled(self.id, False)
-
-
-class URLImportPanel(_ImportDialogPanel):
-    """Floating panel for importing assets from URL-backed sources."""
-
-    id = "lfs.url_import"
-    label = "Import from URL"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 13
-    template = "rmlui/url_import_panel.rml"
-    height_mode = lf.ui.PanelHeightMode.FILL
-    size = (560, 360)
-    form_id = "url-import-form"
-
-    STORAGE_PATH = resolve_asset_manager_storage_path()
-
-    def __init__(self):
-        global _url_import_panel
-        _url_import_panel = self
-
-        self._handle = None
-        self._doc = None
-        self._last_lang = ""
-        self._url_import_url = ""
-        self._url_import_progress = -1.0
-        self._url_import_status = ""
-        self._url_import_warning = ""
-        self._url_import_in_progress = False
-        self._url_import_thread: Optional[threading.Thread] = None
-        self._url_import_cancelled = False
-        self._url_import_session_id = 0
-        self._url_import_close_timer: Optional[threading.Timer] = None
-        self._url_import_formats_open = False
-        self._formats_header = None
-        self._formats_arrow = None
-        self._formats_content = None
-
-    def on_mount(self, doc):
-        super().on_mount(doc)
-        self._doc = doc
-        self._formats_header = doc.get_element_by_id("url-import-formats-header")
-        self._formats_arrow = doc.get_element_by_id("url-import-formats-arrow")
-        self._formats_content = doc.get_element_by_id("url-import-formats-content")
-        self._sync_formats_ui()
-
-    def on_unmount(self, doc):
-        self._unsubscribe_reactive_state()
-        # Cancel any in-progress download before unmounting
-        if self._url_import_in_progress and not self._url_import_cancelled:
-            self._url_import_cancelled = True
-        self._cancel_url_import_close_timer()
-        _join_thread(self._url_import_close_timer, "URL import close timer")
-        self._url_import_close_timer = None
-        url_import_thread = self._url_import_thread
-        self._url_import_thread = None
-        _join_thread(url_import_thread, "URL import worker")
-        self._handle = None
-        self._doc = None
-        self._formats_header = None
-        self._formats_arrow = None
-        self._formats_content = None
-        doc.remove_data_model("url_import")
-
-    def on_bind_model(self, ctx):
-        model = ctx.create_data_model("url_import")
-        if model is None:
-            return
-
-        model.bind_func("panel_label", lambda: _tr("asset_manager.import_from_url"))
-        model.bind(
-            "url_import_url",
-            lambda: self._url_import_url,
-            self._set_url_import_url,
-        )
-        model.bind_func(
-            "url_import_progress",
-            lambda: str(
-                max(
-                    0.0,
-                    min(
-                        1.0,
-                        self._url_import_progress
-                        if self._url_import_progress >= 0.0
-                        else 0.0,
-                    ),
-                )
-            ),
-        )
-        model.bind_func("url_import_status", lambda: self._url_import_status)
-        model.bind_func("url_import_warning_text", lambda: self._url_import_warning)
-        model.bind_func("url_import_has_warning", lambda: bool(self._url_import_warning))
-        model.bind_func(
-            "url_import_show_progress",
-            lambda: self._url_import_in_progress or bool(self._url_import_status),
-        )
-        model.bind_func(
-            "url_import_show_progress_bar",
-            lambda: self._url_import_in_progress
-            and self._url_import_progress >= 0.0
-            and not self._url_import_cancelled,
-        )
-        model.bind_func(
-            "url_import_button_enabled",
-            lambda: not self._url_import_in_progress and bool(self._url_import_url.strip()),
-        )
-        model.bind_func(
-            "url_import_button_text",
-            lambda: _tr("asset_manager.import_button_downloading")
-            if self._url_import_in_progress
-            else _tr("asset_manager.import_button"),
-        )
-
-        model.bind_event("toggle_formats", self._on_toggle_formats)
-        model.bind_event("do_load", self._on_do_load)
-        model.bind_event("do_cancel", self._on_do_cancel)
-
-        self._handle = model.get_handle()
-
-    def on_update(self, doc):
-        del doc
-        current_lang = lf.ui.get_current_language()
-        if current_lang != self._last_lang:
-            self._last_lang = current_lang
-            self._dirty_model()
-            return True
-        return False
-
-    def show(self) -> bool:
-        self._reset_state()
-        self._dirty_model()
-        self._sync_formats_ui()
-        lf.ui.set_panel_enabled(self.id, True)
-        return True
-
-    def _can_submit_from_keyboard(self) -> bool:
-        return not self._url_import_in_progress and bool(self._url_import_url.strip())
-
-    def _dirty_model(self, *fields):
-        if not self._handle:
-            return
-        if not fields:
-            self._handle.dirty_all()
-            return
-        for field in fields:
-            self._handle.dirty(field)
-
-    def _set_url_import_url(self, value):
-        next_value = str(value)
-        if next_value == self._url_import_url:
-            return
-        self._url_import_url = next_value
-        self._dirty_model("url_import_url", "url_import_button_enabled")
-
-    def _cancel_url_import_close_timer(self) -> None:
-        if self._url_import_close_timer is None:
-            return
-        self._url_import_close_timer.cancel()
-
-    def _schedule_close(self, session_id: int) -> None:
-        self._cancel_url_import_close_timer()
-        self._url_import_close_timer = threading.Timer(
-            1.0,
-            lambda: self._close_panel_after_success(session_id),
-        )
-        self._url_import_close_timer.start()
-
-    def _close_panel_after_success(self, session_id: int) -> None:
-        if session_id != self._url_import_session_id:
-            return
-        self._reset_state()
-        self._dirty_model()
-        refresh_active_panel()
-        lf.ui.set_panel_enabled(self.id, False)
-
-    def _on_toggle_formats(self, _handle=None, _ev=None, _args=None):
-        self._url_import_formats_open = not self._url_import_formats_open
-        self._sync_formats_ui()
-
-    def _sync_formats_ui(self) -> None:
-        if self._formats_header is not None:
-            self._formats_header.set_class("is-expanded", self._url_import_formats_open)
-        if self._formats_arrow is not None:
-            self._formats_arrow.set_class("is-expanded", self._url_import_formats_open)
-        if self._formats_content is not None:
-            self._formats_content.set_class("collapsed", not self._url_import_formats_open)
-
-    def _reset_state(self) -> None:
-        self._cancel_url_import_close_timer()
-        self._url_import_url = ""
-        self._url_import_progress = -1.0
-        self._url_import_status = ""
-        self._url_import_warning = ""
-        self._url_import_in_progress = False
-        self._url_import_cancelled = False
-        self._url_import_thread = None
-        self._url_import_formats_open = False
-
-    def _should_cancel(self, session_id: int) -> bool:
-        return self._url_import_cancelled or session_id != self._url_import_session_id
-
-    def _cleanup_destination(self, dest_dir: Optional[Path], created_dest_dir: bool) -> None:
-        if not dest_dir or not created_dest_dir:
-            return
-        try:
-            shutil.rmtree(dest_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-    def _resolve_catalog_context(self, index) -> tuple[Optional[str], Optional[str]]:
-        project_id = None
-        scene_id = None
-
-        panel = get_asset_manager_panel()
-        if panel is not None:
-            candidate_project = getattr(panel, "_selected_project_id", None)
-            candidate_scene = getattr(panel, "_selected_scene_id", None)
-            if candidate_project and candidate_project in index.projects:
-                project_id = candidate_project
-            if candidate_scene and candidate_scene in index.scenes:
-                scene = index.scenes[candidate_scene]
-                if project_id is None or scene.project_id == project_id:
-                    scene_id = candidate_scene
-                    project_id = project_id or scene.project_id
-
-        if project_id is None:
-            project = index.find_or_create_project("Default")
-            project_id = project.id if project is not None else None
-
-        return project_id, scene_id
-
-    def _strip_archive_suffix(self, name: str) -> str:
-        for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tar"):
-            if name.lower().endswith(suffix):
-                return name[:-len(suffix)]
-        return name
-
-    def _scan_and_register_asset(self, path: str, *, name: Optional[str] = None):
-        index = load_asset_index()
-        if index is None:
-            raise RuntimeError("Asset Manager backend is unavailable")
-
-        scanner = load_scanner()
-        thumbnails = load_thumbnails()
-        project_id, scene_id = self._resolve_catalog_context(index)
-        metadata_list = _discover_asset_metadata(scanner, path)
-        created_assets = _register_discovered_assets(
-            index,
-            thumbnails,
-            metadata_list,
-            project_id=project_id,
-            scene_id=scene_id,
-            name_override=self._strip_archive_suffix(name) if name else None,
-        )
-        if created_assets:
-            first_asset = created_assets[0]
-            panel = get_asset_manager_panel()
-            if panel is not None:
-                select_asset_in_active_panel(
-                    first_asset.id,
-                    project_id=first_asset.project_id,
-                    scene_id=first_asset.scene_id,
-                )
-            else:
-                refresh_active_panel()
-            return first_asset
-        return None
-
-    def _handle_download_error(self, title: str, message: str, session_id: int) -> None:
-        if session_id != self._url_import_session_id:
-            return
-        self._url_import_in_progress = False
-        self._url_import_progress = -1.0
-        self._url_import_status = ""
-        self._url_import_warning = f"{title}: {message}"
-        self._dirty_model(
-            "url_import_show_progress",
-            "url_import_show_progress_bar",
-            "url_import_progress",
-            "url_import_status",
-            "url_import_warning_text",
-            "url_import_has_warning",
-            "url_import_button_enabled",
-            "url_import_button_text",
-        )
-
-    def _download_url_worker(self, url: str, session_id: int) -> None:
-        dest_dir: Optional[Path] = None
-        created_dest_dir = False
-        try:
-            url_info = get_url_info(url)
-            asset_name = str(url_info.get("name") or "").strip() or "imported-asset"
-            asset_name = Path(asset_name).name or "imported-asset"
-
-            dest_dir = self.STORAGE_PATH / "assets" / asset_name
-            created_dest_dir = not dest_dir.exists()
-            dest_dir.mkdir(parents=True, exist_ok=True)
-
-            def on_progress(percent: float, status: str):
-                if self._should_cancel(session_id):
-                    raise InterruptedError("Download cancelled")
-                if session_id != self._url_import_session_id:
-                    return
-                self._url_import_progress = percent
-                self._url_import_status = status
-                self._dirty_model(
-                    "url_import_show_progress",
-                    "url_import_show_progress_bar",
-                    "url_import_progress",
-                    "url_import_status",
-                )
-
-            def on_warning(message: str):
-                if session_id != self._url_import_session_id:
-                    return
-                self._url_import_warning = message
-                self._dirty_model("url_import_warning_text", "url_import_has_warning")
-
-            downloaded_file = dest_dir / asset_name
-            download_url(
-                url,
-                downloaded_file,
-                on_progress=on_progress,
-                on_warning=on_warning,
-                should_cancel=lambda: self._should_cancel(session_id),
-            )
-
-            if self._should_cancel(session_id):
-                raise InterruptedError("Download cancelled")
-
-            self._url_import_progress = 0.0
-            self._url_import_status = _tr("asset_manager.status_extracting")
-            self._dirty_model(
-                "url_import_show_progress",
-                "url_import_show_progress_bar",
-                "url_import_progress",
-                "url_import_status",
-            )
-
-            extracted = False
-            try:
-                extract_archive(
-                    downloaded_file,
-                    dest_dir,
-                    on_progress=on_progress,
-                    should_cancel=lambda: self._should_cancel(session_id),
-                )
-                downloaded_file.unlink(missing_ok=True)
-                extracted = True
-            except ExtractError:
-                extracted = False
-
-            discovery_path = str(dest_dir) if extracted else str(downloaded_file)
-            self._scan_and_register_asset(discovery_path, name=asset_name)
-
-            if session_id != self._url_import_session_id:
-                return
-            self._url_import_in_progress = False
-            self._url_import_status = _tr("asset_manager.status_complete")
-            self._url_import_progress = 1.0
-            self._dirty_model(
-                "url_import_show_progress",
-                "url_import_show_progress_bar",
-                "url_import_status",
-                "url_import_progress",
-                "url_import_button_enabled",
-                "url_import_button_text",
-            )
-            self._schedule_close(session_id)
-
-        except URLDownloadError as exc:
-            self._cleanup_destination(dest_dir, created_dest_dir)
-            self._handle_download_error(_tr("asset_manager.error_download_failed"), str(exc), session_id)
-        except UnsupportedURLError as exc:
-            self._cleanup_destination(dest_dir, created_dest_dir)
-            self._handle_download_error(_tr("asset_manager.error_unsupported_url"), str(exc), session_id)
-        except ExtractError as exc:
-            self._cleanup_destination(dest_dir, created_dest_dir)
-            self._handle_download_error(_tr("asset_manager.error_extract_failed"), str(exc), session_id)
-        except InterruptedError:
-            self._cleanup_destination(dest_dir, created_dest_dir)
-            if session_id != self._url_import_session_id:
-                return
-            self._reset_state()
-            self._dirty_model()
-            lf.ui.set_panel_enabled(self.id, False)
-        except Exception as exc:
-            self._cleanup_destination(dest_dir, created_dest_dir)
-            self._handle_download_error(_tr("asset_manager.error_unknown"), str(exc), session_id)
-        finally:
-            if session_id == self._url_import_session_id:
-                self._url_import_thread = None
-
-    def _on_do_load(self, _handle=None, _ev=None, _args=None):
-        if self._url_import_in_progress:
-            return
-
-        url = self._url_import_url.strip()
-        if not url:
-            self._url_import_warning = _tr("asset_manager.error_empty_url")
-            self._dirty_model("url_import_warning_text", "url_import_has_warning")
-            return
-
-        try:
-            normalize_url(url)
-        except UnsupportedURLError as exc:
-            self._url_import_warning = _tr("asset_manager.error_unsupported_url")
-            self._dirty_model("url_import_warning_text", "url_import_has_warning")
-            return
-        except Exception as exc:
-            self._url_import_warning = str(exc)
-            self._dirty_model("url_import_warning_text", "url_import_has_warning")
-            return
-
-        self._cancel_url_import_close_timer()
-        self._url_import_session_id += 1
-        self._url_import_warning = ""
-        self._url_import_in_progress = True
-        self._url_import_cancelled = False
-        self._url_import_progress = 0.0
-        self._url_import_status = _tr("asset_manager.status_connecting")
-        self._dirty_model(
-            "url_import_warning_text",
-            "url_import_has_warning",
-            "url_import_show_progress",
-            "url_import_show_progress_bar",
-            "url_import_progress",
-            "url_import_status",
-            "url_import_button_enabled",
-            "url_import_button_text",
-        )
-
-        self._url_import_thread = threading.Thread(
-            target=self._download_url_worker,
-            args=(url, self._url_import_session_id),
-            daemon=True,
-        )
-        self._url_import_thread.start()
-
-    def _on_do_cancel(self, _handle=None, _ev=None, _args=None):
-        if not self._url_import_in_progress:
-            self._reset_state()
-            self._dirty_model()
-            lf.ui.set_panel_enabled(self.id, False)
-            return
-
-        if self._url_import_cancelled:
-            return
-
-        self._url_import_cancelled = True
-        self._url_import_status = _tr("asset_manager.status_cancelling")
-        self._dirty_model(
-            "url_import_show_progress",
-            "url_import_show_progress_bar",
-            "url_import_status",
-        )
-
-
-class WatchDirsDialogPanel(Panel):
-    """Floating panel for editing watched directories per project."""
-
-    id = "lfs.watch_dirs_dialog"
-    label = "Watched Directories"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 14
-    template = "rmlui/watch_dirs_dialog.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
-    size = (520, 0)
-    update_policy = "dirty"
-
-    def __init__(self):
-        global _watch_dirs_dialog_panel
-        _watch_dirs_dialog_panel = self
-
-        self._handle = None
-        self._project_id: Optional[str] = None
-        self._project_name: str = ""
-        self._watch_dirs: list[str] = []
-        self._shared_state_version: int = -1
-        self._last_lang: str = ""
-        self._scan_thread: Optional[threading.Thread] = None
-        self._scan_cancel_event = threading.Event()
-
-    def _sync_from_shared_state(self) -> None:
-        self._project_id = _watch_dirs_dialog_state.get("project_id")
-        self._project_name = str(_watch_dirs_dialog_state.get("project_name") or "")
-        self._watch_dirs = list(_watch_dirs_dialog_state.get("watch_dirs") or [])
-        self._shared_state_version = int(_watch_dirs_dialog_state.get("version") or 0)
-
-    def _publish_shared_state(self) -> None:
-        _set_watch_dirs_dialog_state(self._project_id, self._project_name, self._watch_dirs)
-        self._shared_state_version = int(_watch_dirs_dialog_state.get("version") or 0)
-
-    def on_mount(self, doc):
-        super().on_mount(doc)
-        self._last_lang = lf.ui.get_current_language()
-        self._subscribe_reactive_state()
-
-    def on_unmount(self, doc):
-        self._unsubscribe_reactive_state()
-        self._scan_cancel_event.set()
-        scan_thread = self._scan_thread
-        self._scan_thread = None
-        _join_thread(scan_thread, "AssetManagerWatch scan")
-        self._handle = None
-        doc.remove_data_model("watch_dirs_dialog")
-
-    def _subscribe_reactive_state(self):
-        if getattr(self, "_reactive_unsubscribers", None):
-            return
-
-        self._reactive_unsubscribers = [
-            RuntimeState.language_generation.subscribe(lambda _value: self._request_reactive_update()),
-        ]
-
-    def _unsubscribe_reactive_state(self):
-        for unsubscribe in getattr(self, "_reactive_unsubscribers", []):
-            try:
-                unsubscribe()
-            except Exception:
-                pass
-        self._reactive_unsubscribers = []
-
-    def _request_reactive_update(self):
-        if self._handle:
-            w.request_model_update(self._handle)
-
-    def on_bind_model(self, ctx):
-        model = ctx.create_data_model("watch_dirs_dialog")
-        if model is None:
-            return
-
-        model.bind_func("panel_label", self._panel_label)
-        model.bind_record_list("watch_dirs_list")
-        model.bind_func("no_watch_dirs", lambda: len(self._watch_dirs) == 0)
-        model.bind_event("on_browse_add", self._on_browse_add)
-        model.bind_event("on_remove_dir", self._on_remove_dir)
-        model.bind_event("on_cancel", self._on_cancel)
-        model.bind_event("on_save", self._on_save)
-        self._handle = model.get_handle()
-        self._sync_from_shared_state()
-        if self._handle:
-            self._handle.update_record_list(
-                "watch_dirs_list", [{"path": p} for p in self._watch_dirs]
-            )
-            self._handle.dirty_all()
-
-    def on_update(self, doc):
-        del doc
-        if self._shared_state_version != int(_watch_dirs_dialog_state.get("version") or 0):
-            self._sync_from_shared_state()
-            self._dirty_model()
-            return True
-        current_lang = lf.ui.get_current_language()
-        if current_lang != self._last_lang:
-            self._last_lang = current_lang
-            self._dirty_model()
-            return True
-        return False
-
-    def _catalog_index(self):
-        index = load_asset_index()
-        if index is None:
-            _watch_log("error", "catalog load failed")
-            return None
-
-        _watch_log(
-            "info",
-            "using fresh AssetIndex object_id=%s library=%s projects=%d assets=%d",
-            id(index),
-            _index_library_path(index),
-            _safe_count(getattr(index, "projects", {})),
-            _safe_count(getattr(index, "assets", {})),
-        )
-        return index
-
-    def _scanner(self):
-        panel = get_asset_manager_panel()
-        scanner = getattr(panel, "_asset_scanner", None) if panel is not None else None
-        if scanner is not None:
-            _watch_log("info", "using active panel scanner object_id=%s", id(scanner))
-            return scanner
-        scanner = load_scanner()
-        _watch_log(
-            "warn" if scanner is not None else "error",
-            "using fallback scanner object_id=%s",
-            id(scanner) if scanner is not None else "None",
-        )
-        return scanner
-
-    def _thumbnails(self):
-        panel = get_asset_manager_panel()
-        thumbnails = (
-            getattr(panel, "_asset_thumbnails", None) if panel is not None else None
-        )
-        if thumbnails is not None:
-            _watch_log("info", "using active panel thumbnails object_id=%s", id(thumbnails))
-            return thumbnails
-        thumbnails = load_thumbnails()
-        _watch_log(
-            "warn" if thumbnails is not None else "error",
-            "using fallback thumbnails object_id=%s",
-            id(thumbnails) if thumbnails is not None else "None",
-        )
-        return thumbnails
-
-    def show(self, project_id: str) -> bool:
-        try:
-            _watch_log("info", "show requested project_id=%s", project_id)
-            if not _load_watch_dirs_dialog_state(project_id):
-                return False
-            self._sync_from_shared_state()
-            _watch_log(
-                "info",
-                "show synced object_id=%s project_id=%s project_name=%s watch_dirs=%s",
-                id(self),
-                self._project_id,
-                self._project_name,
-                self._watch_dirs,
-            )
-            lf.ui.set_panel_enabled(self.id, True)
-            self._dirty_model()
-            return True
-        except Exception as e:
-            _watch_log("error", "failed to show watch dirs dialog: %s", e, exc_info=True)
-            return False
-
-    def _panel_label(self) -> str:
-        return f"Watched Directories — {self._project_name}"
-
-    def _dirty_model(self, *fields):
-        if not self._handle:
-            return
-        if not fields:
-            self._handle.update_record_list(
-                "watch_dirs_list", [{"path": p} for p in self._watch_dirs]
-            )
-            self._handle.dirty_all()
-            return
-        if "watch_dirs_list" in fields or not fields:
-            self._handle.update_record_list(
-                "watch_dirs_list", [{"path": p} for p in self._watch_dirs]
-            )
-        for field in fields:
-            self._handle.dirty(field)
-
-    def _on_browse_add(self, _handle=None, _ev=None, _args=None):
-        self._sync_from_shared_state()
-        path = lf.ui.open_dataset_folder_dialog()
-        if not path:
-            _watch_log("info", "browse add cancelled")
-            return
-        if path in self._watch_dirs:
-            _watch_log("info", "browse add ignored duplicate path=%s", path)
-            return
-        _watch_log("info", "browse add path=%s exists=%s", path, os.path.exists(path))
-        self._watch_dirs.append(path)
-        self._publish_shared_state()
-        self._dirty_model("watch_dirs_list", "no_watch_dirs")
-
-    def _on_remove_dir(self, _handle=None, _ev=None, args=None):
-        self._sync_from_shared_state()
-        if not args:
-            return
-        try:
-            idx = int(args[0])
-        except (ValueError, TypeError):
-            return
-        if 0 <= idx < len(self._watch_dirs):
-            self._watch_dirs.pop(idx)
-            self._publish_shared_state()
-            self._dirty_model("watch_dirs_list", "no_watch_dirs")
-
-    def _on_cancel(self, _handle=None, _ev=None, _args=None):
-        lf.ui.set_panel_enabled(self.id, False)
-
-    def _on_save(self, _handle=None, _ev=None, _args=None):
-        self._sync_from_shared_state()
-        _watch_log(
-            "info",
-            "save clicked object_id=%s project_id=%s watch_dirs=%s",
-            id(self),
-            self._project_id,
-            self._watch_dirs,
-        )
-        index = self._catalog_index()
-        if index is None or self._project_id is None:
-            _watch_log(
-                "error",
-                "save aborted index_is_none=%s project_id=%s",
-                index is None,
-                self._project_id,
-            )
-            lf.ui.set_panel_enabled(self.id, False)
-            return
-
-        project = index.get_project(self._project_id)
-        if project is None:
-            _watch_log(
-                "error",
-                "save aborted: project missing project_id=%s available=%s library=%s",
-                self._project_id,
-                list(getattr(index, "projects", {}).keys()),
-                _index_library_path(index),
-            )
-            return
-
-        _watch_log(
-            "info",
-            "persist start object_id=%s library=%s mtime=%s project_id=%s dirs=%s",
-            id(index),
-            _index_library_path(index),
-            _library_mtime(index),
-            self._project_id,
-            self._watch_dirs,
-        )
-
-        # Persist watch directories
-        if not index.set_watch_dirs(self._project_id, self._watch_dirs):
-            _watch_log(
-                "error",
-                "persist failed project_id=%s library=%s mtime=%s",
-                self._project_id,
-                _index_library_path(index),
-                _library_mtime(index),
-            )
-            return
-
-        _watch_log(
-            "info",
-            "persist complete object_id=%s library=%s mtime=%s dirs=%s",
-            id(index),
-            _index_library_path(index),
-            _library_mtime(index),
-            index.get_watch_dirs(self._project_id),
-        )
-        refresh_active_panel()
-        _watch_log("info", "active panel refresh requested after watch-dir save")
-
-        # Close dialog immediately and run scan in background thread
-        lf.ui.set_panel_enabled(self.id, False)
-
-        scanner = self._scanner()
-        thumbnails = self._thumbnails()
-        self._scan_cancel_event = threading.Event()
-        thread = threading.Thread(
-            target=self._scan_worker,
-            args=(
-                index,
-                scanner,
-                thumbnails,
-                self._project_id,
-                list(self._watch_dirs),
-                self._scan_cancel_event,
-            ),
-            daemon=True,
-            name="AssetManagerWatchScan",
-        )
-        self._scan_thread = thread
-        thread.start()
-        _watch_log(
-            "info",
-            "scan thread started name=%s ident=%s index_object_id=%s",
-            thread.name,
-            thread.ident,
-            id(index),
-        )
-
-    def _scan_worker(
-        self,
-        index,
-        scanner,
-        thumbnails,
-        project_id: str,
-        watch_dirs: list[str],
-        cancel_event: Optional[threading.Event] = None,
-    ):
-        """Background thread: scan watched directories and import new assets."""
-        _watch_log(
-            "info",
-            "scan worker start index_object_id=%s library=%s scanner=%s thumbnails=%s project_id=%s dirs=%s",
-            id(index) if index is not None else "None",
-            _index_library_path(index) if index is not None else "<none>",
-            id(scanner) if scanner is not None else "None",
-            id(thumbnails) if thumbnails is not None else "None",
-            project_id,
-            watch_dirs,
-        )
-        if index is None:
-            index = load_asset_index()
-        if index is None or scanner is None:
-            _watch_log(
-                "error",
-                "scan worker aborted index_is_none=%s scanner_is_none=%s",
-                index is None,
-                scanner is None,
-            )
-            return
-
-        added = 0
-        discovered = 0
-        for path in watch_dirs:
-            if cancel_event is not None and cancel_event.is_set():
-                _watch_log(
-                    "info",
-                    "scan worker cancelled before path=%s project_id=%s",
-                    path,
-                    project_id,
-                )
-                return
-            try:
-                metadata_list = _discover_asset_metadata(scanner, path)
-                discovered += len(metadata_list)
-                if not metadata_list:
-                    _watch_log("info", "no importable assets found path=%s", path)
-                    continue
-                created_assets = _register_discovered_assets(
-                    index,
-                    thumbnails,
-                    metadata_list,
-                    project_id=project_id,
-                )
-                added += len(created_assets)
-            except Exception as e:
-                _watch_log(
-                    "warn",
-                    "failed to scan watched directory path=%s error=%s",
-                    path,
-                    e,
-                    exc_info=True,
-                )
-
-        try:
-            if cancel_event is not None and cancel_event.is_set():
-                _watch_log(
-                    "info",
-                    "scan worker cancelled before final save project_id=%s discovered=%d added=%d",
-                    project_id,
-                    discovered,
-                    added,
-                )
-                return
-            if added > 0:
-                if index.save():
-                    _watch_log(
-                        "info",
-                        "scan save complete discovered=%d added=%d library=%s mtime=%s",
-                        discovered,
-                        added,
-                        _index_library_path(index),
-                        _library_mtime(index),
-                    )
-                else:
-                    _watch_log(
-                        "error",
-                        "scan save failed discovered=%d added=%d library=%s mtime=%s",
-                        discovered,
-                        added,
-                        _index_library_path(index),
-                        _library_mtime(index),
-                    )
-            else:
-                _watch_log(
-                    "info",
-                    "scan complete with no new assets discovered=%d added=%d library=%s",
-                    discovered,
-                    added,
-                    _index_library_path(index),
-                )
-            refresh_active_panel()
-            _watch_log("info", "active panel refresh requested after scan")
-        except Exception as e:
-            _watch_log("error", "failed to finalize watch-dir scan: %s", e, exc_info=True)
-        finally:
-            if self._scan_thread is threading.current_thread():
-                self._scan_thread = None

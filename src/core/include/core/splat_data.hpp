@@ -4,15 +4,20 @@
 
 #pragma once
 
+#include "core/error.hpp"
 #include "core/export.hpp"
+#include "core/mapped_file.hpp"
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
 
 #include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
-#include <glm/fwd.hpp>
+#include <glm/glm.hpp>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,6 +31,148 @@ namespace lfs::core {
     namespace param {
         struct TrainingParameters;
     }
+
+    // Per-node tree metadata in the exact layouts the GPU traversal consumes.
+    struct NodeBoundsRecord {
+        float x = 0.0f, y = 0.0f, z = 0.0f, size = 0.0f;
+    };
+    struct NodeLinksRecord {
+        uint32_t child_start = 0;
+        // child_count:16 | level:8 | flags:8 (bit0 leaf, bit1 root, bit2 lodOpacity)
+        uint32_t packed = 0;
+        uint32_t parent = 0xFFFFFFFFu;
+        uint32_t logical = 0xFFFFFFFFu;
+
+        [[nodiscard]] uint32_t childCount() const { return packed & 0xffffu; }
+        [[nodiscard]] uint32_t level() const { return (packed >> 16u) & 0xffu; }
+    };
+    static_assert(sizeof(NodeBoundsRecord) == 16);
+    static_assert(sizeof(NodeLinksRecord) == 16);
+
+    // On-disk .rad.meta sidecar records (20 B/node): bounds quantized against
+    // a per-chunk frame so 1B-leaf trees fit a ~34 GB cache. Centers are u16
+    // against the chunk AABB (error ≤ extent/65535); sizes are u16 over the
+    // chunk's log-size range (relative error ≤ range/65535).
+    struct RadMetaBoundsQ {
+        uint16_t qx = 0, qy = 0, qz = 0, qsize = 0;
+    };
+    struct RadMetaLinksQ {
+        uint32_t child_start = 0;
+        // Same encoding as NodeLinksRecord::packed; logical is derived as
+        // chunk * kChunkSplats + offset at expansion time.
+        uint32_t packed = 0;
+        uint32_t parent = 0xFFFFFFFFu;
+    };
+    // Per-chunk payload range + dequantization frame (sidecar chunk table).
+    struct RadMetaChunkRecord {
+        uint64_t payload_offset = 0;
+        uint64_t payload_bytes = 0;
+        float bbox_min[3] = {0.0f, 0.0f, 0.0f};
+        float bbox_extent[3] = {0.0f, 0.0f, 0.0f};
+        float log_size_min = 0.0f;
+        float log_size_range = 0.0f;
+
+        [[nodiscard]] glm::vec3 dequantCenter(const RadMetaBoundsQ& q) const {
+            constexpr float kInv = 1.0f / 65535.0f;
+            return {bbox_min[0] + static_cast<float>(q.qx) * kInv * bbox_extent[0],
+                    bbox_min[1] + static_cast<float>(q.qy) * kInv * bbox_extent[1],
+                    bbox_min[2] + static_cast<float>(q.qz) * kInv * bbox_extent[2]};
+        }
+        [[nodiscard]] float dequantSize(const RadMetaBoundsQ& q) const {
+            constexpr float kInv = 1.0f / 65535.0f;
+            return std::exp(log_size_min + static_cast<float>(q.qsize) * kInv * log_size_range);
+        }
+    };
+    static_assert(sizeof(RadMetaBoundsQ) == 8);
+    static_assert(sizeof(RadMetaLinksQ) == 12);
+    static_assert(sizeof(RadMetaChunkRecord) == 48);
+
+    struct SplatLodTree {
+        static constexpr std::size_t kChunkSplats = 2'048;
+        static constexpr uint32_t kInvalidPage = 0xFFFFFFFFu;
+
+        struct ChunkFileRange {
+            uint64_t file_offset = 0;
+            uint64_t file_bytes = 0;
+            uint64_t payload_offset = 0;
+            uint64_t payload_bytes = 0;
+            uint64_t file_base = 0;
+            uint64_t file_count = 0;
+            uint64_t base = 0;
+            uint64_t count = 0;
+        };
+
+        struct RadSource {
+            std::filesystem::path path;
+            uint32_t chunk_size = static_cast<uint32_t>(kChunkSplats);
+            uint64_t metadata_bytes = 0;
+            std::vector<ChunkFileRange> chunks;
+
+            [[nodiscard]] bool valid() const { return !path.empty() && !chunks.empty(); }
+        };
+
+        // Memory-mapped per-node metadata from a .rad.meta sidecar; replaces
+        // the in-RAM vectors for out-of-core models (23 B/node does not scale
+        // to billions of nodes). Copies share the mapping.
+        struct NodeMetaView {
+            std::shared_ptr<MappedFile> file;
+            const RadMetaBoundsQ* bounds = nullptr;
+            const RadMetaLinksQ* links = nullptr;
+            const RadMetaChunkRecord* chunks = nullptr;
+            std::size_t node_count = 0;
+            std::size_t chunk_count = 0;
+            std::size_t leaf_count = 0;
+
+            [[nodiscard]] bool valid() const {
+                return file != nullptr && bounds != nullptr && links != nullptr &&
+                       chunks != nullptr && node_count > 0;
+            }
+            [[nodiscard]] const RadMetaChunkRecord& chunkOf(const std::size_t node) const {
+                return chunks[node / kChunkSplats];
+            }
+        };
+
+        std::vector<uint16_t> child_count;
+        std::vector<uint32_t> child_start;
+        std::vector<uint8_t> lod_level;
+        std::vector<glm::vec3> centers;
+        std::vector<float> sizes;
+        std::vector<uint32_t> page_to_chunk;
+        std::vector<uint32_t> chunk_to_page;
+        RadSource rad_source;
+        NodeMetaView meta_view;
+        bool lod_opacity_encoded = false;
+
+        size_t total_nodes() const {
+            return meta_view.valid() ? meta_view.node_count : child_count.size();
+        }
+        size_t chunk_count() const { return (total_nodes() + kChunkSplats - 1) / kChunkSplats; }
+        bool has_tree() const { return total_nodes() > 0; }
+        // True when the per-node vectors are materialized in RAM (legacy and
+        // in-core models); false when only the sidecar view backs the tree.
+        bool nodes_in_memory() const { return !child_count.empty(); }
+
+        [[nodiscard]] uint32_t child_start_at(const std::size_t i) const {
+            return meta_view.valid() ? meta_view.links[i].child_start : child_start[i];
+        }
+        [[nodiscard]] uint16_t child_count_at(const std::size_t i) const {
+            return meta_view.valid() ? static_cast<uint16_t>(meta_view.links[i].packed & 0xffffu)
+                                     : child_count[i];
+        }
+        [[nodiscard]] uint8_t level_at(const std::size_t i) const {
+            return meta_view.valid()
+                       ? static_cast<uint8_t>((meta_view.links[i].packed >> 16u) & 0xffu)
+                       : (i < lod_level.size() ? lod_level[i] : 0);
+        }
+        [[nodiscard]] glm::vec3 center_at(const std::size_t i) const {
+            return meta_view.valid() ? meta_view.chunkOf(i).dequantCenter(meta_view.bounds[i])
+                                     : centers[i];
+        }
+        [[nodiscard]] float size_at(const std::size_t i) const {
+            return meta_view.valid() ? meta_view.chunkOf(i).dequantSize(meta_view.bounds[i])
+                                     : sizes[i];
+        }
+    };
 
     using SplatTensorAllocator = std::function<Tensor(TensorShape shape,
                                                       size_t capacity,
@@ -51,6 +198,11 @@ namespace lfs::core {
             Swizzled
         };
 
+        struct FrozenRange {
+            std::size_t start = 0;
+            std::size_t count = 0;
+        };
+
         SplatData() = default;
         ~SplatData();
 
@@ -73,6 +225,16 @@ namespace lfs::core {
                   float scene_scale,
                   ShNLayout shN_layout = ShNLayout::Canonical);
 
+        // Deep-copies scalars and tensors, including q16 bounds. Skips allocator,
+        // capacity hook, LOD tree, frozen ranges, and layout generation.
+        [[nodiscard]] SplatData clone() const;
+
+        // Deep-copy tensor state onto an already-created CUDA stream. Device
+        // copies remain ordered on `stream`; callers synchronize before using
+        // the returned snapshot from another thread. CPU tensors are copied
+        // synchronously because they do not participate in CUDA transfers.
+        [[nodiscard]] SplatData clone_async(cudaStream_t stream) const;
+
         // ========== Computed getters ==========
         Tensor get_means() const;
         Tensor get_opacity() const;  // Returns sigmoid(opacity_raw)
@@ -84,6 +246,7 @@ namespace lfs::core {
         int get_active_sh_degree() const { return _active_sh_degree; }
         int get_max_sh_degree() const { return _max_sh_degree; }
         float get_scene_scale() const { return _scene_scale; }
+        void set_scene_scale(float scene_scale) { _scene_scale = scene_scale; }
         unsigned long size() const { return static_cast<unsigned long>(_means.shape()[0]); }
 
         // ========== Raw tensor access (for optimization) ==========
@@ -116,13 +279,59 @@ namespace lfs::core {
         inline Tensor& shN_raw() { return _shN; }
         inline const Tensor& shN_raw() const { return _shN; }
 
+        // float2 bounds per 256-splat block when SH value quant is ON.
+        inline Tensor& shN_value_bounds() { return _shN_value_bounds; }
+        inline const Tensor& shN_value_bounds() const { return _shN_value_bounds; }
+        // q16 pad-dropped codes: Float16 bit-patterns + per-block bounds.
+        // IEEE f16 float4-swizzle (exportable viewer path) is also Float16 but has
+        // no bounds — do not treat it as q16.
+        [[nodiscard]] bool shN_value_quantized() const {
+            return _shN.is_valid() && _shN.dtype() == DataType::Float16 &&
+                   _shN_value_bounds.is_valid() && _shN_value_bounds.numel() > 0;
+        }
+        // IEEE half float4-swizzle (same topology as fp32, 2 B/component). Used by
+        // the GUI exportable block so the Vulkan viewer can zero-copy bind half SH.
+        [[nodiscard]] bool shN_ieee_f16() const {
+            return _shN.is_valid() && _shN.dtype() == DataType::Float16 && !shN_value_quantized();
+        }
+
+        // Non-SH display attrs (rotation / log-scale / logit opacity) as IEEE f16.
+        // Means stay Float32. Used by the viewer layout when a path stores half
+        // attrs (lodq pool / future exportable packing). Training exportable
+        // currently keeps these as Float32 and zero-copies them into the viewport.
+        [[nodiscard]] bool non_sh_attrs_f16() const {
+            return _rotation.is_valid() && _rotation.dtype() == DataType::Float16 &&
+                   _scaling.is_valid() && _scaling.dtype() == DataType::Float16 &&
+                   _opacity.is_valid() && _opacity.dtype() == DataType::Float16;
+        }
+
         // Materialise a deswizzled [N, K, 3] copy of resident shN storage where
         // K = sh_rest_coeffs of the max SH degree. Always allocates a new tensor — not a view.
+        // When quantized, dequants to fp32 first (PLY/checkpoint bit-compat).
         Tensor shN_canonical() const;
 
         // Host-side variant for export/checkpoint paths. Copies the resident swizzled buffer
         // to CPU first and unpacks there, avoiding a full canonical SH allocation on CUDA.
         Tensor shN_canonical_cpu() const;
+
+        // Decode selected rows of compact q16 / IEEE-f16 SH directly into a host-side
+        // canonical tensor. Row indices must be a rank-1 CPU integer tensor.
+        Tensor shN_canonical_cpu_rows(const Tensor& row_indices) const;
+
+        // Host-side variant for export paths. When resident q16/IEEE-f16 SH is on CUDA,
+        // decode it in bands directly into canonical [N, K, 3] host output memory.
+        Tensor shN_canonical_cpu_gpu_decoded() const;
+
+        // Host-side PLY variant. Copies/dequantizes resident SH storage directly into the
+        // final [N, 3*K] channel-major PLY rest layout, avoiding canonical unpack + transpose.
+        Tensor shN_ply_rest_cpu() const;
+
+        // Clone resident SH storage while retaining capacity headroom required by q16.
+        [[nodiscard]] Tensor clone_shN_storage() const;
+
+        // Synchronize every unique non-null CUDA home stream, then re-home all valid CUDA
+        // tensor members onto the default stream. Call before a trainer destroys its streams.
+        void detach_from_streams();
 
         // Replace _shN with the swizzled form of a canonical-layout source tensor.
         // `canonical` may be [N, K, 3] or [N, K*3]; K may be 0 for SH degree 0. The
@@ -150,12 +359,38 @@ namespace lfs::core {
         [[nodiscard]] std::size_t deleted_count() const {
             return _deleted_count.load(std::memory_order_relaxed);
         }
+        [[nodiscard]] std::uint64_t deleted_mask_version() const {
+            return _deleted_mask_version.load(std::memory_order_relaxed);
+        }
         void refresh_deleted_count();
 
-        // Mark gaussians as deleted, returns previous state for undo
+        [[nodiscard]] const std::vector<FrozenRange>& frozen_ranges() const { return _frozen_ranges; }
+        [[nodiscard]] bool has_frozen_ranges() const { return !_frozen_ranges.empty(); }
+        void set_frozen_ranges(std::vector<FrozenRange> ranges) { _frozen_ranges = std::move(ranges); }
+        void clear_frozen_ranges() { _frozen_ranges.clear(); }
+        void remap_frozen_ranges_after_keep(size_t old_size, const std::vector<int>& kept_old_indices);
+        void remap_frozen_ranges_after_keep(size_t old_size, const std::vector<int64_t>& kept_old_indices);
+
+        // Mark gaussians as deleted, returns newly deleted mask for undo
         Tensor soft_delete(const Tensor& mask);
         void undelete(const Tensor& mask);
         void clear_deleted();
+
+        // VkSplat (and other consumers) require: if a deleted mask is present it
+        // must be a contiguous CUDA bool tensor of numel == size(). Call this
+        // after any N-mutating path (densify grow, compact, load, random_choose)
+        // that may have left the mask stale. Legal outcomes:
+        //   - mask matches the contract (possibly rebuilt / resized in place)
+        //   - mask cleared (has_deleted_mask()==false)
+        // Bumps deleted_mask_version() when the mask storage or content changes.
+        void reconcile_deleted_mask();
+
+        // True when has_deleted_mask() and the packer contract holds.
+        [[nodiscard]] bool deleted_mask_matches_size() const;
+
+        // Bump deleted_mask_version after external writers replace/mutate
+        // deleted() storage (strategies, compact gathers, exportable rebind).
+        void notify_deleted_mask_changed();
 
         // Permanently remove deleted gaussians (compacts data)
         // Returns number of gaussians removed
@@ -167,13 +402,31 @@ namespace lfs::core {
 
         // ========== SH degree management ==========
         void increment_sh_degree();
+        // Non-q16 shN verify/resize shared by degree setters (fail-loud on
+        // unclassifiable Float16 storage). Internal maintenance helper.
+        void verify_or_resize_non_q16_shN(size_t n, size_t cap, uint32_t layout_rest);
         void set_active_sh_degree(int sh_degree);
+        // Attach optional q16 bounds, then set the active SH degree.
+        // Reconstruct/migrate paths that copy pad-dropped codes must pass the
+        // bounds so the tripwire never sees codes without them (#1616, #1678).
+        void set_active_sh_degree(int sh_degree, Tensor shN_value_bounds);
         void set_max_sh_degree(int sh_degree);
         bool set_sh_degree(int sh_degree);
 
         // ========== Serialization ==========
         void serialize(std::ostream& os) const;
         void deserialize(std::istream& is, SplatTensorAllocator tensor_allocator = {});
+        // Advance `is` by one serialized SplatData without allocating tensors.
+        // Leaves the stream at the same position deserialize() would.
+        static void skip_serialized(std::istream& is);
+
+        [[nodiscard]] static lfs::Result<std::unique_ptr<SplatData>>
+        from_raw_tensors(int active_sh_degree, int max_sh_degree,
+                         float scene_scale, Tensor means, Tensor sh0,
+                         Tensor shN_canonical, Tensor scaling, Tensor rotation,
+                         Tensor opacity, Tensor deleted, Tensor densification,
+                         std::vector<FrozenRange> frozen_ranges,
+                         SplatTensorAllocator tensor_allocator = {});
 
         // Allocator used to back the parameter tensors (e.g. Vulkan-external interop
         // storage). Retained so edits that rebuild tensors (apply_deleted) can keep
@@ -182,20 +435,93 @@ namespace lfs::core {
         void set_tensor_allocator(SplatTensorAllocator allocator) {
             _tensor_allocator = std::move(allocator);
         }
+        [[nodiscard]] bool has_tensor_allocator() const noexcept {
+            return static_cast<bool>(_tensor_allocator);
+        }
+        // Allocate a named param tensor via the active backing allocator when set
+        // (exportable / Vulkan-external), otherwise zeros_direct. Used by SH q16
+        // encode to keep codes+bounds inside the exportable block.
+        [[nodiscard]] Tensor allocate_named_param(
+            const TensorShape& shape,
+            std::size_t capacity,
+            DataType dtype,
+            std::string_view name);
+
+        // Encode float/ieee-f16 shN into allocator-backed pad-dropped q16.
+        // No-op when already quantized, flag off, or shN empty.
+        [[nodiscard]] bool apply_shN_value_quant();
+
+        // Optional hook for exportable / external storage growth.
+        // When densification needs more rows than the committed exportable block,
+        // AdamOptimizer calls this before falling back to Tensor::cat (which would
+        // leave the Vulkan zero-copy path). Returns true if capacity >= needed.
+        using CapacityEnsureFn = std::function<bool(std::size_t needed_rows)>;
+        void set_capacity_ensure(CapacityEnsureFn fn) {
+            _capacity_ensure = std::move(fn);
+        }
+        // Full-model rebuilds must transfer and reinstall this hook. A fresh
+        // SplatData has none, so densification would otherwise abort when its
+        // committed capacity is exhausted.
+        [[nodiscard]] bool has_capacity_ensure() const noexcept {
+            return static_cast<bool>(_capacity_ensure);
+        }
+        [[nodiscard]] CapacityEnsureFn release_capacity_ensure() {
+            return std::move(_capacity_ensure);
+        }
+        // Bumped by rebindSplatData / exportable grow so densify code that holds
+        // Tensor& locals across ensure_param_capacity can detect invalidated
+        // references after a grow.
+        [[nodiscard]] std::uint64_t param_layout_generation() const noexcept {
+            return _param_layout_generation;
+        }
+        void note_param_layout_changed() noexcept {
+            ++_param_layout_generation;
+        }
+        // needed_rows growth hook. When layout_changed is non-null, sets it true
+        // iff the hook rebased parameter tensors (generation advanced). Callers
+        // that held Tensor& across the call MUST re-fetch via get_param / means_raw.
+        [[nodiscard]] bool ensure_param_capacity(std::size_t needed_rows,
+                                                 bool* layout_changed = nullptr) {
+            if (layout_changed) {
+                *layout_changed = false;
+            }
+            if (means_raw().is_valid() && means_raw().capacity() >= needed_rows) {
+                return true;
+            }
+            if (!_capacity_ensure) {
+                return false;
+            }
+            const std::uint64_t gen0 = _param_layout_generation;
+            const bool ok = _capacity_ensure(needed_rows);
+            if (layout_changed) {
+                *layout_changed = (_param_layout_generation != gen0);
+            }
+            return ok;
+        }
 
     public:
         // Holds the magnitude of the screen space gradient (used for densification)
         Tensor _densification_info;
+        // Per-splat max screen-share over the current refine window. [N] fp32.
+        Tensor _max_screen_share;
+
+        // Optional LOD tree (populated by RAD loader, null for training/non-RAD scenes)
+        std::unique_ptr<SplatLodTree> lod_tree;
 
     private:
         int _active_sh_degree = 0;
         int _max_sh_degree = 0;
         float _scene_scale = 0.f;
 
-        // Parameters
+        // Parameters — any new Tensor member must be added to detach_from_streams().
         Tensor _means;
         Tensor _sh0;
+        // When sh_value quant is ON: Float16 bit-pattern u16 codes,
+        // pad-dropped cell-linear layout (n_cells = coeffs_rest*3). When OFF: Float32
+        // float4-swizzled as before. Access via shN() / data_ptr(); do not assume dtype.
         Tensor _shN;
+        // float2 bounds per 256-splat block (only when quant ON); empty when fp32.
+        Tensor _shN_value_bounds;
         Tensor _scaling;
         Tensor _rotation;
         Tensor _opacity;
@@ -205,9 +531,16 @@ namespace lfs::core {
         // Cached nonzero count of _deleted; see refresh_deleted_count(). Atomic so
         // the render thread can read it without a data race on the writer.
         std::atomic<std::size_t> _deleted_count{0};
+        // Monotonic content revision for the soft-delete mask. The renderer uses
+        // this to refresh per-ring opacity copies when the mask is updated in place.
+        std::atomic<std::uint64_t> _deleted_mask_version{0};
 
         // Backing allocator for parameter tensors (see set_tensor_allocator).
         SplatTensorAllocator _tensor_allocator;
+        CapacityEnsureFn _capacity_ensure;
+        // Monotonic; advanced when exportable rebind rewrites param tensor VAs.
+        std::uint64_t _param_layout_generation = 0;
+        std::vector<FrozenRange> _frozen_ranges;
 
         // Allow free functions in splat_data_transform.cpp to access private members
         friend LFS_CORE_API SplatData& transform(SplatData&, const glm::mat4&);

@@ -1,15 +1,35 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cuda_runtime.h>
+#include <functional>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <numeric>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
 #include <vector>
 
+#include "core/logger.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 
 using namespace lfs::core;
+
+namespace {
+    // Streams that touched pool memory must be severed from the allocator
+    // before destruction (see CudaMemoryPool::release_stream).
+    void destroyStreamSafely(cudaStream_t stream) {
+        CudaMemoryPool::instance().release_stream(stream);
+        cudaStreamDestroy(stream);
+    }
+} // namespace
 
 class TensorStreamTest : public ::testing::Test {
 protected:
@@ -55,7 +75,7 @@ TEST_F(TensorStreamTest, FactoryPicksUpThreadLocalStream) {
     auto t2 = Tensor::empty({4, 4}, Device::CUDA);
     EXPECT_EQ(t2.stream(), nullptr);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, ViewInheritsStreamReshape) {
@@ -78,7 +98,7 @@ TEST_F(TensorStreamTest, ViewInheritsStreamReshape) {
     auto squeezed = unsqueezed.squeeze(0);
     EXPECT_EQ(squeezed.stream(), stream);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, ViewInheritsStreamSlice) {
@@ -95,7 +115,7 @@ TEST_F(TensorStreamTest, ViewInheritsStreamSlice) {
     auto sliced = t.slice(0, 0, 5);
     EXPECT_EQ(sliced.stream(), stream);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, ViewInheritsStreamPermute) {
@@ -115,7 +135,7 @@ TEST_F(TensorStreamTest, ViewInheritsStreamPermute) {
     auto transposed = t.transpose(0, 1);
     EXPECT_EQ(transposed.stream(), stream);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, OperationsProduceResultWithCorrectStream) {
@@ -144,7 +164,7 @@ TEST_F(TensorStreamTest, OperationsProduceResultWithCorrectStream) {
     auto e = c.sum();
     EXPECT_EQ(e.stream(), stream);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, EmptyLikeInheritsStream) {
@@ -164,7 +184,7 @@ TEST_F(TensorStreamTest, EmptyLikeInheritsStream) {
     auto flike = Tensor::full_like(t, 42.0f);
     EXPECT_EQ(flike.stream(), stream);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, StreamOrderingCorrectness) {
@@ -188,7 +208,7 @@ TEST_F(TensorStreamTest, StreamOrderingCorrectness) {
     EXPECT_NEAR(vals[0], 4.0f, 1e-5f);
     EXPECT_NEAR(vals.back(), 4.0f, 1e-5f);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, CrossStreamOrderingWithEventWait) {
@@ -220,8 +240,8 @@ TEST_F(TensorStreamTest, CrossStreamOrderingWithEventWait) {
     EXPECT_NEAR(vals.back(), 7.0f, 1e-5f);
 
     cudaEventDestroy(ready);
-    cudaStreamDestroy(consumer);
-    cudaStreamDestroy(producer);
+    destroyStreamSafely(consumer);
+    destroyStreamSafely(producer);
 }
 
 TEST_F(TensorStreamTest, SetStreamManual) {
@@ -237,7 +257,7 @@ TEST_F(TensorStreamTest, SetStreamManual) {
     t.set_stream(nullptr);
     EXPECT_EQ(t.stream(), nullptr);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, GuardRestoresPreviousStream) {
@@ -259,8 +279,8 @@ TEST_F(TensorStreamTest, GuardRestoresPreviousStream) {
 
     EXPECT_EQ(getCurrentCUDAStream(), nullptr);
 
-    cudaStreamDestroy(s1);
-    cudaStreamDestroy(s2);
+    destroyStreamSafely(s1);
+    destroyStreamSafely(s2);
 }
 
 TEST_F(TensorStreamTest, InplaceOpsUseOwnStream) {
@@ -293,7 +313,7 @@ TEST_F(TensorStreamTest, InplaceOpsUseOwnStream) {
     ASSERT_GT(vals.size(), 0u);
     EXPECT_NEAR(vals[0], 3.0f, 1e-5f);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, MaskedFillRespectsTensorStreamWithoutGuard) {
@@ -324,7 +344,7 @@ TEST_F(TensorStreamTest, MaskedFillRespectsTensorStreamWithoutGuard) {
     EXPECT_NEAR(vals.back(), 2.0f, 1e-5f);
 
     cudaEventDestroy(gate);
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, GatherRespectsTensorStreamWithoutGuard) {
@@ -359,7 +379,7 @@ TEST_F(TensorStreamTest, GatherRespectsTensorStreamWithoutGuard) {
     EXPECT_NEAR(vals.back(), 3.0f, 1e-5f);
 
     cudaEventDestroy(gate);
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, ToDeviceNonContiguousCpuToCudaRespectsExplicitStream) {
@@ -376,7 +396,8 @@ TEST_F(TensorStreamTest, ToDeviceNonContiguousCpuToCudaRespectsExplicitStream) {
 
     auto gpu = view.to(Device::CUDA, stream);
     EXPECT_EQ(gpu.stream(), stream);
-    EXPECT_EQ(view.stream(), stream);
+    // An async reader is an additional use, not a transfer of ownership.
+    EXPECT_EQ(view.stream(), nullptr);
 
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
     auto back = gpu.to(Device::CPU).to_vector();
@@ -385,7 +406,7 @@ TEST_F(TensorStreamTest, ToDeviceNonContiguousCpuToCudaRespectsExplicitStream) {
     EXPECT_FLOAT_EQ(back[4], 6.0f);
     EXPECT_FLOAT_EQ(back[11], 14.0f);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, ToDeviceCudaToCpuRespectsExplicitStreamMetadata) {
@@ -402,7 +423,7 @@ TEST_F(TensorStreamTest, ToDeviceCudaToCpuRespectsExplicitStreamMetadata) {
     EXPECT_NEAR(vals.front(), 2.0f, 1e-5f);
     EXPECT_NEAR(vals.back(), 2.0f, 1e-5f);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorStreamTest, DtypeConversionLaunchesOnCurrentResultStream) {
@@ -435,5 +456,236 @@ TEST_F(TensorStreamTest, DtypeConversionLaunchesOnCurrentResultStream) {
     EXPECT_EQ(cpu_ptr[kNumel - 1], static_cast<int>(kNumel - 1));
 
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
+}
+
+// Bool->UInt8 is a raw D2D copy. empty() reuse of a same-size cached block
+// calls bridgeStreams and would order the copy after the producer, masking a
+// missing convert-side wait. This test uses a unique size so the UInt8 dest
+// is a fresh cudaMallocAsync (no reuse-bridge), then races a default-stream
+// .to() against a fill still gated on a non-blocking producer stream.
+TEST_F(TensorStreamTest, BoolToUInt8OrderedAgainstGatedProducerStream) {
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    // Odd size unused elsewhere so the UInt8 dest misses the 8 MiB bucket cache.
+    constexpr size_t N = 7'340'033;
+
+    std::atomic<bool> gate_released{false};
+    const auto release_gate = [&gate_released]() {
+        gate_released.store(true, std::memory_order_release);
+    };
+    struct GateGuard {
+        std::atomic<bool>* released;
+        ~GateGuard() { released->store(true, std::memory_order_release); }
+    } gate_guard{&gate_released};
+
+    // Evict leftover same-bucket blocks so dest empty() cannot reuse-and-bridge.
+    CudaMemoryPool::instance().trim_cached_memory();
+
+    Tensor flags;
+    {
+        CUDAStreamGuard guard(stream);
+        flags = Tensor::empty({N}, Device::CUDA, DataType::Bool);
+        ASSERT_EQ(flags.stream(), stream);
+        ASSERT_EQ(flags.dtype(), DataType::Bool);
+
+        // Warm every in-place fill path this test will use; end at zeros.
+        // Stream-aware fill_ is required: the no-arg overload uses blocking
+        // H2D cudaMemcpy and would not enqueue on S.
+        flags.fill_(0.0f, stream);
+        flags.fill_(1.0f, stream);
+        flags.fill_(0.0f, stream);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        ASSERT_EQ(cudaLaunchHostFunc(
+                      stream,
+                      [](void* userData) {
+                          auto* released = static_cast<std::atomic<bool>*>(userData);
+                          while (!released->load(std::memory_order_acquire)) {
+                          }
+                      },
+                      &gate_released),
+                  cudaSuccess);
+
+        flags.fill_(1.0f, stream);
+        // Force any deferred materialization without allocating or syncing.
+        (void)flags.data_ptr();
+    }
+
+    const uint64_t cross_before =
+        SizeBucketedPool::instance().stats().cross_stream_reuse.load();
+    const uint64_t misses_before =
+        SizeBucketedPool::instance().stats().cache_misses.load();
+
+    std::atomic<bool> to_finished{false};
+    std::thread watchdog([&] {
+        using namespace std::chrono_literals;
+        for (int i = 0; i < 500; ++i) {
+            if (to_finished.load(std::memory_order_acquire)) {
+                return;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+        // Unstick a wait on S so a failed ASSERT cannot hang the process.
+        gate_released.store(true, std::memory_order_release);
+    });
+
+    Tensor bytes = flags.to(DataType::UInt8);
+    to_finished.store(true, std::memory_order_release);
+    watchdog.join();
+
+    const cudaError_t query = cudaStreamQuery(stream);
+    const char* query_name = (query == cudaSuccess)         ? "Success"
+                             : (query == cudaErrorNotReady) ? "NotReady"
+                                                            : cudaGetErrorName(query);
+    (void)cudaGetLastError();
+
+    const uint64_t cross_after =
+        SizeBucketedPool::instance().stats().cross_stream_reuse.load();
+    const uint64_t misses_after =
+        SizeBucketedPool::instance().stats().cache_misses.load();
+
+    release_gate();
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(bytes.stream()), cudaSuccess);
+
+    auto vals = bytes.to_vector_uint8();
+    ASSERT_EQ(vals.size(), N);
+    const size_t ones =
+        static_cast<size_t>(std::count(vals.begin(), vals.end(), uint8_t{1}));
+
+    std::cout << "BoolToUInt8OrderedAgainstGatedProducerStream: ones=" << ones
+              << " N=" << N << " query=" << query_name
+              << " cache_misses_delta=" << (misses_after - misses_before)
+              << " cross_stream_reuse_delta=" << (cross_after - cross_before)
+              << std::endl;
+
+    ASSERT_EQ(query, cudaErrorNotReady)
+        << "producer stream was already idle after .to(); test is not exercising "
+           "the gated window (watchdog may have released the gate)";
+    ASSERT_EQ(cross_after, cross_before)
+        << "UInt8 empty() reused a cross-stream pool block; bridgeStreams would "
+           "mask a missing convert-side wait";
+    ASSERT_EQ(ones, N)
+        << "Bool->UInt8 copy was not ordered after the gated producer fill";
+
+    destroyStreamSafely(stream);
+}
+
+// A busy default stream must not initialize a tensor after its owning stream
+// has already overwritten it (the GT preview's UInt8 vertical flip did this).
+TEST_F(TensorStreamTest, ConstantInitializationStaysOnNonBlockingStream) {
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    for (const auto dtype : {DataType::UInt8, DataType::Bool, DataType::Int32, DataType::Int64}) {
+        SCOPED_TRACE(static_cast<int>(dtype));
+        CUDAStreamGuard guard(stream);
+        {
+            auto warm = Tensor::zeros({4096}, Device::CUDA, dtype);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        }
+        std::atomic<bool> release{false};
+        ASSERT_EQ(cudaLaunchHostFunc(nullptr, [](void* data) {
+            auto& ready = *static_cast<std::atomic<bool>*>(data);
+            while (!ready.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            } }, &release), cudaSuccess);
+        std::jthread watchdog([&](std::stop_token stop) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            release.store(true, std::memory_order_release);
+        });
+        auto tensor = Tensor::zeros({4096}, Device::CUDA, dtype);
+        EXPECT_EQ(cudaMemsetAsync(tensor.data_ptr(), 0x7f, tensor.bytes(), stream), cudaSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        const bool gate_timed_out = release.load(std::memory_order_acquire);
+        release.store(true, std::memory_order_release);
+        watchdog.request_stop();
+        watchdog.join();
+        ASSERT_EQ(cudaStreamSynchronize(nullptr), cudaSuccess);
+        const auto cpu = tensor.cpu();
+        const auto* bytes = static_cast<const uint8_t*>(cpu.data_ptr());
+        EXPECT_FALSE(gate_timed_out) << "Factory waited on the unrelated default stream";
+        EXPECT_EQ(std::count(bytes, bytes + cpu.bytes(), uint8_t{0x7f}), cpu.bytes())
+            << "Late default-stream initialization overwrote the tensor";
+    }
+    destroyStreamSafely(stream);
+}
+
+TEST_F(TensorStreamTest, FusedSliceReductionOfStreamTensorWaitsForItsResult) {
+    constexpr size_t rows = 5'000'000;
+    cudaStream_t producer;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&producer, cudaStreamNonBlocking), cudaSuccess);
+    {
+        Tensor produced;
+        {
+            CUDAStreamGuard guard(producer);
+            produced = (Tensor::full({rows, 3}, 0.25f, Device::CUDA) +
+                        Tensor::from_vector({0.0f, -0.5f, 0.0f}, {1, 3}, Device::CUDA))
+                           .contiguous();
+        }
+        ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
+        const auto column_gap = [](const Tensor& value) {
+            const auto scaled = value * 0.5f + 0.5f;
+            return (scaled.slice(1, 1, 2).squeeze(1) - scaled.slice(1, 0, 1).squeeze(1)).mean().item<float>();
+        };
+        EXPECT_FLOAT_EQ(column_gap(Tensor::full({rows, 3}, 1.0f, Device::CUDA)), 0.0f);
+
+        // Hold the producer back so an unordered consumer reads unwritten memory.
+        ASSERT_EQ(cudaLaunchHostFunc(producer, [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }, nullptr), cudaSuccess);
+        EXPECT_FLOAT_EQ(column_gap(produced), -0.25f);
+    }
+    destroyStreamSafely(producer);
+}
+
+TEST_F(TensorStreamTest, EagerOpsOnStreamTensorWaitForItsProducer) {
+    constexpr size_t rows = 1'000'000;
+    cudaStream_t producer;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&producer, cudaStreamNonBlocking), cudaSuccess);
+    {
+        Tensor produced;
+        {
+            CUDAStreamGuard guard(producer);
+            produced = (Tensor::full({rows, 3}, 0.25f, Device::CUDA) + Tensor::zeros({rows, 3}, Device::CUDA)).contiguous();
+        }
+        ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
+        using Probe = std::function<float(const Tensor&)>;
+        const std::vector<std::tuple<const char*, Probe, float>> probes = {
+            {"to", [](const Tensor& v) { return (v * 4.0f).gt(1.5f).to(DataType::Float32).sum().item<float>(); }, 0.0f},
+            {"clamp", [](const Tensor& v) { return (v * 4.0f).clamp(0.0f, 0.5f).sum().item<float>(); }, 1.5e6f},
+            {"cat", [](const Tensor& v) { return Tensor::cat({v * 4.0f, v * 4.0f}, 0).sum().item<float>(); }, 6.0e6f},
+        };
+        for (const auto& [name, probe, expected] : probes) {
+            // Same expressions on other values first, so pooled buffers hold wrong results.
+            (void)probe(Tensor::full({rows, 3}, 0.6f, Device::CUDA));
+            // Hold the producer back so an unordered consumer reads unwritten memory.
+            ASSERT_EQ(cudaLaunchHostFunc(producer, [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }, nullptr), cudaSuccess);
+            EXPECT_FLOAT_EQ(probe(produced), expected) << name;
+        }
+    }
+    destroyStreamSafely(producer);
+}
+
+// Fails if moving an empty CUDA tensor to another stream asks the memory pool to rehome storage the pool never
+// allocated: the pool then logs a missed allocation.
+TEST_F(TensorStreamTest, EmptyTensorChangesStreamWithoutRehomingStorage) {
+    std::vector<std::string> warnings;
+    const auto token = Logger::get().add_log_handler(
+        [&warnings](const LogLevel level, const SourceSite&, const std::string_view message) {
+            if (level == LogLevel::Warn && message.find("rehome_stream missed") != std::string_view::npos)
+                warnings.emplace_back(message);
+        });
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    {
+        auto empty = Tensor::empty({0}, Device::CUDA, DataType::Int64);
+        empty.set_stream(stream);
+        EXPECT_EQ(empty.stream(), stream);
+    }
+    Logger::get().remove_log_handler(token);
+    destroyStreamSafely(stream);
+    EXPECT_TRUE(warnings.empty()) << warnings.front();
 }

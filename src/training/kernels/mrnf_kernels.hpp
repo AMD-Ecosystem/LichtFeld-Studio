@@ -7,6 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace lfs::training {
+    struct GumbelTopKScratch;
+} // namespace lfs::training
+
 namespace lfs::training::mrnf_strategy {
 
     struct MRNFBounds {
@@ -15,6 +19,37 @@ namespace lfs::training::mrnf_strategy {
         float median_size;
         float max_extent;
     };
+
+    void launch_replace_parent_weights(
+        const float* opacities,
+        const float* visibility,
+        const bool* active_mask,
+        const bool* trainable_mask,
+        const float* edge_guidance,
+        float* output,
+        size_t N,
+        void* stream = nullptr);
+
+    void launch_fused_exchange_ranks(
+        const int64_t* primary_order,
+        const int64_t* secondary_order,
+        const bool* eligible,
+        int32_t* ranks,
+        int64_t* row_indices,
+        size_t N,
+        void* stream = nullptr);
+
+    void launch_sort_exchange_ranks(
+        int32_t* ranks,
+        int64_t* row_indices,
+        size_t N,
+        void* stream = nullptr);
+
+    void launch_fill_index_mask(
+        const int64_t* indices,
+        size_t count,
+        bool* mask,
+        void* stream = nullptr);
 
     /**
      * Per-iteration exploration noise for low-opacity splats.
@@ -25,6 +60,8 @@ namespace lfs::training::mrnf_strategy {
      * @param means [N, 3] — positions (modified in-place)
      * @param raw_opacities [N] — raw opacity values
      * @param vis_count [N] — visibility counts (> 0 means visible)
+     * @param frozen_mask [N] — optional mask of rows that must not be modified
+     * @param frozen_mask_size — number of entries in frozen_mask
      * @param lr_mean — current mean learning rate
      * @param noise_weight — exploration noise multiplier
      * @param median_scale — clamp range for noise
@@ -36,6 +73,8 @@ namespace lfs::training::mrnf_strategy {
         float* means,
         const float* raw_opacities,
         const float* vis_count,
+        const bool* frozen_mask,
+        size_t frozen_mask_size,
         float lr_mean,
         float noise_weight,
         float median_scale,
@@ -51,6 +90,8 @@ namespace lfs::training::mrnf_strategy {
      *
      * @param raw_opacities [N] — raw opacities (modified in-place)
      * @param log_scales [N, 3] — log scales (modified in-place)
+     * @param frozen_mask [N] — optional mask of rows that must not be modified
+     * @param frozen_mask_size — number of entries in frozen_mask
      * @param opacity_decay — opacity decay rate
      * @param scale_decay — scale decay rate
      * @param train_t — current training progress [0, 1]
@@ -60,11 +101,14 @@ namespace lfs::training::mrnf_strategy {
     void launch_mrnf_decay(
         float* raw_opacities,
         float* log_scales,
+        const bool* frozen_mask,
+        size_t frozen_mask_size,
         float opacity_decay,
         float scale_decay,
         float train_t,
         size_t N,
-        void* stream = nullptr);
+        void* stream = nullptr,
+        const float* rendered_count = nullptr);
 
     /**
      * Compute percentile-based bounding box on GPU.
@@ -83,6 +127,14 @@ namespace lfs::training::mrnf_strategy {
         size_t N,
         float percentile,
         MRNFBounds* bounds,
+        void* stream = nullptr);
+
+    // Median of geomean(exp(scaling_raw)); out_valid is false when no usable extent remains.
+    void launch_median_geomean_extent(
+        const float* scaling_raw,
+        size_t N,
+        float* out_median,
+        bool* out_valid,
         void* stream = nullptr);
 
     /**
@@ -104,11 +156,27 @@ namespace lfs::training::mrnf_strategy {
         size_t K,
         uint64_t seed,
         int64_t* output_indices,
+        void* stream = nullptr,
+        bool compact_sparse = true,
+        lfs::training::GumbelTopKScratch* scratch = nullptr,
+        size_t known_nnz = 0);
+
+    // Row 0 is MRNF's persistent visibility count and must not be cleared.
+    // Fold row 1 into the persistent error maximum and clear only the row-1
+    // per-iteration scratch.
+    void launch_fold_densification_error_and_zero(
+        float* refine_weight_max,
+        float* densification_info,
+        size_t N,
         void* stream = nullptr);
 
-    void launch_elementwise_add_inplace(
-        float* a,
-        const float* b,
+    void launch_far_field_mask(
+        const float* means,
+        float centroid_x,
+        float centroid_y,
+        float centroid_z,
+        float far_radius,
+        bool* far_out,
         size_t N,
         void* stream = nullptr);
 

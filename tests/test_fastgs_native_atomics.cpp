@@ -2,11 +2,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/cuda/memory_arena.hpp"
+#include "training/rasterization/fastgs/rasterization/include/native_gradient_atomics.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <functional>
 #include <gtest/gtest.h>
 #include <limits>
@@ -28,6 +30,114 @@ cudaError_t launch_fastgs_blend_backward_probe(
 
 namespace {
     using lfs::core::RasterizerMemoryArena;
+    using fast_lfs::rasterization::detail::native_gradient_atomics_arch_supported;
+    using fast_lfs::rasterization::detail::native_gradient_atomics_disabled;
+    using fast_lfs::rasterization::detail::select_native_gradient_atomics;
+
+    int set_native_atomics_disable_environment(const char* value) {
+#if defined(_WIN32)
+        return _putenv_s("LFS_DISABLE_HIP_FASTGS_NATIVE_ATOMICS", value == nullptr ? "" : value);
+#else
+        return value == nullptr
+                   ? unsetenv("LFS_DISABLE_HIP_FASTGS_NATIVE_ATOMICS")
+                   : setenv("LFS_DISABLE_HIP_FASTGS_NATIVE_ATOMICS", value, 1);
+#endif
+    }
+
+    TEST(FastGSNativeAtomicDispatch, ProductionSelectorRequiresEveryOwnedRangeAndSupportedDevice) {
+        constexpr std::array<bool, 4> all_owned{true, true, true, true};
+        ASSERT_TRUE(native_gradient_atomics_arch_supported("gfx1151"));
+        ASSERT_TRUE(native_gradient_atomics_arch_supported("gfx1100:sramecc+:xnack-"));
+        EXPECT_FALSE(native_gradient_atomics_arch_supported("gfx11510"));
+        EXPECT_FALSE(native_gradient_atomics_arch_supported("gfx1200"));
+
+        EXPECT_TRUE(select_native_gradient_atomics(true, all_owned, true, false));
+        EXPECT_FALSE(select_native_gradient_atomics(false, all_owned, true, false));
+        EXPECT_FALSE(select_native_gradient_atomics(true, all_owned, false, false));
+        EXPECT_FALSE(select_native_gradient_atomics(true, all_owned, true, true));
+
+        // Each missing range independently forces the production selector to the safe path.
+        for (size_t missing = 0; missing < all_owned.size(); ++missing) {
+            auto ownership = all_owned;
+            ownership[missing] = false;
+            EXPECT_FALSE(select_native_gradient_atomics(true, ownership, true, false))
+                << "gradient output index " << missing;
+        }
+
+        // External or foreign-device allocations are reported as unowned by the current arena.
+        EXPECT_FALSE(select_native_gradient_atomics(true, {true, false, true, true}, true, false));
+    }
+
+    TEST(FastGSNativeAtomicDispatch, DisableEnvironmentValuePolicy) {
+        EXPECT_FALSE(native_gradient_atomics_disabled(nullptr));
+        EXPECT_FALSE(native_gradient_atomics_disabled(""));
+        EXPECT_FALSE(native_gradient_atomics_disabled("0"));
+        EXPECT_FALSE(native_gradient_atomics_disabled("false"));
+        EXPECT_FALSE(native_gradient_atomics_disabled("no"));
+        EXPECT_TRUE(native_gradient_atomics_disabled("1"));
+        EXPECT_TRUE(native_gradient_atomics_disabled("true"));
+    }
+
+    TEST(FastGSNativeAtomicDispatch, DisableEnvironmentValueIsCachedInFreshProcess) {
+        EXPECT_EXIT(
+            {
+                if (set_native_atomics_disable_environment("1") != 0) {
+                    std::exit(2);
+                }
+                if (!fast_lfs::rasterization::detail::
+                        native_gradient_atomics_disabled_from_environment()) {
+                    std::exit(3);
+                }
+                if (set_native_atomics_disable_environment("0") != 0) {
+                    std::exit(4);
+                }
+                std::exit(fast_lfs::rasterization::detail::
+                                  native_gradient_atomics_disabled_from_environment()
+                              ? 0
+                              : 5);
+            },
+            ::testing::ExitedWithCode(0), "");
+    }
+
+    TEST(FastGSNativeAtomicDispatch, DisableEnvironmentAbsenceAndFalseValueAreCachedInFreshProcesses) {
+        EXPECT_EXIT(
+            {
+                if (set_native_atomics_disable_environment(nullptr) != 0) {
+                    std::exit(2);
+                }
+                if (fast_lfs::rasterization::detail::
+                        native_gradient_atomics_disabled_from_environment()) {
+                    std::exit(3);
+                }
+                if (set_native_atomics_disable_environment("1") != 0) {
+                    std::exit(4);
+                }
+                std::exit(fast_lfs::rasterization::detail::
+                                  native_gradient_atomics_disabled_from_environment()
+                              ? 5
+                              : 0);
+            },
+            ::testing::ExitedWithCode(0), "");
+
+        EXPECT_EXIT(
+            {
+                if (set_native_atomics_disable_environment("0") != 0) {
+                    std::exit(2);
+                }
+                if (fast_lfs::rasterization::detail::
+                        native_gradient_atomics_disabled_from_environment()) {
+                    std::exit(3);
+                }
+                if (set_native_atomics_disable_environment("1") != 0) {
+                    std::exit(4);
+                }
+                std::exit(fast_lfs::rasterization::detail::
+                                  native_gradient_atomics_disabled_from_environment()
+                              ? 5
+                              : 0);
+            },
+            ::testing::ExitedWithCode(0), "");
+    }
 
     class ArenaFrame {
     public:
@@ -50,6 +160,44 @@ namespace {
             }
         }
     };
+
+    TEST_F(FastGSNativeAtomics, ProductionEligibilityChecksAllFourCurrentDeviceRanges) {
+        RasterizerMemoryArena arena;
+        ArenaFrame frame(arena);
+        auto allocate = frame.allocator();
+        auto* mean = allocate(2 * sizeof(float));
+        auto* conic = allocate(3 * sizeof(float));
+        auto* opacity = allocate(sizeof(float));
+        auto* color = allocate(3 * sizeof(float));
+        ASSERT_NE(mean, nullptr);
+        ASSERT_NE(conic, nullptr);
+        ASSERT_NE(opacity, nullptr);
+        ASSERT_NE(color, nullptr);
+
+        const std::array<const void*, 4> owned_ranges{mean, conic, opacity, color};
+        EXPECT_TRUE(fast_lfs::rasterization::detail::native_gradient_atomics_eligible(
+            arena, owned_ranges, 1, true, false));
+
+        void* external = nullptr;
+        ASSERT_EQ(cudaMalloc(&external, 3 * sizeof(float)), cudaSuccess);
+        const std::shared_ptr<void> external_owner(external, [](void* ptr) { cudaFree(ptr); });
+        for (size_t index = 0; index < owned_ranges.size(); ++index) {
+            auto ranges = owned_ranges;
+            ranges[index] = external;
+            EXPECT_FALSE(fast_lfs::rasterization::detail::native_gradient_atomics_eligible(
+                arena, ranges, 1, true, false))
+                << "external gradient output index " << index;
+        }
+
+        // Policy-only unsupported-architecture simulation; the GPU tests below run on the
+        // actual device and do not claim that this machine uses gfx1200.
+        const bool simulated_unsupported_architecture =
+            native_gradient_atomics_arch_supported("gfx1200");
+        EXPECT_FALSE(fast_lfs::rasterization::detail::native_gradient_atomics_eligible(
+            arena, owned_ranges, 1, simulated_unsupported_architecture, false));
+        EXPECT_FALSE(fast_lfs::rasterization::detail::native_gradient_atomics_eligible(
+            arena, owned_ranges, 1, true, true));
+    }
 
     template <typename T>
     T* arena_array(std::function<char*(size_t)>& allocate, size_t count) {

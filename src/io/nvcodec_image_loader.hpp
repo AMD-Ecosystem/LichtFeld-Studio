@@ -7,6 +7,8 @@
 #include "core/tensor.hpp"
 #include <filesystem>
 #include <memory>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 // Forward declarations to avoid including nvImageCodec headers in public API
@@ -15,13 +17,22 @@ typedef struct nvimgcodecDecoder* nvimgcodecDecoder_t;
 typedef struct nvimgcodecEncoder* nvimgcodecEncoder_t;
 
 namespace lfs::io {
+    struct MaskedImageFill;
 
     /**
      * @brief Output format for image decoding
      */
     enum class DecodeFormat {
-        RGB,      // 3-channel RGB [C,H,W] or [H,W,C]
-        Grayscale // 1-channel grayscale [H,W]
+        RGB,       // 3-channel RGB [C,H,W] or [H,W,C]
+        Grayscale, // 1-channel grayscale [H,W]
+        Mask       // Grayscale with correctly rounded byte mask normalization
+    };
+
+    // Channel order of a 3-channel RGB tensor. Callers state this. A CHW image
+    // whose width is 3 has the same shape pattern as HWC, so the shape cannot decide.
+    enum class RgbLayout {
+        HWC, // interleaved [H, W, 3]
+        CHW  // planar [3, H, W]
     };
 
     /**
@@ -33,14 +44,34 @@ namespace lfs::io {
     class NvCodecImageLoader {
     public:
         struct Options {
+            struct SentinelValidationTestSeam {
+                // Negative disables the seam. Otherwise the selected batch member
+                // decodes into a discard buffer so its real destination stays sentinel-filled.
+                int skipped_member = -1;
+                // Apply the discard buffer to the one permitted CUDA retry as well.
+                bool skip_cuda_retry = false;
+            };
+
             int device_id = 0;
             int max_num_cpu_threads = 0;
             bool enable_fallback = true;
             size_t decoder_pool_size = 8;
+            // Create every codec handle in the constructor instead of on the first decode and encode.
+            bool create_eagerly = false;
+            // Experimental opt-in only; all production call sites leave this false.
+            // RTX 4090 bicycle gate measured +35 MiB net and 3.5x dl_wait enabled.
+            // A failed cudaFreeAsync stays budget-charged because the allocation
+            // remains live; do not enable without a recovery policy for CUDA errors.
+            bool enable_device_allocator = false;
+            size_t device_allocator_budget_bytes = size_t(256) << 20;
+            SentinelValidationTestSeam sentinel_validation_test_seam{};
         };
 
         explicit NvCodecImageLoader(const Options& options);
         ~NvCodecImageLoader();
+
+        /// Loaders alive in this process.
+        [[nodiscard]] static size_t live_count();
 
         // Disable copying
         NvCodecImageLoader(const NvCodecImageLoader&) = delete;
@@ -63,7 +94,7 @@ namespace lfs::io {
             int max_width = 0,
             void* cuda_stream = nullptr,
             DecodeFormat format = DecodeFormat::RGB,
-            bool output_uint8 = false);
+            bool output_uint8 = false, const MaskedImageFill* masked_fill = nullptr);
 
         /**
          * @brief Decode JPEG from memory to GPU
@@ -82,29 +113,70 @@ namespace lfs::io {
             int max_width = 0,
             void* cuda_stream = nullptr,
             DecodeFormat format = DecodeFormat::RGB,
-            bool output_uint8 = false);
+            bool output_uint8 = false, const MaskedImageFill* masked_fill = nullptr);
 
-        // Load and decode multiple images in batch
-        std::vector<lfs::core::Tensor> load_images_batch_gpu(
-            const std::vector<std::filesystem::path>& paths,
-            int resize_factor = 1,
-            int max_width = 0);
-
-        // Batch decode JPEG blobs from memory
-        std::vector<lfs::core::Tensor> batch_decode_from_memory(
-            const std::vector<std::vector<uint8_t>>& jpeg_blobs,
-            void* cuda_stream = nullptr);
-
-        // Batch decode from spans (zero-copy)
-        std::vector<lfs::core::Tensor> batch_decode_from_spans(
+        std::vector<lfs::core::Tensor> decode_jpeg_batch_from_spans(
             const std::vector<std::pair<const uint8_t*, size_t>>& jpeg_spans,
-            void* cuda_stream = nullptr);
+            void* cuda_stream = nullptr,
+            bool output_uint8 = false,
+            bool synchronize = true,
+            std::vector<lfs::core::Tensor*>* reusable_hwc = nullptr,
+            std::vector<lfs::core::Tensor*>* reusable_outputs = nullptr);
 
         // Encode GPU tensor to JPEG bytes (RGB)
         std::vector<uint8_t> encode_to_jpeg(
             const lfs::core::Tensor& image,
             int quality = 100,
             void* cuda_stream = nullptr);
+
+        // Encode Float32 CUDA RGB to lossless 16-bit JPEG2000.
+        // layout is HWC [H,W,3] or CHW [3,H,W] and is not inferred from the shape.
+        // CHW is permuted once to interleaved RGB. Contiguous HWC is not copied.
+        std::vector<uint8_t> encode_to_jpeg2k(
+            const lfs::core::Tensor& image,
+            RgbLayout layout,
+            void* cuda_stream = nullptr,
+            bool high_throughput = true);
+
+        /**
+         * @brief Encode grayscale GPU tensor to lossless 16-bit JPEG2000 bytes
+         *
+         * @param image Float32 CUDA tensor in [H,W] layout, normalized [0,1].
+         * @param cuda_stream Optional CUDA stream for async operations.
+         * @param high_throughput Use JPEG2000 HT block coding.
+         * @param eight_bit Emit lossless UINT8 samples instead of UINT16.
+         * @return JPEG2000 bytes preserving the selected sample precision.
+         */
+        std::vector<uint8_t> encode_grayscale_to_jpeg2k(
+            const lfs::core::Tensor& image,
+            void* cuda_stream = nullptr,
+            bool high_throughput = true,
+            bool eight_bit = false);
+
+        /**
+         * @brief Decode lossless JPEG2000 bytes from memory to GPU
+         *
+         * Decodes UINT16 JPEG2000 into normalized Float32, or UINT8 into a
+         * UInt8 CUDA tensor when allow_uint8 is true. Grayscale returns [H,W];
+         * RGB returns interleaved [H,W,3]. UINT16 values round-trip bit-exact
+         * for samples representable as uint16 / 65535.0f.
+         *
+         * @param jpeg2k_data Raw JPEG2000 bytes.
+         * @param cuda_stream Optional CUDA stream for async operations.
+         * @param synchronize Wait for device completion before returning.
+         * @return CUDA tensor, [H,W] for grayscale or [H,W,3] for RGB.
+         */
+        lfs::core::Tensor decode_jpeg2k_16bit_from_memory_gpu(
+            const std::vector<uint8_t>& jpeg2k_data,
+            void* cuda_stream = nullptr,
+            bool synchronize = true,
+            bool allow_uint8 = false,
+            bool exact_mask = false);
+
+        std::vector<lfs::core::Tensor> decode_jpeg2k_16bit_batch_from_spans(
+            const std::vector<std::pair<const uint8_t*, size_t>>& jpeg2k_spans,
+            void* cuda_stream = nullptr,
+            bool synchronize = true);
 
         /**
          * @brief Encode grayscale GPU tensor to JPEG bytes
@@ -137,9 +209,12 @@ namespace lfs::io {
             void* cuda_stream = nullptr);
 
         /**
-         * @brief Check if nvImageCodec is available and working
+         * @brief Check if nvImageCodec decodes JPEG on this system
          */
         static bool is_available();
+
+        /// The JPEG decoder this process uses, for run records.
+        [[nodiscard]] static std::string_view jpeg_decoder();
 
     private:
         struct Impl;
