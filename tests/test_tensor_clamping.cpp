@@ -399,6 +399,26 @@ TEST_F(TensorClampTest, ClampWithInfinity) {
     compare_tensors(result2_custom, result2_torch, 1e-5f, 1e-7f, "ClampInfMin");
 }
 
+TEST_F(TensorClampTest, ClampPreservesNaNLikeTorch) {
+    const std::vector<float> data = {
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        0.0f};
+
+    const auto torch_cpu = torch::tensor(data);
+    const auto expected_cpu = torch_cpu.clamp(-10.0f, 10.0f);
+    const auto custom_cpu = Tensor::from_vector(data, {4}, Device::CPU);
+    compare_tensors(custom_cpu.clamp(-10.0f, 10.0f), expected_cpu,
+                    1e-5f, 1e-7f, "ClampNaNCpu");
+
+    if (torch::cuda::is_available()) {
+        const auto custom_cuda = custom_cpu.cuda().clamp(-10.0f, 10.0f);
+        compare_tensors(custom_cuda, expected_cpu.cuda(),
+                        1e-5f, 1e-7f, "ClampNaNCuda");
+    }
+}
+
 TEST_F(TensorClampTest, ClampEmptyTensor) {
     std::vector<float> empty_data;
 
@@ -527,44 +547,6 @@ TEST_F(TensorClampTest, ClampGradient) {
     // Verify no NaNs or Infs
     EXPECT_FALSE(clamped_custom.has_nan());
     EXPECT_FALSE(clamped_custom.has_inf());
-}
-
-// ============= Performance Test =============
-
-TEST_F(TensorClampTest, ClampLargeScale) {
-    if (!is_cuda_available()) {
-        GTEST_SKIP() << "CUDA not available, skipping test";
-    }
-
-    // Generate same random data for both
-    std::vector<float> data;
-    std::mt19937 gen(42);
-    std::normal_distribution<float> dist(0.0f, 2.0f);
-    for (size_t i = 0; i < 1000 * 1000; ++i) {
-        data.push_back(dist(gen));
-    }
-
-    auto t_custom = Tensor::from_vector(data, {1000, 1000}, Device::CUDA);
-    auto t_torch = torch::tensor(data, torch::kCUDA).reshape({1000, 1000});
-
-    auto result_custom = t_custom.clamp(-1.0f, 1.0f);
-    auto result_torch = t_torch.clamp(-1.0f, 1.0f);
-
-    ASSERT_TRUE(result_custom.is_valid());
-    EXPECT_EQ(result_custom.shape(), t_custom.shape());
-
-    // Sample check (compare subset to avoid huge memory copy)
-    auto cpu_custom = result_custom.cpu();
-    auto cpu_torch = result_torch.cpu();
-
-    auto sample_custom = cpu_custom.debug_values(100);
-    auto sample_torch_ptr = cpu_torch.data_ptr<float>();
-
-    for (size_t i = 0; i < std::min(sample_custom.size(), size_t(100)); ++i) {
-        EXPECT_GE(sample_custom[i], -1.0f);
-        EXPECT_LE(sample_custom[i], 1.0f);
-        EXPECT_FLOAT_EQ(sample_custom[i], sample_torch_ptr[i]);
-    }
 }
 
 // ============= Special Values =============
@@ -700,3 +682,53 @@ TEST_F(TensorClampTest, ClampZeroAtBoundary) {
 
     compare_tensors(result_custom, result_torch, 1e-5f, 1e-7f, "ClampZeroAtBoundary");
 }
+
+class TensorClampRegression : public ::testing::TestWithParam<Device> {};
+
+TEST_P(TensorClampRegression, HalfPreservesDtypeAndNonfiniteValues) {
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    auto input = Tensor::from_vector({-inf, -2.0f, 0.5f, 2.0f, inf, nan}, {6}, GetParam())
+                     .to(DataType::Float16);
+    const auto output = input.clamp(-1.0f, 1.0f);
+    EXPECT_EQ(output.dtype(), DataType::Float16);
+    const auto values = output.to(DataType::Float32).to_vector();
+    ASSERT_EQ(values.size(), 6);
+    for (size_t i = 0; i < 5; ++i)
+        EXPECT_FLOAT_EQ(values[i], (std::vector<float>{-1, -1, 0.5f, 1, 1})[i]);
+    EXPECT_TRUE(std::isnan(values[5]));
+    EXPECT_EQ(input.to(DataType::Float32).to_vector()[0], -inf);
+    input.clamp_(-1.0f, 1.0f);
+    EXPECT_EQ(input.dtype(), DataType::Float16);
+    const auto inplace = input.to(DataType::Float32).to_vector();
+    for (size_t i = 0; i < 5; ++i)
+        EXPECT_FLOAT_EQ(inplace[i], values[i]);
+    EXPECT_TRUE(std::isnan(inplace[5]));
+}
+
+TEST_P(TensorClampRegression, HalfStridedWritesAndEmptyInputs) {
+    auto input = Tensor::from_vector({-2.0f, 9.0f, 2.0f, 8.0f, 0.5f, 7.0f}, {3, 2}, GetParam())
+                     .to(DataType::Float16);
+    auto view = input.slice(1, 0, 1);
+    EXPECT_EQ(view.clamp(-1.0f, 1.0f).to(DataType::Float32).to_vector(),
+              (std::vector<float>{-1, 1, 0.5f}));
+    view.clamp_(-1.0f, 1.0f);
+    EXPECT_EQ(input.to(DataType::Float32).to_vector(),
+              (std::vector<float>{-1, 9, 1, 8, 0.5f, 7}));
+    auto empty = Tensor::empty({0, 2}, GetParam(), DataType::Float16);
+    EXPECT_EQ(empty.clamp(-1.0f, 1.0f).dtype(), DataType::Float16);
+    EXPECT_NO_THROW(empty.clamp_(-1.0f, 1.0f));
+}
+
+TEST_P(TensorClampRegression, OneSidedInplacePreservesUnboundedInfinity) {
+    const float inf = std::numeric_limits<float>::infinity();
+    auto lower = Tensor::from_vector({-inf, -2.0f, 2.0f, inf}, {4}, GetParam());
+    auto upper = lower.clone();
+    lower.clamp_min_(-1.0f);
+    upper.clamp_max_(1.0f);
+    EXPECT_EQ(lower.to_vector(), (std::vector<float>{-1, -1, 2, inf}));
+    EXPECT_EQ(upper.to_vector(), (std::vector<float>{-inf, -2, 1, 1}));
+}
+
+INSTANTIATE_TEST_SUITE_P(CpuAndCuda, TensorClampRegression,
+                         ::testing::Values(Device::CPU, Device::CUDA));

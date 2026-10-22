@@ -10,6 +10,14 @@ import sys
 
 import pytest
 
+from locale_utils import locale_key_exists, missing_locale_keys
+
+
+def _confirm_reply(state, buttons):
+    """Pick the reply button by index so it matches whatever labels were passed."""
+    index = 0 if state.confirm_response == "Overwrite" else 1
+    return tuple(buttons)[index] if buttons else state.confirm_response
+
 
 def _make_node(node_type, name, gaussian_count):
     return SimpleNamespace(type=node_type, name=name, gaussian_count=gaussian_count)
@@ -26,10 +34,11 @@ def _install_lf_stub(monkeypatch):
     )
     panel_height_mode = SimpleNamespace(FILL="fill", CONTENT="content")
     panel_option = SimpleNamespace(DEFAULT_CLOSED="DEFAULT_CLOSED", HIDE_HEADER="HIDE_HEADER")
-    node_type = IntEnum("NodeType", {"SPLAT": 1, "MESH": 2})
+    node_type = IntEnum("NodeType", {"SPLAT": 1, "MESH": 2, "GROUP": 3})
     state = SimpleNamespace(
         language=["en"],
         nodes=[],
+        splat_export_requests=[],
         content_type="splat_files",
         active_camera_count=0,
         export_state={"active": False},
@@ -51,6 +60,7 @@ def _install_lf_stub(monkeypatch):
         PanelOption=panel_option,
         tr=lambda key: key,
         get_current_language=lambda: state.language[0],
+        take_splat_export_request=lambda: state.splat_export_requests.pop(0) if state.splat_export_requests else [],
         get_export_state=lambda: dict(state.export_state),
         set_panel_enabled=lambda panel_id, enabled: state.set_panel_enabled_calls.append((panel_id, enabled)),
         cancel_export=lambda: setattr(state, "cancel_calls", state.cancel_calls + 1),
@@ -61,15 +71,24 @@ def _install_lf_stub(monkeypatch):
         save_usdz_file_dialog=lambda default_name: f"/tmp/{default_name}.usdz",
         save_html_file_dialog=lambda default_name: f"/tmp/{default_name}.html",
         save_rad_file_dialog=lambda default_name: f"/tmp/{default_name}.rad",
+        open_folder_dialog=lambda: (state.folder_dialog_calls.append("") or state.folder_dialog_result),
         open_dataset_folder_dialog=lambda default_path="": (
             state.folder_dialog_calls.append(default_path) or state.folder_dialog_result
         ),
         select_colmap_sparse_folder_dialog=lambda default_path="": (
             state.folder_dialog_calls.append(default_path) or state.folder_dialog_result
         ),
+        # Reply with the button the panel actually offered. Echoing a hardcoded
+        # "Overwrite" only matched while the panel used English literals; it now
+        # passes translation keys, so a fixed reply never equals its own label
+        # and the confirm branch silently never fires.
         confirm_dialog=lambda title, message, buttons, callback=None: (
             state.confirm_calls.append((title, message, tuple(buttons)))
-            or (callback(state.confirm_response) if callback else None)
+            or (
+                callback(_confirm_reply(state, buttons))
+                if callback
+                else None
+            )
         ),
         get_content_type=lambda: state.content_type,
     )
@@ -153,7 +172,9 @@ def test_export_panel_builds_format_and_model_records(export_panel_module):
     assert panel._handle.records["formats"] == [
         {"index": "0", "label": "export.format.ply_standard", "selected": False},
         {"index": "1", "label": "export.format.sog_supersplat", "selected": False},
+        {"index": "8", "label": "export.format.ssog", "selected": False},
         {"index": "2", "label": "export.format.spz_niantic", "selected": True},
+        {"index": "13", "label": "export.format.glb_gltf", "selected": False},
         {"index": "6", "label": "export.format.rad_random_access", "selected": False},
         {"index": "4", "label": "export.format.usd_openusd", "selected": False},
         {"index": "5", "label": "export.format.usdz_nurec", "selected": False},
@@ -161,12 +182,32 @@ def test_export_panel_builds_format_and_model_records(export_panel_module):
         {"index": "7", "label": "export.format.colmap_sparse", "selected": False},
     ]
     assert panel._handle.records["models"] == [
-        {"name": "Tree", "selected": True, "count_text": "(128)"},
-        {"name": "House", "selected": False, "count_text": "(64)"},
+        {"name": "Tree", "selected": True, "count_text": "(128)",
+         "is_group": False, "partial": False, "indent": "4dp", "group_id": ""},
+        {"name": "House", "selected": False, "count_text": "(64)",
+         "is_group": False, "partial": False, "indent": "4dp", "group_id": ""},
     ]
     assert panel._has_models is True
     assert panel.update_policy == "dirty"
-    assert "update_interval_ms" not in module.ExportPanel.__dict__
+    assert module.ExportPanel.update_interval_ms is None
+
+
+def test_export_panel_counts_only_splats_that_are_not_deleted(export_panel_module):
+    # Catches the model row showing the stored count after a soft delete, which the export drops.
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._handle = _HandleStub()
+    panel._selected_nodes = {"Tree"}
+    tree = _make_node(module.lf.scene.NodeType.SPLAT, "Tree", 128)
+    tree.splat_data = lambda: SimpleNamespace(visible_count=lambda: 96)
+    state.nodes = [tree]
+
+    panel._rebuild_model_records(state.nodes)
+
+    assert panel._handle.records["models"] == [{
+        "name": "Tree", "selected": True, "count_text": "(96)",
+        "is_group": False, "partial": False, "indent": "4dp", "group_id": "",
+    }]
 
 
 def test_export_panel_seeds_selection_from_scene_nodes(export_panel_module):
@@ -201,6 +242,9 @@ def test_export_panel_progress_updates_bound_value(export_panel_module):
     assert panel._progress_value == "0.5"
     assert panel._cached_export_state["stage"] == "writing"
     assert panel._handle.dirty_fields == [
+        "__update__",
+        "show_form",
+        "show_progress",
         "progress_value",
         "progress_title",
         "progress_pct",
@@ -237,6 +281,28 @@ def test_export_panel_progress_prefers_native_store(export_panel_module, monkeyp
     assert panel._cached_export_state["format"] == "SPZ"
 
 
+def test_export_panel_discovers_drag_job_and_uses_existing_cancel(export_panel_module):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._handle = _HandleStub()
+    state.export_state = {"active": True, "progress": 0.25, "stage": "writing", "format": "SOG"}
+
+    assert panel._exporting is False
+    assert panel.on_update(None) is True
+    assert panel._exporting is True
+    assert panel._progress_value == "0.25"
+    assert "show_form" in panel._handle.dirty_fields
+    assert "show_progress" in panel._handle.dirty_fields
+    assert state.folder_dialog_calls == []
+    assert state.export_calls == []
+
+    panel._on_cancel_export(None, None, None)
+    assert state.cancel_calls == 1
+    state.export_state = {"active": False}
+    assert panel.on_update(None) is True
+    assert state.set_panel_enabled_calls == [("lfs.export", False)]
+
+
 def test_export_panel_closes_when_export_finishes(export_panel_module):
     module, state = export_panel_module
     panel = module.ExportPanel()
@@ -248,27 +314,6 @@ def test_export_panel_closes_when_export_finishes(export_panel_module):
     assert panel._exporting is False
     assert panel._selection_seeded is False
     assert state.set_panel_enabled_calls == [("lfs.export", False)]
-
-
-def test_export_panel_does_not_register_failed_export(export_panel_module):
-    module, state = export_panel_module
-    panel = module.ExportPanel()
-    panel._exporting = True
-    panel._last_export_path = "/tmp/failed.ply"
-    panel._last_export_format = module.ExportFormat.PLY
-    registered = []
-    panel._register_export = lambda path, fmt: registered.append((path, fmt))
-    state.export_state = {
-        "active": False,
-        "stage": "Failed",
-        "error": "disk full",
-        "format": "PLY",
-    }
-
-    assert panel._update_export_progress() is True
-    assert registered == []
-    assert panel._last_export_path is None
-    assert panel._last_export_format is None
 
 
 def test_export_panel_store_subscriptions_mark_panel_dirty(export_panel_module, monkeypatch):
@@ -358,7 +403,7 @@ def test_export_panel_uses_colmap_folder_picker_without_selected_models(export_p
     assert state.export_calls == [
         (int(module.ExportFormat.COLMAP), str(tmp_path), (), 3),
     ]
-    assert state.folder_dialog_calls == ["/datasets/source/sparse"]
+    assert state.folder_dialog_calls == [str(Path("/datasets/source/sparse"))]
     assert state.confirm_calls == []
 
 
@@ -405,9 +450,15 @@ def test_export_panel_uses_exact_folder_returned_by_picker(export_panel_module, 
     assert state.folder_dialog_calls == [str(sparse_root)]
     assert len(state.confirm_calls) == 1
     title, message, buttons = state.confirm_calls[0]
-    assert title == "Export COLMAP sparse"
+    # tr() is stubbed as identity here, so `title` is the raw key. Asserting an
+    # English literal only tracked the stub; what matters is that the key the
+    # panel asks for actually exists, otherwise the dialog shows the raw key.
+    assert locale_key_exists(title), f"confirm dialog title key missing from en.json: {title}"
     assert str(child_model) in message
-    assert buttons == ("Overwrite", "Cancel")
+    # Buttons are translation keys under the identity tr() stub; assert they
+    # resolve rather than pinning English text that only the stub produced.
+    assert not missing_locale_keys(buttons), f"confirm buttons missing from en.json: {buttons}"
+    assert len(buttons) == 2
     assert state.export_calls == [
         (int(module.ExportFormat.COLMAP), str(child_model), (), 3),
     ]
@@ -438,9 +489,15 @@ def test_export_panel_confirms_colmap_overwrite(export_panel_module, tmp_path):
 
     assert len(state.confirm_calls) == 1
     title, message, buttons = state.confirm_calls[0]
-    assert title == "Export COLMAP sparse"
+    # tr() is stubbed as identity here, so `title` is the raw key. Asserting an
+    # English literal only tracked the stub; what matters is that the key the
+    # panel asks for actually exists, otherwise the dialog shows the raw key.
+    assert locale_key_exists(title), f"confirm dialog title key missing from en.json: {title}"
     assert str(tmp_path) in message
-    assert buttons == ("Overwrite", "Cancel")
+    # Buttons are translation keys under the identity tr() stub; assert they
+    # resolve rather than pinning English text that only the stub produced.
+    assert not missing_locale_keys(buttons), f"confirm buttons missing from en.json: {buttons}"
+    assert len(buttons) == 2
     assert state.export_calls == [
         (int(module.ExportFormat.COLMAP), str(tmp_path), (), 3),
     ]
@@ -461,3 +518,212 @@ def test_export_panel_cancel_colmap_overwrite(export_panel_module, tmp_path):
 
     assert len(state.confirm_calls) == 1
     assert state.export_calls == []
+
+
+def test_ssog_directory_and_options(export_panel_module, tmp_path, monkeypatch):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._on_toggle_ssog_bundle(None, None, None)
+    panel._selected_nodes = {"Tree"}
+    state.nodes = [_make_node(module.lf.scene.NodeType.SPLAT, "Tree", 128)]
+    state.folder_dialog_result = str(tmp_path)
+    calls = []
+    monkeypatch.setattr(module.lf, "export_scene", lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert panel._get_ssog_folder_name() == "Tree_ssog"
+    panel._set_ssog_folder_name("my_scene")
+    settings = dict(lod_levels=3, lod_ratio=0.4, chunk_count_k=64,
+                    chunk_extent=12.5, chunk_min_k=2, kmeans_iterations=7)
+    for key, value in settings.items():
+        panel._set_ssog_setting(key, str(value))
+    panel._do_export()
+    assert calls[0][0] == (8, str(tmp_path / "my_scene"), ["Tree"], 3)
+    assert {key: calls[0][1][key] for key in settings} == settings
+    assert not state.confirm_calls
+    assert panel._cached_export_state["format"] == "SSOG"
+
+
+@pytest.mark.parametrize("reply,expected_exports", [("Overwrite", 1), ("Cancel", 0)])
+def test_ssog_overwrite_confirmation(export_panel_module, tmp_path, reply, expected_exports):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._set_ssog_bundle(False)
+    panel._selected_nodes = {"Tree"}
+    state.nodes = [_make_node(module.lf.scene.NodeType.SPLAT, "Tree", 128)]
+    state.folder_dialog_result = str(tmp_path)
+    state.confirm_response = reply
+    output = tmp_path / "Tree_ssog"
+    output.mkdir()
+    (output / "lod-meta.json").write_text("{}")
+    panel._do_export()
+    assert len(state.confirm_calls) == 1
+    assert len(state.export_calls) == expected_exports
+
+
+
+@pytest.mark.parametrize("name", ["..", "a\\b"])
+def test_ssog_rejects_path_in_folder_name(export_panel_module, name):
+    module, _ = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._set_ssog_bundle(False)
+    panel._selected_nodes = {"Tree"}
+    panel._set_ssog_folder_name(name)
+    assert not panel._can_export()
+
+
+
+@pytest.mark.parametrize("chosen", ["/tmp/Tree.ssog", ""])
+def test_ssog_bundle_default_and_option_forwarding(export_panel_module, monkeypatch, chosen):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._selected_nodes = {"Tree"}
+    state.nodes = [_make_node(module.lf.scene.NodeType.SPLAT, "Tree", 128)]
+    picked = []
+    monkeypatch.setattr(module.lf.ui, "save_ssog_file_dialog", lambda name: picked.append(name) or chosen, raising=False)
+    calls = []
+    monkeypatch.setattr(module.lf, "export_scene", lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert panel._ssog_bundle is True
+    panel._set_ssog_folder_name("../unused")
+    assert panel._can_export()
+    panel._set_ssog_setting("lod_levels", "3")
+    panel._do_export()
+    assert picked == ["Tree"]
+    assert not state.folder_dialog_calls
+    if chosen:
+        assert calls[0][0] == (8, chosen, ["Tree"], 3)
+        assert calls[0][1]["lod_levels"] == 3
+    else:
+        assert not calls
+
+
+def _linked(node_type, name, count, node_id, parent_id=-1, children=()):
+    node = _make_node(node_type, name, count)
+    node.id, node.parent_id, node.children = node_id, parent_id, list(children)
+    degree = 1 if name == "A" else 3
+    node.splat_data = lambda n=node, d=degree: SimpleNamespace(max_sh_degree=d, visible_count=lambda: n.gaussian_count)
+    return node
+
+def _toggle(panel, name, checked, group_id=""):
+    attrs = {"type": "checkbox", "data-node-name": name}
+    if group_id:
+        attrs["data-group-id"] = group_id
+    element = SimpleNamespace(
+        tag_name="input", parent=lambda: None,
+        has_attribute=lambda attr: checked if attr == "checked" else attr in attrs,
+        get_attribute=lambda attr, default="": attrs.get(attr, default))
+    panel._on_model_toggle(SimpleNamespace(current_target=lambda: SimpleNamespace(), target=lambda: element))
+
+def test_export_panel_group_selects_nested_models(export_panel_module):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._handle = _HandleStub()
+    splat, group = module.lf.scene.NodeType.SPLAT, module.lf.scene.NodeType.GROUP
+    panel._selected_nodes = {"Tree"}
+    state.nodes = [_make_node(splat, "Tree", 128), _make_node(splat, "House", 64)]
+    panel._rebuild_model_records(state.nodes)
+    flat = panel._handle.records["models"]
+    assert [(r["name"], r["selected"], r["count_text"]) for r in flat] == [
+        ("Tree", True, "(128)"), ("House", False, "(64)"),
+    ]
+    assert not any(r.get("is_group") for r in flat)
+
+    outer = _linked(group, "Outer", 0, 1, children=(2, 3))
+    nested = _linked(group, "Nested", 0, 2, 1, (4,))
+    model_a, model_b = _linked(splat, "A", 10, 4, 2), _linked(splat, "B", 20, 3, 1)
+    loose = _linked(splat, "Loose", 5, 6)
+    state.nodes = [model_a, loose, model_b, outer, nested, _linked(group, "Empty", 0, 9),
+                   _linked(module.lf.scene.NodeType.MESH, "Mesh", 0, 8)]
+    panel._selected_nodes = set()
+    _toggle(panel, "Outer", True, "1")
+    assert panel._selected_nodes == {"A", "B"}
+    by_name = {row["name"]: row for row in panel._handle.records["models"]}
+    assert list(by_name) == ["Loose", "Outer", "Nested", "A", "B"]
+    assert by_name["Outer"]["selected"] and not by_name["Outer"]["partial"] and by_name["A"]["indent"] != by_name["Loose"]["indent"]
+    _toggle(panel, "B", False)
+    partial = {row["name"]: row for row in panel._handle.records["models"]}
+    assert partial["Outer"]["partial"] and not partial["Outer"]["selected"] and partial["Nested"]["selected"] and not partial["Nested"]["partial"]
+    _toggle(panel, "Outer", False, "1")
+    assert panel._selected_nodes == set()
+
+    _toggle(panel, "Outer", True, "1")
+    panel._do_export()
+    grouped = (state.export_calls[-1][2], panel._get_export_label(),
+               panel._compute_max_export_sh_degree(state.nodes))
+    panel._ssog_folder_name, folder = "", panel._get_ssog_folder_name()
+    panel._exporting = False
+    panel._selected_nodes = set()
+    _toggle(panel, "A", True)
+    _toggle(panel, "B", True)
+    panel._do_export()
+    assert grouped[0] == state.export_calls[-1][2] == ("A", "B")
+    assert panel._get_export_label() == grouped[1] == "export_dialog.export_merged"
+    assert panel._compute_max_export_sh_degree(state.nodes) == grouped[2] == 1
+    panel._ssog_folder_name = ""
+    assert panel._get_ssog_folder_name() == folder == "A_ssog"
+
+    panel._exporting = False
+    panel._selection_seeded, panel._selected_nodes = True, {"A", "B", "Loose"}
+    panel._last_lang, panel._last_node_key = "en", None
+    panel._last_colmap_source_path = state.colmap_source_path
+    writes, base = [], panel._handle.update_record_list
+    panel._handle.update_record_list = lambda name, rows: (writes.append(name) if name == "models" else None, base(name, rows))
+    panel.on_update(None)
+    panel.on_update(None)
+    assert writes == ["models"]
+    loose.parent_id, outer.children = 1, [2, 3, 6]
+    panel.on_update(None)
+    assert writes == ["models", "models"]
+
+
+@pytest.mark.parametrize("requested", [("B",), ("A", "B")])
+def test_tree_export_request_selects_only_requested_splats(export_panel_module, requested):
+    module, state = export_panel_module
+    state.nodes = [_make_node(module.lf.scene.NodeType.SPLAT, name, 64) for name in ("A", "B", "Other")]
+    panel = module.ExportPanel()
+    panel._handle = _HandleStub()
+    panel._format = module.ExportFormat.COLMAP
+    panel._selected_nodes = {"Other"}
+    panel._selection_seeded = True
+    state.splat_export_requests.append(list(requested))
+    panel.on_update(None)
+    assert panel._format == module.ExportFormat.PLY
+    assert panel._selected_nodes == set(requested)
+    assert {row["name"] for row in panel._handle.records["models"] if row["selected"]} == set(requested)
+    panel.on_update(None)
+    assert panel._selected_nodes == set(requested)
+    assert not state.splat_export_requests
+
+
+def test_drag_progress_updates_node_name_without_resetting_total(export_panel_module):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._handle = _HandleStub()
+    for progress, stage in [(0.25, "Esportazione 1/2: Foresta"),
+                            (0.5, "Esportazione 1/2: Foresta"),
+                            (0.5, "Esportazione 2/2: Edificio <è>")]:
+        state.export_state = {"active": True, "progress": progress, "stage": stage, "format": "PLY"}
+        assert panel._update_export_progress()
+        assert panel._get_progress_stage() == stage
+        assert panel._progress_value == str(progress)
+        assert "progress_stage" in panel._handle.dirty_fields
+    assert state.export_calls == []
+
+
+def test_drag_progress_translations_have_identical_parameters():
+    import json
+    import string
+    locales = Path(__file__).resolve().parents[2] / "src/visualizer/gui/resources/locales"
+    paths = list(locales.glob("*.json"))
+    assert paths
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for key, count in (("preferences.drag_item", 3), ("preferences.drag_failed_item", 3),
+                           ("preferences.drag_rejected_node", 1)):
+            text = data[key]
+            parameters = [field for _literal, field, _spec, _conversion in string.Formatter().parse(text)
+                          if field is not None]
+            assert parameters == [""] * count, (path.name, key)
+            assert text.format(*((2, 5, "Scena <è>") if count == 3 else ("Scena <è>",)))

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Common.h"
+#include "core/cuda_safe_format.hpp"
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -38,9 +39,20 @@ namespace gsplat_lfs {
         return val;
     }
 #define GSPLAT_WARP_SUM(val, warp) warpReduceSum((val), (warp))
+// Raw lane intrinsics over a 32-lane tile: a 64-lane wavefront holds two
+// tiles, so a ballot returns this tile's half of the wave mask and a shuffle
+// addresses a lane inside the tile. The two tiles can diverge, so the mask
+// names only this tile.
+#define GSPLAT_TILE32_MASK LFS_GROUP32_LANE_MASK
+#define GSPLAT_TILE32_BALLOT(pred) \
+    static_cast<unsigned>(__ballot_sync(LFS_GROUP32_LANE_MASK, (pred)) >> (__lane_id() & 32u))
+#define GSPLAT_TILE32_SHFL(var, src) __shfl_sync(LFS_GROUP32_LANE_MASK, (var), (src), 32)
 #define GSPLAT_WARP_MAX(val, warp) warpReduceMax((val), (warp))
 #else
 #define GSPLAT_WARP_SUM(val, warp) cg::reduce((warp), (val), cg::plus<float>())
+#define GSPLAT_TILE32_MASK 0xffffffffu
+#define GSPLAT_TILE32_BALLOT(pred) __ballot_sync(0xffffffffu, (pred))
+#define GSPLAT_TILE32_SHFL(var, src) __shfl_sync(0xffffffffu, (var), (src))
 #define GSPLAT_WARP_MAX(val, warp) cg::reduce((warp), (val), cg::greater<float>())
 #endif
 
@@ -102,6 +114,21 @@ namespace gsplat_lfs {
     template <class WarpT>
     inline __device__ void warpMax(float& val, WarpT& warp) {
         val = GSPLAT_WARP_MAX(val, warp);
+    }
+
+    inline __device__ float activated_opacity(const float raw) {
+        return 1.0f / (1.0f + expf(-raw));
+    }
+
+    inline __device__ vec3 activated_scale(const vec3 raw) {
+        return vec3(expf(raw.x), expf(raw.y), expf(raw.z));
+    }
+
+    inline __device__ int32_t chw_pix(const uint32_t channel,
+                                      const int32_t pix_id,
+                                      const uint32_t image_height,
+                                      const uint32_t image_width) {
+        return static_cast<int32_t>(channel * image_height * image_width) + pix_id;
     }
 
     ///////////////////////////////
@@ -222,6 +249,35 @@ namespace gsplat_lfs {
             return il * d_out - il3 * glm::dot(d_out, v) * v;
         }
         return d_out;
+    }
+
+    inline __device__ float3 load_float3(const float* p) {
+        return *reinterpret_cast<const float3*>(p);
+    }
+
+    inline __device__ float4 load_float4(const float* p) {
+        return *reinterpret_cast<const float4*>(p);
+    }
+
+    // MaxDynamicSharedMemorySize is a ceiling: set it once per kernel
+    // instantiation when a launch needs more than the last recorded size.
+    // Failure throws so the caller cannot silently skip rendering.
+    template <typename Kernel>
+    inline void set_kernel_max_dynamic_smem(Kernel kernel, const int smem, const char* what) {
+        static int max_set = 0;
+        if (smem <= max_set) {
+            return;
+        }
+        // hipFuncSetAttribute takes the kernel as const void* only; CUDA has the
+        // same overload next to its templated one, so the cast is portable.
+        const auto err = cudaFuncSetAttribute(
+            reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        lfs::core::ensure_cuda_success(
+            err,
+            "cudaFuncSetAttribute(dynamic shared memory)",
+            lfs::core::detail::format_cuda_safe("{} requested_bytes={}", what, smem),
+            LFS_SOURCE_SITE_CURRENT());
+        max_set = smem;
     }
 
 } // namespace gsplat_lfs

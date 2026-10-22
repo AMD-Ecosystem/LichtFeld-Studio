@@ -8,54 +8,44 @@
 #include <algorithm>
 #include <cstdint>
 #include <execution>
+#include <limits>
 #include <numeric>
-
-#define CHECK_CUDA(call)                                        \
-    do {                                                        \
-        if (auto e = call; e != cudaSuccess) {                  \
-            LOG_ERROR("CUDA error: {}", cudaGetErrorString(e)); \
-        }                                                       \
-    } while (0)
 
 namespace lfs::core {
 
     Tensor Tensor::reshape(TensorShape new_shape) const {
-        if (!is_valid())
-            return {};
+        LFS_ASSERT_MSG(is_valid(),
+                       "reshape requires a valid tensor");
 
         if (new_shape.rank() == 0 && numel() == 1) {
             return create_view(new_shape);
         }
 
-        if (new_shape.elements() != numel()) {
-            LOG_ERROR("View shape {} has {} elements, but tensor has {} elements",
-                      new_shape.str(), new_shape.elements(), shape_.elements());
-            return {};
-        }
+        LFS_ASSERT_MSG(new_shape.elements() == numel(),
+                       std::format("reshape element mismatch: requested {} elements for tensor with {}",
+                                   new_shape.elements(), numel()));
 
         return create_view(new_shape);
     }
 
     Tensor Tensor::t() const {
-        if (!is_valid())
-            return {};
+        LFS_ASSERT_MSG(is_valid(),
+                       "t() requires a valid tensor");
 
         if (shape_.rank() <= 1) {
-            return clone();
+            return create_strided_view(shape_, strides_);
         }
 
         return transpose(-2, -1);
     }
 
     Tensor Tensor::permute(std::span<const int> axes) const {
-        if (!is_valid())
-            return {};
+        LFS_ASSERT_MSG(is_valid(),
+                       "permute requires a valid tensor");
 
         const size_t rank = shape_.rank();
-        if (axes.size() != rank) {
-            LOG_ERROR("Permute requires {} axes, got {}", rank, axes.size());
-            return {};
-        }
+        LFS_ASSERT_MSG(axes.size() == rank,
+                       std::format("permute requires {} axes, got {}", rank, axes.size()));
 
         // Fast path: use stack allocation for common small ranks (up to 8D)
         constexpr size_t STACK_SIZE = 8;
@@ -81,14 +71,10 @@ namespace lfs::core {
         // Validate and resolve axes
         for (size_t i = 0; i < rank; ++i) {
             int resolved = resolve_dim(axes[i]);
-            if (resolved < 0 || resolved >= static_cast<int>(rank)) {
-                LOG_ERROR("Invalid permute axis: {}", axes[i]);
-                return {};
-            }
-            if (used[resolved]) {
-                LOG_ERROR("Duplicate permute axis: {}", axes[i]);
-                return {};
-            }
+            LFS_ASSERT_MSG(resolved >= 0 && resolved < static_cast<int>(rank),
+                           std::format("permute axis {} is out of range for rank {}", axes[i], rank));
+            LFS_ASSERT_MSG(!used[resolved],
+                           std::format("permute axis {} is duplicated", axes[i]));
             used[resolved] = true;
             resolved_axes[i] = resolved;
         }
@@ -101,7 +87,7 @@ namespace lfs::core {
             new_strides[i] = strides_[resolved_axes[i]];
         }
 
-        if (state_ && state_->has_deferred_expr) {
+        if (is_deferred()) {
             std::vector<int> deferred_axes(rank);
             for (size_t i = 0; i < rank; ++i) {
                 deferred_axes[i] = resolved_axes[i];
@@ -156,13 +142,11 @@ namespace lfs::core {
     }
 
     Tensor Tensor::expand(const TensorShape& target_shape) const {
-        if (!is_valid())
-            return {};
+        LFS_ASSERT_MSG(is_valid(),
+                       "expand requires a valid tensor");
 
-        if (target_shape.rank() < shape_.rank()) {
-            LOG_ERROR("Cannot expand to fewer dimensions");
-            return {};
-        }
+        LFS_ASSERT_MSG(target_shape.rank() >= shape_.rank(),
+                       "expand cannot reduce tensor rank");
 
         std::vector<size_t> padded_shape = shape_.dims();
         while (padded_shape.size() < target_shape.rank()) {
@@ -174,18 +158,13 @@ namespace lfs::core {
             size_t target_dim = target_shape[i];
 
             if (target_dim == static_cast<size_t>(-1)) {
-                if (i < padded_shape.size()) {
-                    final_shape[i] = padded_shape[i];
-                } else {
-                    LOG_ERROR("Cannot use -1 for new dimension");
-                    return {};
-                }
+                LFS_ASSERT_MSG(i < padded_shape.size(),
+                               "expand cannot use -1 for a new dimension");
+                final_shape[i] = padded_shape[i];
             } else {
-                if (padded_shape[i] != 1 && padded_shape[i] != target_dim) {
-                    LOG_ERROR("Cannot expand dimension {} from {} to {}",
-                              i, padded_shape[i], target_dim);
-                    return {};
-                }
+                LFS_ASSERT_MSG(padded_shape[i] == 1 || padded_shape[i] == target_dim,
+                               std::format("expand cannot change dimension {} from {} to {}",
+                                           i, padded_shape[i], target_dim));
                 final_shape[i] = target_dim;
             }
         }
@@ -195,13 +174,11 @@ namespace lfs::core {
     }
 
     Tensor Tensor::slice(std::span<const std::pair<int, int>> ranges) const {
-        if (!is_valid())
-            return {};
+        LFS_ASSERT_MSG(is_valid(),
+                       "slice requires a valid tensor");
 
-        if (ranges.size() > shape_.rank()) {
-            LOG_ERROR("Too many slice ranges for tensor rank");
-            return {};
-        }
+        LFS_ASSERT_MSG(ranges.size() <= shape_.rank(),
+                       "slice has more ranges than tensor dimensions");
 
         std::vector<size_t> starts(shape_.rank());
         std::vector<size_t> ends(shape_.rank());
@@ -232,7 +209,7 @@ namespace lfs::core {
             new_shape.push_back(ends[i] - starts[i]);
         }
 
-        if (state_ && state_->has_deferred_expr) {
+        if (is_deferred()) {
             std::vector<std::pair<int, int>> deferred_ranges(ranges.begin(), ranges.end());
             const uint64_t source_id = lazy_expr_id();
             Tensor source = *this;
@@ -254,41 +231,44 @@ namespace lfs::core {
             return deferred;
         }
 
-        bool is_contiguous = is_contiguous_slice(starts, ends);
+        Tensor view;
+        view.data_ = data_;
+        view.data_owner_ = data_owner_;
+        view.shape_ = TensorShape(new_shape);
+        view.strides_ = strides_;
+        view.storage_offset_ = storage_offset_ + calculate_offset(starts);
+        view.device_ = device_;
+        view.dtype_ = dtype_;
+        view.is_view_ = true;
+        view.id_ = profiling_enabled_ ? next_id_++ : 0;
 
-        if (is_contiguous) {
-            size_t offset = calculate_offset(starts);
-            void* new_data = static_cast<char*>(data_) + offset * dtype_size(dtype_);
-
-            Tensor view(new_data, TensorShape(new_shape), device_, dtype_);
-            view.data_owner_ = data_owner_;
-            view.is_view_ = true;
-            propagate_view_meta(view);
-            return view;
-        } else {
-            return copy_slice(starts, ends, new_shape);
+        size_t expected_stride = 1;
+        view.is_contiguous_ = true;
+        for (int i = static_cast<int>(view.shape_.rank()) - 1; i >= 0; --i) {
+            if (view.strides_[i] != expected_stride) {
+                view.is_contiguous_ = false;
+                break;
+            }
+            expected_stride *= view.shape_[i];
         }
+        propagate_view_meta(view);
+        return view;
     }
 
     Tensor Tensor::slice(size_t dim, size_t start, size_t end) const {
-        if (!is_valid())
-            return {};
+        LFS_ASSERT_MSG(is_valid(),
+                       "slice requires a valid tensor");
 
-        if (dim >= shape_.rank()) {
-            LOG_ERROR("Slice dimension {} out of range for rank {}", dim, shape_.rank());
-            return {};
-        }
-
-        if (start >= end || end > shape_[dim]) {
-            LOG_ERROR("Invalid slice range [{}, {}) for dimension {} of size {}",
-                      start, end, dim, shape_[dim]);
-            return {};
-        }
+        LFS_ASSERT_MSG(dim < shape_.rank(),
+                       std::format("slice dimension {} is out of range for rank {}", dim, shape_.rank()));
+        LFS_ASSERT_MSG(start <= end && end <= shape_[dim],
+                       std::format("slice range [{}, {}) is invalid for dimension {} of size {}",
+                                   start, end, dim, shape_[dim]));
 
         std::vector<size_t> new_dims = shape_.dims();
         new_dims[dim] = end - start;
 
-        if (state_ && state_->has_deferred_expr) {
+        if (is_deferred()) {
             const uint64_t source_id = lazy_expr_id();
             Tensor source = *this;
             const cudaStream_t source_stream = source.stream();
@@ -319,11 +299,13 @@ namespace lfs::core {
         view.is_view_ = true;
         view.id_ = profiling_enabled_ ? next_id_++ : 0; // Only increment ID when profiling
 
-        // Adjust offset to point to slice start (in elements)
-        view.storage_offset_ = storage_offset_ + start * strides_[dim];
-
         // Adjust shape for the sliced dimension
         view.shape_ = TensorShape(new_dims);
+
+        // Empty views keep a valid offset, including chained endpoint slices.
+        view.storage_offset_ = view.numel() == 0
+                                   ? storage_offset_
+                                   : storage_offset_ + start * strides_[dim];
 
         // Check if strides match the new shape's expected contiguous layout
         // A sliced tensor is contiguous if its strides match row-major order for its shape
@@ -342,8 +324,60 @@ namespace lfs::core {
         return view;
     }
 
+    Tensor Tensor::slice(size_t dim, size_t start, size_t end, size_t step) const {
+        LFS_ASSERT_MSG(step > 0,
+                       "slice step must be positive");
+        if (step == 1) {
+            return slice(dim, start, end);
+        }
+
+        Tensor base = slice(dim, start, end);
+        const size_t extent = end - start;
+        const size_t count = extent / step + (extent % step != 0);
+        auto dims = base.shape_.dims();
+        dims[dim] = count;
+        auto strides = base.strides_;
+        if (count > 1 && strides[dim] != 0) {
+            LFS_ASSERT_MSG(step <= std::numeric_limits<size_t>::max() / strides[dim],
+                           "slice stride overflows size_t");
+            strides[dim] *= step;
+        }
+
+        base.materialize_if_deferred();
+        Tensor view;
+        view.data_ = base.data_;
+        view.data_owner_ = base.data_owner_;
+        view.shape_ = TensorShape(dims);
+        view.strides_ = strides;
+        view.storage_offset_ = base.storage_offset_;
+        view.device_ = base.device_;
+        view.dtype_ = base.dtype_;
+        view.is_view_ = true;
+        view.id_ = profiling_enabled_ ? next_id_++ : 0;
+
+        size_t expected_stride = 1;
+        view.is_contiguous_ = true;
+        for (int dimension = static_cast<int>(view.shape_.rank()) - 1; dimension >= 0; --dimension) {
+            if (view.strides_[static_cast<size_t>(dimension)] != expected_stride) {
+                view.is_contiguous_ = false;
+                break;
+            }
+            expected_stride *= view.shape_[static_cast<size_t>(dimension)];
+        }
+        propagate_view_meta(view);
+        return view;
+    }
+
     bool Tensor::is_contiguous_slice(const std::vector<size_t>& starts,
                                      const std::vector<size_t>& ends) const {
+        LFS_DEBUG_ASSERT_MSG(starts.size() == shape_.rank(),
+                             std::format("slice start count must match tensor rank "
+                                         "(start_count={}, tensor_rank={}, tensor_shape={})",
+                                         starts.size(), shape_.rank(), shape_.str()));
+        LFS_DEBUG_ASSERT_MSG(ends.size() == shape_.rank(),
+                             std::format("slice end count must match tensor rank "
+                                         "(end_count={}, tensor_rank={}, tensor_shape={})",
+                                         ends.size(), shape_.rank(), shape_.str()));
         for (size_t i = 1; i < shape_.rank(); ++i) {
             if (starts[i] != 0 || ends[i] != shape_[i]) {
                 return false;
@@ -354,8 +388,17 @@ namespace lfs::core {
     }
 
     size_t Tensor::calculate_offset(const std::vector<size_t>& indices) const {
+        LFS_DEBUG_ASSERT_MSG(indices.size() <= strides_.size(),
+                             std::format("offset index rank must not exceed stride rank "
+                                         "(index_count={}, stride_count={}, tensor_shape={})",
+                                         indices.size(), strides_.size(), shape_.str()));
         size_t offset = 0;
         for (size_t i = 0; i < indices.size(); ++i) {
+            LFS_DEBUG_ASSERT_MSG(indices[i] < shape_[i],
+                                 std::format("offset index must be in range for its dimension "
+                                             "(dimension={}, index={}, dimension_size={}, "
+                                             "index_count={}, tensor_shape={})",
+                                             i, indices[i], shape_[i], indices.size(), shape_.str()));
             offset += indices[i] * strides_[i];
         }
         return offset;
@@ -364,6 +407,8 @@ namespace lfs::core {
     Tensor Tensor::copy_slice(const std::vector<size_t>& starts,
                               const std::vector<size_t>& ends,
                               const std::vector<size_t>& new_shape) const {
+        LFS_ASSERT_MSG(dtype_ == DataType::Float32,
+                       "non-contiguous slice copying currently supports only Float32");
         auto result = empty(TensorShape(new_shape), device_, dtype_);
 
         if (device_ == Device::CUDA) {
@@ -407,16 +452,12 @@ namespace lfs::core {
 
         for (int dim : dims) {
             int r = resolve_dim(dim);
-            if (r < 0 || r >= static_cast<int>(shape_.rank())) {
-                LOG_ERROR("Dimension {} out of range for tensor with {} dimensions", dim, shape_.rank());
-                return {};
-            }
+            LFS_ASSERT_MSG(detail::tensor_dim_is_valid(r, shape_.rank()),
+                           std::format("dimension {} is out of range for rank {}", dim, shape_.rank()));
             resolved.push_back(static_cast<size_t>(r));
         }
 
         return resolved;
     }
-
-#undef CHECK_CUDA
 
 } // namespace lfs::core

@@ -94,6 +94,26 @@ TEST_F(TensorMatrixTest, MatMul2D) {
     compare_tensors(custom_mm, torch_result, 1e-4f, 1e-5f, "MM_Alias");
 }
 
+// Products with at most 16 inner and output columns take a one-thread-per-row path; sizes just past
+// the limit take the tiled kernels.
+TEST_F(TensorMatrixTest, NarrowProductsMatchTorch) {
+    for (const auto [m, k, n] : {std::tuple{1037, 3, 3}, std::tuple{2, 3, 3}, std::tuple{1037, 1, 16},
+                                 std::tuple{1037, 16, 1}, std::tuple{1037, 16, 16}, std::tuple{70001, 4, 4},
+                                 std::tuple{1037, 17, 3}, std::tuple{1037, 3, 17}}) {
+        SCOPED_TRACE(::testing::Message() << m << "x" << k << " * " << k << "x" << n);
+        const auto torch_a = torch::randn({m, k}, torch::TensorOptions().device(torch::kCUDA));
+        const auto torch_b = torch::randn({k, n}, torch::TensorOptions().device(torch::kCUDA));
+        const auto to_custom = [](const torch::Tensor& value) {
+            const auto cpu = value.cpu().contiguous();
+            std::vector<float> data(cpu.data_ptr<float>(), cpu.data_ptr<float>() + cpu.numel());
+            return Tensor::from_vector(data, {static_cast<size_t>(value.size(0)), static_cast<size_t>(value.size(1))},
+                                       Device::CUDA);
+        };
+        compare_tensors(to_custom(torch_a).matmul(to_custom(torch_b)), torch::matmul(torch_a, torch_b), 1e-4f, 1e-5f,
+                        "narrow matmul");
+    }
+}
+
 TEST_F(TensorMatrixTest, MatMulVectorMatrix) {
     // Test vector-matrix multiplication: (3,) @ (3x2) = (2,)
     std::vector<float> vec_data = {1, 2, 3};
@@ -555,8 +575,7 @@ TEST_F(TensorMatrixTest, InvalidMatMulDimensionMismatch) {
     auto a = Tensor::ones({2, 3}, Device::CUDA);
     auto b = Tensor::ones({4, 5}, Device::CUDA);
 
-    auto result = a.matmul(b);
-    EXPECT_FALSE(result.is_valid()) << "MatMul should fail with mismatched dimensions";
+    EXPECT_THROW(a.matmul(b), std::runtime_error);
 }
 
 TEST_F(TensorMatrixTest, InvalidBatchMatMulDimensionMismatch) {
@@ -564,8 +583,7 @@ TEST_F(TensorMatrixTest, InvalidBatchMatMulDimensionMismatch) {
     auto a = Tensor::ones({2, 3, 4}, Device::CUDA);
     auto b = Tensor::ones({3, 4, 5}, Device::CUDA);
 
-    auto result = a.bmm(b);
-    EXPECT_FALSE(result.is_valid()) << "BMM should fail with mismatched batch dimensions";
+    EXPECT_THROW(a.bmm(b), std::runtime_error);
 }
 
 TEST_F(TensorMatrixTest, InvalidDotProductDimensionMismatch) {
@@ -573,8 +591,7 @@ TEST_F(TensorMatrixTest, InvalidDotProductDimensionMismatch) {
     auto a = Tensor::ones({3}, Device::CUDA);
     auto b = Tensor::ones({4}, Device::CUDA);
 
-    auto result = a.dot(b);
-    EXPECT_FALSE(result.is_valid()) << "Dot product should fail with mismatched sizes";
+    EXPECT_THROW(a.dot(b), std::runtime_error);
 }
 
 // ============= CPU vs CUDA Tests =============
@@ -693,57 +710,4 @@ TEST_F(TensorMatrixTest, DiagMatMul) {
     auto torch_result = torch::matmul(torch_diag, torch_mat);
 
     compare_tensors(custom_result, torch_result, 1e-4f, 1e-5f, "DiagMatMul");
-}
-
-// ============= Performance Benchmark (Optional) =============
-
-TEST_F(TensorMatrixTest, MatMulPerformance) {
-    // Compare performance with PyTorch
-    const size_t n = 512;
-    const int iterations = 10;
-
-    auto custom_a = Tensor::randn({n, n}, Device::CUDA);
-    auto custom_b = Tensor::randn({n, n}, Device::CUDA);
-
-    auto a_vec = custom_a.to_vector();
-    auto b_vec = custom_b.to_vector();
-
-    auto torch_a = torch::tensor(a_vec, torch::TensorOptions().device(torch::kCUDA))
-                       .reshape({static_cast<int64_t>(n), static_cast<int64_t>(n)});
-    auto torch_b = torch::tensor(b_vec, torch::TensorOptions().device(torch::kCUDA))
-                       .reshape({static_cast<int64_t>(n), static_cast<int64_t>(n)});
-
-    // Warm up
-    auto warm_custom = custom_a.matmul(custom_b);
-    auto warm_torch = torch::matmul(torch_a, torch_b);
-    cudaDeviceSynchronize();
-
-    // Benchmark custom implementation
-    auto start_custom = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iterations; ++i) {
-        auto result = custom_a.matmul(custom_b);
-        cudaDeviceSynchronize();
-    }
-    auto end_custom = std::chrono::high_resolution_clock::now();
-    auto custom_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           end_custom - start_custom)
-                           .count();
-
-    // Benchmark PyTorch
-    auto start_torch = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iterations; ++i) {
-        auto result = torch::matmul(torch_a, torch_b);
-        cudaDeviceSynchronize();
-    }
-    auto end_torch = std::chrono::high_resolution_clock::now();
-    auto torch_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          end_torch - start_torch)
-                          .count();
-
-    LOG_INFO("MatMul {}x{} Performance:", n, n);
-    LOG_INFO("  Custom: {:.2f} ms per operation", custom_time / double(iterations));
-    LOG_INFO("  PyTorch: {:.2f} ms per operation", torch_time / double(iterations));
-    LOG_INFO("  Ratio: {:.2f}x", custom_time / double(torch_time));
-
-    // We don't assert on performance, just log it for information
 }

@@ -2,7 +2,9 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "python/python_runtime.hpp"
 #include "visualizer/input/input_bindings.hpp"
@@ -13,6 +15,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace nb = nanobind;
 
@@ -116,6 +119,7 @@ namespace lfs::python {
             .value("CAMERA_MOVE_DOWN", Action::CAMERA_MOVE_DOWN)
             .value("CAMERA_RESET_HOME", Action::CAMERA_RESET_HOME)
             .value("CAMERA_SET_HOME", Action::CAMERA_SET_HOME)
+            .value("CAMERA_RESTORE_HOME", Action::CAMERA_RESTORE_HOME)
             .value("CAMERA_FOCUS_SELECTION", Action::CAMERA_FOCUS_SELECTION)
             .value("CAMERA_SET_PIVOT", Action::CAMERA_SET_PIVOT)
             .value("CAMERA_NEXT_VIEW", Action::CAMERA_NEXT_VIEW)
@@ -137,13 +141,14 @@ namespace lfs::python {
             .value("DESELECT_ALL", Action::DESELECT_ALL)
             .value("SELECT_ALL", Action::SELECT_ALL)
             .value("COPY_SELECTION", Action::COPY_SELECTION)
+            .value("CUT_SELECTION", Action::CUT_SELECTION)
+            .value("TOGGLE_PERFORMANCE_HUD", Action::TOGGLE_PERFORMANCE_HUD)
             .value("PASTE_SELECTION", Action::PASTE_SELECTION)
             .value("DEPTH_ADJUST_FAR", Action::DEPTH_ADJUST_FAR)
             .value("DEPTH_ADJUST_SIDE", Action::DEPTH_ADJUST_SIDE)
             .value("TOGGLE_SELECTION_DEPTH_FILTER", Action::TOGGLE_SELECTION_DEPTH_FILTER)
             .value("TOGGLE_SELECTION_CROP_FILTER", Action::TOGGLE_SELECTION_CROP_FILTER)
             .value("BRUSH_RESIZE", Action::BRUSH_RESIZE)
-            .value("CYCLE_BRUSH_MODE", Action::CYCLE_BRUSH_MODE)
             .value("CONFIRM_POLYGON", Action::CONFIRM_POLYGON)
             .value("CANCEL_POLYGON", Action::CANCEL_POLYGON)
             .value("UNDO_POLYGON_VERTEX", Action::UNDO_POLYGON_VERTEX)
@@ -151,11 +156,15 @@ namespace lfs::python {
             .value("SELECTION_REPLACE", Action::SELECTION_REPLACE)
             .value("SELECTION_ADD", Action::SELECTION_ADD)
             .value("SELECTION_REMOVE", Action::SELECTION_REMOVE)
+            .value("SELECTION_INTERSECT", Action::SELECTION_INTERSECT)
             .value("SELECT_MODE_CENTERS", Action::SELECT_MODE_CENTERS)
             .value("SELECT_MODE_RECTANGLE", Action::SELECT_MODE_RECTANGLE)
             .value("SELECT_MODE_POLYGON", Action::SELECT_MODE_POLYGON)
             .value("SELECT_MODE_LASSO", Action::SELECT_MODE_LASSO)
             .value("SELECT_MODE_RINGS", Action::SELECT_MODE_RINGS)
+            .value("SELECT_MODE_COLOR", Action::SELECT_MODE_COLOR)
+            .value("SELECT_MODE_BOX", Action::SELECT_MODE_BOX)
+            .value("SELECT_MODE_SPHERE", Action::SELECT_MODE_SPHERE)
             .value("APPLY_CROP_BOX", Action::APPLY_CROP_BOX)
             .value("NODE_PICK", Action::NODE_PICK)
             .value("NODE_RECT_SELECT", Action::NODE_RECT_SELECT)
@@ -169,16 +178,29 @@ namespace lfs::python {
             .value("TOOL_ROTATE", Action::TOOL_ROTATE)
             .value("TOOL_SCALE", Action::TOOL_SCALE)
             .value("TOOL_MIRROR", Action::TOOL_MIRROR)
-            .value("TOOL_BRUSH", Action::TOOL_BRUSH)
             .value("TOOL_ALIGN", Action::TOOL_ALIGN)
             .value("PIE_MENU", Action::PIE_MENU)
-            .value("DEPTH_ADJUST_NEAR", Action::DEPTH_ADJUST_NEAR);
+            .value("DEPTH_ADJUST_NEAR", Action::DEPTH_ADJUST_NEAR)
+            .value("HISTOGRAM_ZOOM_MARKED", Action::HISTOGRAM_ZOOM_MARKED)
+            .value("TOGGLE_CAMERA_FRUSTUMS", Action::TOGGLE_CAMERA_FRUSTUMS)
+            .value("OPEN_PREFERENCES", Action::OPEN_PREFERENCES)
+            .value("TOGGLE_MCP_SERVER", Action::TOGGLE_MCP_SERVER)
+            .value("TOGGLE_MCP_BINDING", Action::TOGGLE_MCP_BINDING)
+            .value("TOGGLE_GRID", Action::TOGGLE_GRID)
+            .value("SELECT_ALL_SCENE_NODES", Action::SELECT_ALL_SCENE_NODES)
+            .value("TOGGLE_SCENE_SELECTION_VISIBILITY", Action::TOGGLE_SCENE_SELECTION_VISIBILITY)
+            .value("TOGGLE_SCENE_SELECTION_TRAINING", Action::TOGGLE_SCENE_SELECTION_TRAINING)
+            .value("GROUP_SELECTED_SCENE_NODES", Action::GROUP_SELECTED_SCENE_NODES)
+            .value("ASSET_GALLERY_PRIMARY", Action::ASSET_GALLERY_PRIMARY)
+            .value("ASSET_GALLERY_COPY_LINK", Action::ASSET_GALLERY_COPY_LINK)
+            .value("ASSET_REFRESH", Action::ASSET_REFRESH)
+            .value("TOGGLE_PYTHON_CONSOLE", Action::TOGGLE_PYTHON_CONSOLE)
+            .value("UNGROUP_SELECTED_SCENE_NODE", Action::UNGROUP_SELECTED_SCENE_NODE);
 
         // Expose ToolMode enum
         nb::enum_<ToolMode>(keymap, "ToolMode")
             .value("GLOBAL", ToolMode::GLOBAL)
             .value("SELECTION", ToolMode::SELECTION)
-            .value("BRUSH", ToolMode::BRUSH)
             .value("TRANSLATE", ToolMode::TRANSLATE)
             .value("ROTATE", ToolMode::ROTATE)
             .value("SCALE", ToolMode::SCALE)
@@ -225,6 +247,16 @@ namespace lfs::python {
             },
             nb::arg("mode"), nb::arg("key"), nb::arg("modifiers") = 0,
             "Get action bound to a key in given mode");
+
+        keymap.def(
+            "get_action_for_scroll",
+            [](ToolMode mode, int modifiers, std::vector<int> held_keys) {
+                if (!get_keymap_bindings())
+                    return Action::NONE;
+                return get_keymap_bindings()->getActionForScroll(mode, modifiers, held_keys);
+            },
+            nb::arg("mode"), nb::arg("modifiers") = 0, nb::arg("held_keys") = std::vector<int>{},
+            "Get action bound to a mouse scroll trigger in given mode");
 
         keymap.def(
             "get_key_for_action",
@@ -275,6 +307,9 @@ namespace lfs::python {
                 if (!get_keymap_bindings())
                     return;
                 KeyTrigger trigger{key, modifiers, false};
+                if (!InputBindings::isValidTriggerForAction(action, trigger))
+                    throw nb::value_error(lfs::event::LocalizationManager::getInstance().get(
+                        "input_settings.invalid_binding"));
                 get_keymap_bindings()->setBinding(mode, action, trigger);
             },
             nb::arg("mode"), nb::arg("action"), nb::arg("key"), nb::arg("modifiers") = 0,
@@ -287,6 +322,8 @@ namespace lfs::python {
                     return false;
                 const auto trigger = triggerFromDict(trigger_dict);
                 if (!trigger)
+                    return false;
+                if (!InputBindings::isValidTriggerForAction(action, *trigger))
                     return false;
                 get_keymap_bindings()->setBinding(mode, action, *trigger);
                 return true;
@@ -390,6 +427,9 @@ namespace lfs::python {
         keymap.def(
             "load_profile",
             [](const std::string& name) {
+                if (!InputBindings::isValidProfileName(name))
+                    throw nb::value_error(lfs::event::LocalizationManager::getInstance().get(
+                        "input_settings.invalid_profile_name"));
                 if (!get_keymap_bindings())
                     return;
                 get_keymap_bindings()->loadProfile(name);
@@ -400,9 +440,14 @@ namespace lfs::python {
         keymap.def(
             "save_profile",
             [](const std::string& name) {
+                if (!InputBindings::isValidProfileName(name))
+                    throw nb::value_error(lfs::event::LocalizationManager::getInstance().get(
+                        "input_settings.invalid_profile_name"));
                 if (!get_keymap_bindings())
                     return;
-                get_keymap_bindings()->saveProfile(name);
+                if (!get_keymap_bindings()->saveProfile(name))
+                    throw std::runtime_error(lfs::event::LocalizationManager::getInstance().get(
+                        "input_settings.profile_save_failed"));
             },
             nb::arg("name"),
             "Save current bindings as a named profile");
@@ -475,6 +520,15 @@ namespace lfs::python {
             "Check if waiting for potential double-click");
 
         keymap.def(
+            "take_altgr_capture_rejection",
+            []() {
+                if (!get_keymap_bindings())
+                    return false;
+                return get_keymap_bindings()->takeAltGrCaptureRejection();
+            },
+            "Return and clear an unsupported AltGr capture notice");
+
+        keymap.def(
             "get_captured_trigger",
             []() -> nb::object {
                 if (!get_keymap_bindings())
@@ -512,10 +566,11 @@ namespace lfs::python {
             []() {
                 if (!get_keymap_bindings())
                     return;
-                auto config_dir = InputBindings::getConfigDir();
-                auto saved_path = config_dir / "Default.json";
-                if (std::filesystem::exists(saved_path)) {
-                    std::filesystem::remove(saved_path);
+                if (const auto config_dir = InputBindings::getConfigDir()) {
+                    const auto saved_path = *config_dir / "Default.json";
+                    if (lfs::core::native_fs::exists(saved_path)) {
+                        lfs::core::native_fs::remove(saved_path);
+                    }
                 }
                 get_keymap_bindings()->loadProfile("Default");
                 get_keymap_bindings()->saveProfile("Default");

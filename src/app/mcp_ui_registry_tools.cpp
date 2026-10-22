@@ -8,8 +8,10 @@
 #include "core/events.hpp"
 #include "python/python_runtime.hpp"
 #include "visualizer/core/editor_context.hpp"
+#include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui/rml_menu_bar.hpp"
+#include "visualizer/gui/rml_modal_overlay.hpp"
 #include "visualizer/operator/operator_properties.hpp"
 #include "visualizer/operator/operator_registry.hpp"
 #include "visualizer/tools/unified_tool_registry.hpp"
@@ -44,11 +46,14 @@ namespace lfs::app {
         };
 
         constexpr std::array kSelectionSubmodes = {
-            std::pair<std::string_view, int>{"centers", 0},
-            std::pair<std::string_view, int>{"rectangle", 1},
-            std::pair<std::string_view, int>{"polygon", 2},
-            std::pair<std::string_view, int>{"lasso", 3},
-            std::pair<std::string_view, int>{"rings", 4},
+            std::pair<std::string_view, int>{"centers", static_cast<int>(vis::SelectionSubMode::Centers)},
+            std::pair<std::string_view, int>{"rectangle", static_cast<int>(vis::SelectionSubMode::Rectangle)},
+            std::pair<std::string_view, int>{"polygon", static_cast<int>(vis::SelectionSubMode::Polygon)},
+            std::pair<std::string_view, int>{"lasso", static_cast<int>(vis::SelectionSubMode::Lasso)},
+            std::pair<std::string_view, int>{"rings", static_cast<int>(vis::SelectionSubMode::Rings)},
+            std::pair<std::string_view, int>{"color", static_cast<int>(vis::SelectionSubMode::Color)},
+            std::pair<std::string_view, int>{"box", static_cast<int>(vis::SelectionSubMode::Box)},
+            std::pair<std::string_view, int>{"sphere", static_cast<int>(vis::SelectionSubMode::Sphere)},
         };
 
         struct CollectedMenuItem {
@@ -141,8 +146,6 @@ namespace lfs::app {
                 return "builtin.scale";
             case vis::ToolType::Mirror:
                 return "builtin.mirror";
-            case vis::ToolType::Brush:
-                return "builtin.brush";
             case vis::ToolType::Align:
                 return "builtin.align";
             }
@@ -201,8 +204,12 @@ namespace lfs::app {
                 return std::string(value);
             }
 
-            const std::string key(value);
-            return LOC(key.c_str());
+            auto& localization =
+                lfs::event::LocalizationManager::getInstance();
+            if (!localization.hasKey(value)) {
+                return std::string(value);
+            }
+            return localization.get(value);
         }
 
         const char* menu_item_type_to_string(const int type) {
@@ -534,6 +541,60 @@ namespace lfs::app {
             return dynamic_cast<vis::VisualizerImpl*>(viewer);
         }
 
+        vis::gui::RmlModalOverlay* modal_overlay_or_null(vis::Visualizer* viewer) {
+            auto* const impl = as_visualizer_impl(viewer);
+            if (!impl)
+                return nullptr;
+            auto* const gui = impl->getGuiManager();
+            return gui ? gui->modalOverlay() : nullptr;
+        }
+
+        json modal_state_json(vis::gui::RmlModalOverlay* overlay) {
+            json buttons = json::array();
+            if (!overlay) {
+                return json{
+                    {"open", false},
+                    {"title", ""},
+                    {"body", ""},
+                    {"buttons", std::move(buttons)},
+                    {"has_input", false},
+                    {"pending", 0},
+                };
+            }
+
+            const auto snap = overlay->current();
+            const auto pending = overlay->pending_count();
+            if (!snap) {
+                return json{
+                    {"open", false},
+                    {"title", ""},
+                    {"body", ""},
+                    {"buttons", std::move(buttons)},
+                    {"has_input", false},
+                    {"pending", pending},
+                };
+            }
+
+            const auto n = snap->button_labels.size() < snap->button_enabled.size()
+                               ? snap->button_labels.size()
+                               : snap->button_enabled.size();
+            buttons.get_ref<json::array_t&>().reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                buttons.push_back(json{
+                    {"label", snap->button_labels[i]},
+                    {"enabled", static_cast<bool>(snap->button_enabled[i])},
+                });
+            }
+            return json{
+                {"open", true},
+                {"title", snap->title},
+                {"body", snap->body_text},
+                {"buttons", std::move(buttons)},
+                {"has_input", snap->has_input},
+                {"pending", pending},
+            };
+        }
+
         json current_ui_state_json(vis::Visualizer* viewer) {
             const std::string active_tool_id = vis::UnifiedToolRegistry::instance().getActiveTool();
             const std::string active_submode_id = vis::UnifiedToolRegistry::instance().getActiveSubmode();
@@ -612,7 +673,7 @@ namespace lfs::app {
         }
 
         json panel_details_json(const vis::gui::PanelDetails& panel) {
-            return json{
+            json result{
                 {"id", panel.id},
                 {"label", panel.label},
                 {"parent_id", panel.parent_id},
@@ -625,6 +686,14 @@ namespace lfs::app {
                 {"initial_width", panel.initial_width},
                 {"initial_height", panel.initial_height},
             };
+            if (panel.space == vis::gui::PanelSpace::Floating) {
+                const auto instance = vis::gui::PanelRegistry::instance().get_panel_instance(panel.id);
+                result["desktop_window"] = instance && instance->nativeWindow();
+                if (const auto bounds = vis::gui::PanelRegistry::instance().live_floating_bounds(panel.id)) {
+                    result["floating_bounds"] = json{{"x", bounds->x}, {"y", bounds->y}, {"width", bounds->width}, {"height", bounds->height}, {"coordinate_space", "main_window_pixels"}};
+                }
+            }
+            return result;
         }
 
         std::expected<json, std::string> list_tools_payload(vis::Visualizer* viewer,
@@ -826,14 +895,14 @@ namespace lfs::app {
                         return json{{"error", description.error()}};
                     }
 
+                    const bool available_before = (*description)["tool"].value("poll", false);
+                    vis::UnifiedToolRegistry::instance().invoke(tool_id);
+
                     if (submode_id) {
                         if (auto result = set_selection_submode(*submode_id); !result) {
                             return json{{"error", result.error()}};
                         }
                     }
-
-                    const bool available_before = (*description)["tool"].value("poll", false);
-                    vis::UnifiedToolRegistry::instance().invoke(tool_id);
 
                     auto payload = current_ui_state_json(viewer);
                     payload["success"] = true;
@@ -885,7 +954,7 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"submode_id", json{{"type", "string"}, {"enum", json::array({"centers", "rectangle", "polygon", "lasso", "rings"})}, {"description", "Selection submode id"}}}},
+                        {"submode_id", json{{"type", "string"}, {"enum", json::array({"centers", "rectangle", "polygon", "lasso", "rings", "box", "sphere", "color"})}, {"description", "Selection submode id"}}}},
                     .required = {"submode_id"}},
                 .metadata = mcp::McpToolMetadata{
                     .category = "ui",
@@ -968,8 +1037,8 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"menu_id", json{{"type", "string"}, {"description", "Registered top-level menu id"}}},
-                        {"action_index", json{{"type", "integer"}, {"description", "Deterministic action index from ui.menu.describe"}}},
-                        {"callback_index", json{{"type", "integer"}, {"description", "Callback index from ui.menu.describe for callback-backed items"}}},
+                        {"action_index", json{{"type", "integer"}, {"description", "Deterministic action index from ui_menu_describe"}}},
+                        {"callback_index", json{{"type", "integer"}, {"description", "Callback index from ui_menu_describe for callback-backed items"}}},
                         {"operator_id", json{{"type", "string"}, {"description", "Operator id present in this menu"}}},
                         {"path", json{{"type", "array"}, {"items", json{{"type", "string"}}}, {"description", "Full raw or display label path, for example ['View', 'Theme', 'Nord']"}}}},
                     .required = {"menu_id"}},
@@ -1232,6 +1301,56 @@ namespace lfs::app {
                     auto payload = current_ui_state_json(viewer);
                     payload["success"] = true;
                     return payload;
+                });
+            });
+
+        registry.register_tool(
+            mcp::McpTool{
+                .name = "ui.modal.get",
+                .description = "Inspect the currently shown confirm/input modal overlay, including button labels and queued dialogs behind it",
+                .input_schema = {.type = "object", .properties = json::object(), .required = {}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "ui",
+                    .kind = "query",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                }},
+            [viewer](const json&) -> json {
+                return post_and_wait(viewer, [viewer]() -> json {
+                    return modal_state_json(modal_overlay_or_null(viewer));
+                });
+            });
+
+        registry.register_tool(
+            mcp::McpTool{
+                .name = "ui.modal.press",
+                .description = "Press an enabled button on the currently shown modal overlay by label, running the same result path as a real click",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"label", json{{"type", "string"}, {"description", "Exact button label to press"}}}},
+                    .required = {"label"}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "ui",
+                    .kind = "command",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                }},
+            [viewer](const json& args) -> json {
+                const std::string label = args["label"].get<std::string>();
+                return post_and_wait(viewer, [viewer, label]() -> json {
+                    auto* const overlay = modal_overlay_or_null(viewer);
+                    if (!overlay) {
+                        return json{{"pressed", false}, {"error", "Modal overlay is unavailable"}};
+                    }
+                    if (!overlay->current()) {
+                        return json{{"pressed", false}, {"error", "No modal dialog is open"}};
+                    }
+                    if (!overlay->dismiss(label)) {
+                        return json{{"pressed", false},
+                                    {"error", "No matching enabled button: " + label}};
+                    }
+                    return json{{"pressed", true}};
                 });
             });
     }

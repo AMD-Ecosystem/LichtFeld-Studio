@@ -3,11 +3,16 @@
 
 #pragma once
 
-#include "tensor_impl.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <ranges>
+#include <span>
+#include <vector>
 
 namespace lfs::core {
+
+    class Tensor;
+    class TensorShape;
 
     // Pure functions for broadcasting - no classes!
     namespace broadcast {
@@ -21,7 +26,7 @@ namespace lfs::core {
          * - Aligns shapes from the right
          * - Dimensions must either match or one must be 1
          * - Result takes the maximum of each dimension
-         * - Handles zero dimensions: 0 can only broadcast with another 0
+         * - A size-1 dimension broadcasts to zero, producing a zero dimension
          */
         inline std::vector<size_t> shape(std::span<const size_t> a, std::span<const size_t> b) {
             size_t max_rank = std::max(a.size(), b.size());
@@ -32,16 +37,14 @@ namespace lfs::core {
                 size_t dim_a = (i < a.size()) ? a[a.size() - 1 - i] : 1;
                 size_t dim_b = (i < b.size()) ? b[b.size() - 1 - i] : 1;
 
-                // Handle zero dimensions
-                if (dim_a == 0 && dim_b == 0) {
-                    result[max_rank - 1 - i] = 0;
-                } else if (dim_a == 0 || dim_b == 0) {
-                    // Can't broadcast 0 with non-zero (except matching 0)
-                    return {}; // Incompatible
-                } else if (dim_a != dim_b && dim_a != 1 && dim_b != 1) {
-                    return {}; // Incompatible
+                if (dim_a == dim_b) {
+                    result[max_rank - 1 - i] = dim_a;
+                } else if (dim_a == 1) {
+                    result[max_rank - 1 - i] = dim_b;
+                } else if (dim_b == 1) {
+                    result[max_rank - 1 - i] = dim_a;
                 } else {
-                    result[max_rank - 1 - i] = std::max(dim_a, dim_b);
+                    return {}; // Incompatible
                 }
             }
             return result;
@@ -58,10 +61,6 @@ namespace lfs::core {
             for (size_t i = 0; i < max_rank; ++i) {
                 size_t dim_a = (i < a.size()) ? a[a.size() - 1 - i] : 1;
                 size_t dim_b = (i < b.size()) ? b[b.size() - 1 - i] : 1;
-                if (dim_a == 0 && dim_b == 0)
-                    continue;
-                if (dim_a == 0 || dim_b == 0)
-                    return false;
                 if (dim_a != dim_b && dim_a != 1 && dim_b != 1)
                     return false;
             }
@@ -81,12 +80,13 @@ namespace lfs::core {
             size_t in_idx = 0;
             size_t stride = 1;
 
-            for (int i = out_shape.size() - 1; i >= 0; --i) {
+            for (size_t trailing = 0; trailing < out_shape.size(); ++trailing) {
+                const size_t i = out_shape.size() - 1 - trailing;
                 size_t coord = (out_idx / stride) % out_shape[i];
                 stride *= out_shape[i];
 
-                int in_dim = i - (out_shape.size() - in_shape.size());
-                if (in_dim >= 0) {
+                if (trailing < in_shape.size()) {
+                    const size_t in_dim = in_shape.size() - 1 - trailing;
                     size_t in_coord = (in_shape[in_dim] == 1) ? 0 : coord;
                     size_t in_stride = 1;
                     for (size_t j = in_dim + 1; j < in_shape.size(); ++j) {

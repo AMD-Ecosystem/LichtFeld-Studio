@@ -3,12 +3,15 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "package_manager.hpp"
+#include "core/native_fs.hpp"
+#include "core/path_utils.hpp"
 #include "windows_process_utils.hpp"
 
 #include <core/cuda_version.hpp>
 #include <core/executable_path.hpp>
 #include <core/logger.hpp>
 #include <core/path_utils.hpp>
+#include <core/user_paths.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -30,7 +33,6 @@ namespace lfs::python {
 
 #ifdef _WIN32
         constexpr const char* UV_BINARY = "uv.exe";
-        constexpr size_t MAX_PATH_LEN = MAX_PATH;
 #else
         constexpr const char* UV_BINARY = "uv";
         constexpr size_t MAX_PATH_LEN = 4096;
@@ -39,9 +41,7 @@ namespace lfs::python {
 
         std::filesystem::path get_executable_dir() {
 #ifdef _WIN32
-            wchar_t path[MAX_PATH_LEN];
-            GetModuleFileNameW(nullptr, path, MAX_PATH_LEN);
-            return std::filesystem::path(path).parent_path();
+            return core::getExecutableDir();
 #else
             char path[MAX_PATH_LEN];
             const ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
@@ -49,7 +49,7 @@ namespace lfs::python {
                 path[len] = '\0';
                 return std::filesystem::path(path).parent_path();
             }
-            return std::filesystem::current_path();
+            return lfs::core::native_fs::current_path();
 #endif
         }
 
@@ -141,7 +141,7 @@ namespace lfs::python {
             void* environment_ptr = environment.empty() ? nullptr : environment.data();
 
             // Keep lpApplicationName and argv[0] aligned to the same executable path.
-            if (!CreateProcessW(program_w.c_str(), cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+            if (!CreateProcessW(lfs::core::native_fs::native_path(program_w).c_str(), cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
                                 environment_ptr, nullptr, &si, &pi)) {
                 CloseHandle(hReadPipe);
                 CloseHandle(hWritePipe);
@@ -222,26 +222,19 @@ namespace lfs::python {
             return {exit_code, output};
         }
 
-        std::filesystem::path get_lichtfeld_dir() {
-#ifdef _WIN32
-            const DWORD size = GetEnvironmentVariableW(L"USERPROFILE", nullptr, 0);
-            if (size > 0) {
-                std::wstring home(size - 1, L'\0');
-                if (GetEnvironmentVariableW(L"USERPROFILE", home.data(), size) == size - 1) {
-                    return std::filesystem::path(home) / ".lichtfeld";
-                }
-            }
-            return std::filesystem::temp_directory_path() / "lichtfeld";
-#else
-            const char* const home = std::getenv("HOME");
-            return std::filesystem::path(home ? home : "/tmp") / ".lichtfeld";
-#endif
+        std::filesystem::path get_venv_dir() {
+            const auto paths = lfs::core::UserPaths::resolve();
+            if (paths)
+                return paths->venvDir();
+            LOG_WARN("Unable to resolve Python environment directory: {}; using temporary storage",
+                     lfs::format_for_developer(paths.error()));
+            return lfs::core::native_fs::temp_directory_path() / "lichtfeld" / "venv";
         }
 
     } // namespace
 
     PackageManager::PackageManager()
-        : m_root_dir(get_lichtfeld_dir()),
+        : m_root_dir(get_venv_dir().parent_path()),
           m_venv_dir(m_root_dir / "venv") {}
 
     PackageManager& PackageManager::instance() {
@@ -260,10 +253,10 @@ namespace lfs::python {
         const auto exe_dir = get_executable_dir();
         bool bundled = false;
 
-        if (const auto p = exe_dir / "bin" / UV_BINARY; std::filesystem::exists(p)) {
+        if (const auto p = exe_dir / "bin" / UV_BINARY; lfs::core::native_fs::exists(p)) {
             cached = p;
             bundled = true;
-        } else if (const auto p = exe_dir / UV_BINARY; std::filesystem::exists(p)) {
+        } else if (const auto p = exe_dir / UV_BINARY; lfs::core::native_fs::exists(p)) {
             cached = p;
             bundled = true;
         }
@@ -296,25 +289,21 @@ namespace lfs::python {
 #endif
     }
 
-    bool PackageManager::is_venv_ready() const {
-        return m_venv_ready && std::filesystem::exists(venv_python());
-    }
-
     bool PackageManager::ensure_venv() {
         std::lock_guard lock(m_mutex);
 
-        if (m_venv_ready && std::filesystem::exists(venv_python()))
+        if (m_venv_ready && lfs::core::native_fs::exists(venv_python()))
             return true;
 
-        if (std::filesystem::exists(venv_python())) {
+        if (lfs::core::native_fs::exists(venv_python())) {
             LOG_INFO("Existing venv found: {}", lfs::core::path_to_utf8(venv_python()));
             m_venv_ready = true;
             return true;
         }
 
-        if (std::filesystem::exists(m_venv_dir) && !std::filesystem::exists(venv_python())) {
+        if (lfs::core::native_fs::exists(m_venv_dir) && !lfs::core::native_fs::exists(venv_python())) {
             LOG_WARN("Broken venv (missing python), removing: {}", lfs::core::path_to_utf8(m_venv_dir));
-            std::filesystem::remove_all(m_venv_dir);
+            lfs::core::native_fs::remove_all(m_venv_dir);
         }
 
         const auto uv = uv_path();
@@ -368,15 +357,15 @@ namespace lfs::python {
         return m_venv_dir / "Lib" / "site-packages";
 #else
         const auto lib_dir = m_venv_dir / "lib";
-        if (std::filesystem::exists(lib_dir)) {
+        if (lfs::core::native_fs::exists(lib_dir)) {
             std::filesystem::path best_match;
-            for (const auto& entry : std::filesystem::directory_iterator(lib_dir)) {
+            for (const auto& entry : lfs::core::native_fs::directory_iterator(lib_dir)) {
                 if (entry.is_directory()) {
-                    const auto name = entry.path().filename().string();
+                    const auto name = lfs::core::path_to_utf8(entry.path().filename());
                     // Prefer pythonX.Y over pythonX (more specific version)
                     if (name.find("python") == 0) {
-                        if (best_match.empty() || name.length() > best_match.filename().string().length()) {
-                            best_match = entry.path();
+                        if (best_match.empty() || name.length() > lfs::core::path_to_utf8(best_match.filename()).length()) {
+                            best_match = lfs::core::native_fs::entry_path(lib_dir, entry.path());
                         }
                     }
                 }
@@ -453,16 +442,16 @@ namespace lfs::python {
         std::vector<PackageInfo> packages;
 
         const auto site_dir = site_packages_dir();
-        if (!std::filesystem::exists(site_dir))
+        if (!lfs::core::native_fs::exists(site_dir))
             return packages;
 
         static const std::regex DIST_INFO_PATTERN(R"((.+)-(.+)\.dist-info)");
 
-        for (const auto& entry : std::filesystem::directory_iterator(site_dir)) {
+        for (const auto& entry : lfs::core::native_fs::directory_iterator(site_dir)) {
             if (!entry.is_directory())
                 continue;
 
-            const auto name = entry.path().filename().string();
+            const auto name = lfs::core::path_to_utf8(entry.path().filename());
             if (name.find(".dist-info") == std::string::npos)
                 continue;
 
@@ -471,11 +460,11 @@ namespace lfs::python {
                 const std::string pkg_name = match[1].str();
                 std::filesystem::path pkg_path = site_dir / pkg_name;
 
-                if (!std::filesystem::exists(pkg_path)) {
+                if (!lfs::core::native_fs::exists(pkg_path)) {
                     std::string normalized = pkg_name;
                     std::replace(normalized.begin(), normalized.end(), '-', '_');
                     const auto alt_path = site_dir / normalized;
-                    pkg_path = std::filesystem::exists(alt_path) ? alt_path : site_dir;
+                    pkg_path = lfs::core::native_fs::exists(alt_path) ? alt_path : site_dir;
                 }
 
                 packages.push_back(
@@ -498,90 +487,6 @@ namespace lfs::python {
                 return true;
         }
         return false;
-    }
-
-    bool PackageManager::install_async(const std::string& package,
-                                       UvRunner::OutputCallback on_output,
-                                       UvRunner::CompletionCallback on_complete) {
-        if (!ensure_venv())
-            return false;
-
-        if (!m_runner) {
-            m_runner = std::make_unique<UvRunner>();
-        }
-
-        if (m_runner->is_running()) {
-            LOG_ERROR("Another UV operation is already running");
-            return false;
-        }
-
-        LOG_INFO("Installing {} (async)", package);
-
-        m_runner->set_output_callback(std::move(on_output));
-        m_runner->set_completion_callback(std::move(on_complete));
-
-        return m_runner->start({"pip", "install", package, "--python", lfs::core::path_to_utf8(venv_python())});
-    }
-
-    bool PackageManager::uninstall_async(const std::string& package,
-                                         UvRunner::OutputCallback on_output,
-                                         UvRunner::CompletionCallback on_complete) {
-        if (!ensure_venv())
-            return false;
-
-        if (!m_runner) {
-            m_runner = std::make_unique<UvRunner>();
-        }
-
-        if (m_runner->is_running()) {
-            LOG_ERROR("Another UV operation is already running");
-            return false;
-        }
-
-        LOG_INFO("Uninstalling {} (async)", package);
-
-        m_runner->set_output_callback(std::move(on_output));
-        m_runner->set_completion_callback(std::move(on_complete));
-
-        return m_runner->start({"pip", "uninstall", package, "-y", "--python", lfs::core::path_to_utf8(venv_python())});
-    }
-
-    bool PackageManager::install_torch_async(const std::string& cuda_version,
-                                             const std::string& torch_version,
-                                             UvRunner::OutputCallback on_output,
-                                             UvRunner::CompletionCallback on_complete) {
-        if (!ensure_venv())
-            return false;
-
-        if (!m_runner) {
-            m_runner = std::make_unique<UvRunner>();
-        }
-
-        if (m_runner->is_running()) {
-            LOG_ERROR("Another UV operation is already running");
-            return false;
-        }
-
-        const std::string cuda_tag = core::get_pytorch_cuda_tag(cuda_version);
-        LOG_INFO("PyTorch CUDA tag (async): {}", cuda_tag);
-
-        std::string package = "torch";
-        if (!torch_version.empty())
-            package += "==" + torch_version;
-
-        const std::string index_url = std::string(PYTORCH_INDEX) + cuda_tag;
-
-        LOG_INFO("Installing {} from {} (async)", package, cuda_tag);
-
-        m_runner->set_output_callback(std::move(on_output));
-        m_runner->set_completion_callback(std::move(on_complete));
-
-        std::vector<std::string> args = {"pip", "install", package, "--extra-index-url", index_url,
-                                         "--python", lfs::core::path_to_utf8(venv_python())};
-        if (torch_version.empty())
-            args.push_back("--upgrade");
-
-        return m_runner->start(args);
     }
 
     bool PackageManager::install_async_raw(const std::string& package,

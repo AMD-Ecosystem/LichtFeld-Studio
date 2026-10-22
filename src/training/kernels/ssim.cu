@@ -2,10 +2,13 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/cuda_error.hpp"
+#include "core/cuda_safe_format.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "lfs/kernels/loss_tensor_contract.hpp"
 #include "lfs/kernels/ssim.cuh"
 #include "lfs/kernels/ssim_reduction.cuh"
 #include <algorithm>
-#include <cassert>
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -97,9 +100,10 @@ namespace {
         const float* __restrict__ img1,
         const TargetT* __restrict__ img2,
         float* __restrict__ ssim_map,
-        float* __restrict__ dm_dmu1,
-        float* __restrict__ dm_dsigma1_sq,
-        float* __restrict__ dm_dsigma12) {
+        float* __restrict__ cs_map,
+        __half* __restrict__ dm_dmu1,
+        __half* __restrict__ dm_dsigma1_sq,
+        __half* __restrict__ dm_dsigma12) {
         auto block = cg::this_thread_block();
         const int bIdx = block.group_index().z; // batch index
         const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
@@ -286,6 +290,9 @@ namespace {
 
                     int global_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
                     ssim_map[global_idx] = val;
+                    if (cs_map) {
+                        cs_map[global_idx] = D_ / B;
+                    }
 
                     if (dm_dmu1) {
                         // partial derivatives
@@ -293,9 +300,9 @@ namespace {
                         float d_m_dsigma1_sq = (-C_ * D_) / (A * B * B);
                         float d_m_dsigma12 = (2.f * C_) / (A * B);
 
-                        dm_dmu1[global_idx] = d_m_dmu1;
-                        dm_dsigma1_sq[global_idx] = d_m_dsigma1_sq;
-                        dm_dsigma12[global_idx] = d_m_dsigma12;
+                        dm_dmu1[global_idx] = static_cast<__half>(d_m_dmu1);
+                        dm_dsigma1_sq[global_idx] = static_cast<__half>(d_m_dsigma1_sq);
+                        dm_dsigma12[global_idx] = static_cast<__half>(d_m_dsigma12);
                     }
                 }
             }
@@ -319,9 +326,9 @@ namespace {
         const TargetT* __restrict__ img2,
         const float* __restrict__ dL_dmap,
         float* __restrict__ dL_dimg1,
-        const float* __restrict__ dm_dmu1,
-        const float* __restrict__ dm_dsigma1_sq,
-        const float* __restrict__ dm_dsigma12) {
+        const __half* __restrict__ dm_dmu1,
+        const __half* __restrict__ dm_dsigma1_sq,
+        const __half* __restrict__ dm_dsigma12) {
         auto block = cg::this_thread_block();
 
         const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
@@ -464,7 +471,8 @@ namespace {
         __half* __restrict__ dm_dmu1,
         __half* __restrict__ dm_dsigma1_sq,
         __half* __restrict__ dm_dsigma12,
-        float* __restrict__ ssim_map) {
+        float* __restrict__ ssim_map,
+        float* __restrict__ cs_map) {
 
         auto block = cg::this_thread_block();
         const int bIdx = block.group_index().z;
@@ -477,6 +485,7 @@ namespace {
         __shared__ float xconv[CONV_Y][CONV_X][5];
 
         float ssim_sum = 0.0f;
+        float cs_sum = 0.0f;
         for (int c = 0; c < CH; ++c) {
             // 1) Load tile + halo into shared memory
             {
@@ -634,6 +643,7 @@ namespace {
                     int global_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
 
                     ssim_sum += ssim_val;
+                    cs_sum += D_ / B;
 
                     if (dm_dmu1) {
                         float d_m_dmu1 = ((mu2 * 2.f * D_) / (A * B) - (mu2 * 2.f * C_) / (A * B) - (mu1 * 2.f * C_ * D_) / (A * A * B) + (mu1 * 2.f * C_ * D_) / (A * B * B));
@@ -648,13 +658,21 @@ namespace {
             }
         }
 
-        if (ssim_map && pix_x < W && pix_y < H) {
-            ssim_map[bIdx * num_pix + pix_id] = ssim_sum / static_cast<float>(CH);
+        if (pix_x < W && pix_y < H) {
+            const float inv_c = 1.0f / static_cast<float>(CH);
+            if (ssim_map) {
+                ssim_map[bIdx * num_pix + pix_id] = ssim_sum * inv_c;
+            }
+            if (cs_map) {
+                cs_map[bIdx * num_pix + pix_id] = cs_sum * inv_c;
+            }
         }
     }
 
-    // Fused L1+SSIM Backward Kernel
-    template <typename TargetT, typename PartialT>
+    // Fused L1+SSIM Backward Kernel.
+    // HasSigmaPartials=false: sigma partials are identically zero (decoupled
+    // appearance branch). Avoids a full-image zero_terms buffer.
+    template <typename TargetT, bool HasSigmaPartials = true, bool Accumulate = false>
     __global__ void fusedL1SSIMBackwardCUDA(
         float ssim_weight,
         int H,
@@ -667,9 +685,9 @@ namespace {
         const float* __restrict__ img1,
         const TargetT* __restrict__ img2,
         float* __restrict__ dL_dimg1,
-        const PartialT* __restrict__ dm_dmu1,
-        const PartialT* __restrict__ dm_dsigma1_sq,
-        const PartialT* __restrict__ dm_dsigma12) {
+        const __half* __restrict__ dm_dmu1,
+        const __half* __restrict__ dm_dsigma1_sq,
+        const __half* __restrict__ dm_dsigma12) {
 
         auto block = cg::this_thread_block();
         const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
@@ -710,15 +728,18 @@ namespace {
                         if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
                             const bool inside_valid_region =
                                 !apply_valid_padding ||
-                                (H <= 10 || W <= 10) ||
-                                (gx >= 5 && gx < W - 5 && gy >= 5 && gy < H - 5);
+                                ((H <= 10 || (gy >= 5 && gy < H - 5)) &&
+                                 (W <= 10 || (gx >= 5 && gx < W - 5)));
                             if (inside_valid_region) {
                                 chain = grad_per_pixel;
                             }
                         }
                         float vmu = get_pix_value(dm_dmu1, bIdx, c, gy, gx, CH, H, W);
-                        float vs1 = get_pix_value(dm_dsigma1_sq, bIdx, c, gy, gx, CH, H, W);
-                        float vs12 = get_pix_value(dm_dsigma12, bIdx, c, gy, gx, CH, H, W);
+                        float vs1 = 0.f, vs12 = 0.f;
+                        if constexpr (HasSigmaPartials) {
+                            vs1 = get_pix_value(dm_dsigma1_sq, bIdx, c, gy, gx, CH, H, W);
+                            vs12 = get_pix_value(dm_dsigma12, bIdx, c, gy, gx, CH, H, W);
+                        }
 
                         // SSIM gradient needs -ssim_weight (d(1-ssim)/d(ssim) = -1)
                         sData[row][col][0] = -ssim_weight * vmu * chain;
@@ -805,8 +826,8 @@ namespace {
                 float chain_local = 0.0f;
                 const bool inside_valid_region =
                     !apply_valid_padding ||
-                    (H <= 10 || W <= 10) ||
-                    (pix_x >= 5 && pix_x < W - 5 && pix_y >= 5 && pix_y < H - 5);
+                    ((H <= 10 || (pix_y >= 5 && pix_y < H - 5)) &&
+                     (W <= 10 || (pix_x >= 5 && pix_x < W - 5)));
                 if (inside_valid_region) {
                     chain_local = grad_per_pixel;
                 }
@@ -814,14 +835,176 @@ namespace {
                 float grad_l1 = l1_weight * sign_grad * chain_local;
 
                 // Combined gradient
-                dL_dimg1[out_idx] = grad_ssim + grad_l1;
+                if constexpr (Accumulate)
+                    dL_dimg1[out_idx] += grad_ssim + grad_l1;
+                else
+                    dL_dimg1[out_idx] = grad_ssim + grad_l1;
             }
             block.sync();
         }
     }
 
-    // Masked Fused L1+SSIM Forward Kernel
-    template <typename TargetT>
+    // Normalize only the masked samples; retain the existing zero-padding
+    // convention outside the image. The scratch storage is reused by the image
+    // convolution, so no per-pixel allocation or extra kernel is needed.
+    template <typename MaskT, int Moments>
+    __device__ float load_mask_window(
+        const MaskT* mask, int H, int W,
+        float (&tile)[SHARED_Y][SHARED_X],
+        float (&scratch)[CONV_Y][CONV_X][Moments], bool& full_support) {
+        const auto block = cg::this_thread_block();
+        const int start_y = block.group_index().y * BLOCK_Y;
+        const int start_x = block.group_index().x * BLOCK_X;
+        // A common scale cancels from normalized moments and center/mass.
+        // Removing it improves second-moment precision for structure weights.
+        const int anchor_y = min(start_y + BLOCK_Y / 2, H - 1);
+        const int anchor_x = min(start_x + BLOCK_X / 2, W - 1);
+        const float inv_scale = 1.0f / fmaxf(1.0f, mask_value(mask, anchor_y * W + anchor_x));
+        bool all_one = true;
+        for (int i = block.thread_rank(); i < SHARED_Y * SHARED_X; i += BLOCK_X * BLOCK_Y) {
+            const int y = i / SHARED_X;
+            const int x = i % SHARED_X;
+            const int gy = start_y + y - HALO;
+            const int gx = start_x + x - HALO;
+            const float value = (gx >= 0 && gx < W && gy >= 0 && gy < H
+                                     ? mask_value(mask, gy * W + gx)
+                                     : 1.0f) *
+                                inv_scale;
+            tile[y][x] = value;
+            all_one = all_one && value == 1.0f;
+        }
+        // Most binary-mask tiles have full support; their Gaussian mass is one.
+        full_support = __syncthreads_and(all_one);
+        if (full_support)
+            return 1.0f;
+        const int x = threadIdx.x + HALO;
+        for (int y = threadIdx.y; y < CONV_Y; y += BLOCK_Y) {
+            float sum = tile[y][x] * cGauss[HALO];
+#pragma unroll
+            for (int d = 1; d <= HALO; ++d)
+                sum += (tile[y][x - d] + tile[y][x + d]) * cGauss[HALO - d];
+            scratch[y][threadIdx.x][0] = sum;
+        }
+        block.sync();
+        const int y = threadIdx.y + HALO;
+        float sum = scratch[y][threadIdx.x][0] * cGauss[HALO];
+#pragma unroll
+        for (int d = 1; d <= HALO; ++d)
+            sum += (scratch[y - d][threadIdx.x][0] + scratch[y + d][threadIdx.x][0]) * cGauss[HALO - d];
+        // Below this mass the window is unsupported. This is far below the
+        // loss reduction's epsilon, and bounds the reciprocal even without FTZ.
+        constexpr float min_window_mass = 1.0e-30f;
+        return sum >= min_window_mass ? 1.0f / sum : 0.0f;
+    }
+
+    // Full-support tiles retain the cheaper symmetric convolution.
+    template <bool Weighted>
+    __device__ __forceinline__ void masked_horizontal_moments(
+        const float (&sTile)[SHARED_Y][SHARED_X][2],
+        const float (&mask_tile)[SHARED_Y][SHARED_X],
+        float (&xconv)[CONV_Y][CONV_X][5]) {
+        int ly = threadIdx.y;
+        int lx = threadIdx.x + HALO;
+
+        float sumX = 0.f, sumX2 = 0.f, sumY = 0.f, sumY2 = 0.f, sumXY = 0.f;
+
+#pragma unroll
+        for (int d = 1; d <= HALO; ++d) {
+            float w = cGauss[HALO - d];
+            float Xleft = sTile[ly][lx - d][0];
+            float Yleft = sTile[ly][lx - d][1];
+            float Xright = sTile[ly][lx + d][0];
+            float Yright = sTile[ly][lx + d][1];
+            if constexpr (Weighted) {
+                const float ml = mask_tile[ly][lx - d] * w;
+                const float mr = mask_tile[ly][lx + d] * w;
+
+                sumX += Xleft * ml + Xright * mr;
+                sumX2 += (Xleft * Xleft) * ml + (Xright * Xright) * mr;
+                sumY += Yleft * ml + Yright * mr;
+                sumY2 += (Yleft * Yleft) * ml + (Yright * Yright) * mr;
+                sumXY += (Xleft * Yleft) * ml + (Xright * Yright) * mr;
+            } else {
+                sumX += (Xleft + Xright) * w;
+                sumX2 += (Xleft * Xleft + Xright * Xright) * w;
+                sumY += (Yleft + Yright) * w;
+                sumY2 += (Yleft * Yleft + Yright * Yright) * w;
+                sumXY += (Xleft * Yleft + Xright * Yright) * w;
+            }
+        }
+        {
+            float centerX = sTile[ly][lx][0];
+            float centerY = sTile[ly][lx][1];
+            float wc = cGauss[HALO];
+            if constexpr (Weighted)
+                wc *= mask_tile[ly][lx];
+            sumX += centerX * wc;
+            sumX2 += (centerX * centerX) * wc;
+            sumY += centerY * wc;
+            sumY2 += (centerY * centerY) * wc;
+            sumXY += (centerX * centerY) * wc;
+        }
+
+        xconv[ly][threadIdx.x][0] = sumX;
+        xconv[ly][threadIdx.x][1] = sumX2;
+        xconv[ly][threadIdx.x][2] = sumY;
+        xconv[ly][threadIdx.x][3] = sumY2;
+        xconv[ly][threadIdx.x][4] = sumXY;
+
+        int ly2 = ly + BLOCK_Y;
+        if (ly2 < CONV_Y) {
+            sumX = 0.f;
+            sumX2 = 0.f;
+            sumY = 0.f;
+            sumY2 = 0.f;
+            sumXY = 0.f;
+
+#pragma unroll
+            for (int d = 1; d <= HALO; ++d) {
+                float w = cGauss[HALO - d];
+                float Xleft = sTile[ly2][lx - d][0];
+                float Yleft = sTile[ly2][lx - d][1];
+                float Xright = sTile[ly2][lx + d][0];
+                float Yright = sTile[ly2][lx + d][1];
+                if constexpr (Weighted) {
+                    const float ml = mask_tile[ly2][lx - d] * w;
+                    const float mr = mask_tile[ly2][lx + d] * w;
+
+                    sumX += Xleft * ml + Xright * mr;
+                    sumX2 += (Xleft * Xleft) * ml + (Xright * Xright) * mr;
+                    sumY += Yleft * ml + Yright * mr;
+                    sumY2 += (Yleft * Yleft) * ml + (Yright * Yright) * mr;
+                    sumXY += (Xleft * Yleft) * ml + (Xright * Yright) * mr;
+                } else {
+                    sumX += (Xleft + Xright) * w;
+                    sumX2 += (Xleft * Xleft + Xright * Xright) * w;
+                    sumY += (Yleft + Yright) * w;
+                    sumY2 += (Yleft * Yleft + Yright * Yright) * w;
+                    sumXY += (Xleft * Yleft + Xright * Yright) * w;
+                }
+            }
+            {
+                float cx = sTile[ly2][lx][0];
+                float cy = sTile[ly2][lx][1];
+                float wc = cGauss[HALO];
+                if constexpr (Weighted)
+                    wc *= mask_tile[ly2][lx];
+                sumX += cx * wc;
+                sumX2 += (cx * cx) * wc;
+                sumY += cy * wc;
+                sumY2 += (cy * cy) * wc;
+                sumXY += (cx * cy) * wc;
+            }
+            xconv[ly2][threadIdx.x][0] = sumX;
+            xconv[ly2][threadIdx.x][1] = sumX2;
+            xconv[ly2][threadIdx.x][2] = sumY;
+            xconv[ly2][threadIdx.x][3] = sumY2;
+            xconv[ly2][threadIdx.x][4] = sumXY;
+        }
+    }
+
+    // Masked Fused L1+SSIM Forward Kernel.
+    template <typename TargetT, typename MaskT>
     __global__ void maskedFusedL1SSIMForwardCUDA(
         int H,
         int W,
@@ -830,10 +1013,12 @@ namespace {
         float C2,
         const float* __restrict__ img1,
         const TargetT* __restrict__ img2,
-        float* __restrict__ dm_dmu1,
-        float* __restrict__ dm_dsigma1_sq,
-        float* __restrict__ dm_dsigma12,
-        float* __restrict__ ssim_map) {
+        const MaskT* __restrict__ mask,
+        __half* __restrict__ dm_dmu1,
+        __half* __restrict__ dm_dsigma1_sq,
+        __half* __restrict__ dm_dsigma12,
+        float* __restrict__ ssim_map,
+        float* __restrict__ cs_map) {
 
         auto block = cg::this_thread_block();
         const int bIdx = block.group_index().z;
@@ -845,7 +1030,33 @@ namespace {
         __shared__ float sTile[SHARED_Y][SHARED_X][2];
         __shared__ float xconv[CONV_Y][CONV_X][5];
 
+        __shared__ float mask_tile[SHARED_Y][SHARED_X];
+        bool full_support;
+        const float inv_window = load_mask_window(mask, H, W, mask_tile, xconv, full_support);
+        const float center_weight = mask_tile[threadIdx.y + HALO][threadIdx.x + HALO];
+        const float derivative_weight = center_weight * inv_window;
+        // Ignored centers contribute no loss or partials, even near a kept tile.
+        if (!__syncthreads_or(pix_x < W && pix_y < H && center_weight != 0.0f)) {
+            if (pix_x < W && pix_y < H) {
+                for (int c = 0; c < CH; ++c) {
+                    const int index = bIdx * CH * num_pix + c * num_pix + pix_id;
+                    if (dm_dmu1)
+                        dm_dmu1[index] = __float2half(0.0f);
+                    if (dm_dsigma1_sq)
+                        dm_dsigma1_sq[index] = __float2half(0.0f);
+                    if (dm_dsigma12)
+                        dm_dsigma12[index] = __float2half(0.0f);
+                }
+                if (ssim_map)
+                    ssim_map[bIdx * num_pix + pix_id] = 1.0f;
+                if (cs_map)
+                    cs_map[bIdx * num_pix + pix_id] = 1.0f;
+            }
+            return;
+        }
+
         float ssim_sum = 0.0f;
+        float cs_sum = 0.0f;
         for (int c = 0; c < CH; ++c) {
             // 1) Load tile
             {
@@ -873,83 +1084,10 @@ namespace {
             }
             block.sync();
 
-            // 2) Horizontal convolution
-            {
-                int ly = threadIdx.y;
-                int lx = threadIdx.x + HALO;
-
-                float sumX = 0.f, sumX2 = 0.f, sumY = 0.f, sumY2 = 0.f, sumXY = 0.f;
-
-#pragma unroll
-                for (int d = 1; d <= HALO; ++d) {
-                    float w = cGauss[HALO - d];
-                    float Xleft = sTile[ly][lx - d][0];
-                    float Yleft = sTile[ly][lx - d][1];
-                    float Xright = sTile[ly][lx + d][0];
-                    float Yright = sTile[ly][lx + d][1];
-
-                    sumX += (Xleft + Xright) * w;
-                    sumX2 += ((Xleft * Xleft) + (Xright * Xright)) * w;
-                    sumY += (Yleft + Yright) * w;
-                    sumY2 += ((Yleft * Yleft) + (Yright * Yright)) * w;
-                    sumXY += ((Xleft * Yleft) + (Xright * Yright)) * w;
-                }
-                {
-                    float centerX = sTile[ly][lx][0];
-                    float centerY = sTile[ly][lx][1];
-                    float wc = cGauss[HALO];
-                    sumX += centerX * wc;
-                    sumX2 += (centerX * centerX) * wc;
-                    sumY += centerY * wc;
-                    sumY2 += (centerY * centerY) * wc;
-                    sumXY += (centerX * centerY) * wc;
-                }
-
-                xconv[ly][threadIdx.x][0] = sumX;
-                xconv[ly][threadIdx.x][1] = sumX2;
-                xconv[ly][threadIdx.x][2] = sumY;
-                xconv[ly][threadIdx.x][3] = sumY2;
-                xconv[ly][threadIdx.x][4] = sumXY;
-
-                int ly2 = ly + BLOCK_Y;
-                if (ly2 < CONV_Y) {
-                    sumX = 0.f;
-                    sumX2 = 0.f;
-                    sumY = 0.f;
-                    sumY2 = 0.f;
-                    sumXY = 0.f;
-
-#pragma unroll
-                    for (int d = 1; d <= HALO; ++d) {
-                        float w = cGauss[HALO - d];
-                        float Xleft = sTile[ly2][lx - d][0];
-                        float Yleft = sTile[ly2][lx - d][1];
-                        float Xright = sTile[ly2][lx + d][0];
-                        float Yright = sTile[ly2][lx + d][1];
-
-                        sumX += (Xleft + Xright) * w;
-                        sumX2 += ((Xleft * Xleft) + (Xright * Xright)) * w;
-                        sumY += (Yleft + Yright) * w;
-                        sumY2 += ((Yleft * Yleft) + (Yright * Yright)) * w;
-                        sumXY += ((Xleft * Yleft) + (Xright * Yright)) * w;
-                    }
-                    {
-                        float cx = sTile[ly2][lx][0];
-                        float cy = sTile[ly2][lx][1];
-                        float wc = cGauss[HALO];
-                        sumX += cx * wc;
-                        sumX2 += (cx * cx) * wc;
-                        sumY += cy * wc;
-                        sumY2 += (cy * cy) * wc;
-                        sumXY += (cx * cy) * wc;
-                    }
-                    xconv[ly2][threadIdx.x][0] = sumX;
-                    xconv[ly2][threadIdx.x][1] = sumX2;
-                    xconv[ly2][threadIdx.x][2] = sumY;
-                    xconv[ly2][threadIdx.x][3] = sumY2;
-                    xconv[ly2][threadIdx.x][4] = sumXY;
-                }
-            }
+            if (full_support)
+                masked_horizontal_moments<false>(sTile, mask_tile, xconv);
+            else
+                masked_horizontal_moments<true>(sTile, mask_tile, xconv);
             block.sync();
 
             // 3) Vertical convolution + SSIM
@@ -982,14 +1120,14 @@ namespace {
                 }
 
                 if (pix_x < W && pix_y < H) {
-                    float mu1 = out0;
-                    float mu2 = out2;
+                    float mu1 = out0 * inv_window;
+                    float mu2 = out2 * inv_window;
                     float mu1_sq = mu1 * mu1;
                     float mu2_sq = mu2 * mu2;
 
-                    float sigma1_sq = out1 - mu1_sq;
-                    float sigma2_sq = out3 - mu2_sq;
-                    float sigma12 = out4 - mu1 * mu2;
+                    float sigma1_sq = out1 * inv_window - mu1_sq;
+                    float sigma2_sq = out3 * inv_window - mu2_sq;
+                    float sigma12 = out4 * inv_window - mu1 * mu2;
 
                     float A = mu1_sq + mu2_sq + C1;
                     float B = sigma1_sq + sigma2_sq + C2;
@@ -1001,22 +1139,311 @@ namespace {
                     int global_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
 
                     ssim_sum += ssim_val;
+                    cs_sum += D_ / B;
 
                     if (dm_dmu1) {
                         float d_m_dmu1 = ((mu2 * 2.f * D_) / (A * B) - (mu2 * 2.f * C_) / (A * B) - (mu1 * 2.f * C_ * D_) / (A * A * B) + (mu1 * 2.f * C_ * D_) / (A * B * B));
                         float d_m_dsigma1_sq = (-C_ * D_) / (A * B * B);
                         float d_m_dsigma12 = (2.f * C_) / (A * B);
 
-                        dm_dmu1[global_idx] = d_m_dmu1;
-                        dm_dsigma1_sq[global_idx] = d_m_dsigma1_sq;
-                        dm_dsigma12[global_idx] = d_m_dsigma12;
+                        dm_dmu1[global_idx] = static_cast<__half>(d_m_dmu1 * derivative_weight);
+                        dm_dsigma1_sq[global_idx] = static_cast<__half>(d_m_dsigma1_sq * derivative_weight);
+                        dm_dsigma12[global_idx] = static_cast<__half>(d_m_dsigma12 * derivative_weight);
                     }
                 }
             }
         }
 
-        if (ssim_map && pix_x < W && pix_y < H) {
-            ssim_map[bIdx * num_pix + pix_id] = ssim_sum / static_cast<float>(CH);
+        if (pix_x < W && pix_y < H) {
+            const float inv_c = 1.0f / static_cast<float>(CH);
+            if (ssim_map) {
+                ssim_map[bIdx * num_pix + pix_id] = center_weight > 0.0f ? ssim_sum * inv_c : 1.0f;
+            }
+            if (cs_map) {
+                cs_map[bIdx * num_pix + pix_id] = center_weight > 0.0f ? cs_sum * inv_c : 1.0f;
+            }
+        }
+    }
+
+    template <typename TargetT, typename MaskT>
+    __global__ void maskedDecoupledFusedL1SSIMForwardCUDA(
+        int H,
+        int W,
+        int CH,
+        float C1,
+        float C2,
+        float ssim_weight,
+        const float* __restrict__ corrected_img,
+        const float* __restrict__ raw_img,
+        const TargetT* __restrict__ gt_img,
+        const MaskT* __restrict__ mask,
+        __half* __restrict__ app_dm_dmu1,
+        __half* __restrict__ raw_dm_dmu1,
+        __half* __restrict__ raw_dm_dsigma1_sq,
+        __half* __restrict__ raw_dm_dsigma12,
+        float* __restrict__ ssim_map,
+        float* __restrict__ cs_map) {
+
+        auto block = cg::this_thread_block();
+        const int bIdx = block.group_index().z;
+        const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
+        const int pix_x = block.group_index().x * BLOCK_X + block.thread_index().x;
+        const int pix_id = pix_y * W + pix_x;
+        const int num_pix = H * W;
+
+        __shared__ float sTile[SHARED_Y][SHARED_X][3];
+        // [0]=corrected, [1]=raw, [2]=raw^2, [3]=gt, [4]=gt^2, [5]=raw*gt
+        __shared__ float xconv[CONV_Y][CONV_X][6];
+
+        __shared__ float mask_tile[SHARED_Y][SHARED_X];
+        bool full_support;
+        const float inv_window = load_mask_window(mask, H, W, mask_tile, xconv, full_support);
+        const float center_weight = mask_tile[threadIdx.y + HALO][threadIdx.x + HALO];
+        const float derivative_weight = center_weight * inv_window;
+        // Ignored centers contribute no loss or partials, even near a kept tile.
+        if (!__syncthreads_or(pix_x < W && pix_y < H && center_weight != 0.0f)) {
+            if (pix_x < W && pix_y < H) {
+                for (int c = 0; c < CH; ++c) {
+                    const int index = bIdx * CH * num_pix + c * num_pix + pix_id;
+                    if (app_dm_dmu1)
+                        app_dm_dmu1[index] = __float2half(0.0f);
+                    if (raw_dm_dmu1)
+                        raw_dm_dmu1[index] = __float2half(0.0f);
+                    if (raw_dm_dsigma1_sq)
+                        raw_dm_dsigma1_sq[index] = __float2half(0.0f);
+                    if (raw_dm_dsigma12)
+                        raw_dm_dsigma12[index] = __float2half(0.0f);
+                }
+                if (ssim_map)
+                    ssim_map[bIdx * num_pix + pix_id] = 1.0f;
+                if (cs_map)
+                    cs_map[bIdx * num_pix + pix_id] = 1.0f;
+            }
+            return;
+        }
+
+        float ssim_sum = 0.0f;
+        float cs_sum = 0.0f;
+        for (int c = 0; c < CH; ++c) {
+            {
+                const int tileSize = SHARED_Y * SHARED_X;
+                const int threads = BLOCK_X * BLOCK_Y;
+                const int steps = (tileSize + threads - 1) / threads;
+                const int tileStartY = block.group_index().y * BLOCK_Y;
+                const int tileStartX = block.group_index().x * BLOCK_X;
+
+                for (int s = 0; s < steps; ++s) {
+                    int tid = s * threads + block.thread_rank();
+                    if (tid < tileSize) {
+                        int local_y = tid / SHARED_X;
+                        int local_x = tid % SHARED_X;
+                        int gy = tileStartY + local_y - HALO;
+                        int gx = tileStartX + local_x - HALO;
+
+                        sTile[local_y][local_x][0] = get_pix_value(corrected_img, bIdx, c, gy, gx, CH, H, W);
+                        sTile[local_y][local_x][1] = get_pix_value(raw_img, bIdx, c, gy, gx, CH, H, W);
+                        sTile[local_y][local_x][2] = get_pix_value(gt_img, bIdx, c, gy, gx, CH, H, W);
+                    }
+                }
+            }
+            block.sync();
+
+            {
+                int ly = threadIdx.y;
+                int lx = threadIdx.x + HALO;
+
+                float sum_corrected = 0.f;
+                float sum_raw = 0.f;
+                float sum_raw_sq = 0.f;
+                float sum_gt = 0.f;
+                float sum_gt_sq = 0.f;
+                float sum_raw_gt = 0.f;
+
+#pragma unroll
+                for (int d = 1; d <= HALO; ++d) {
+                    const float w = cGauss[HALO - d];
+
+                    const float corrected_left = sTile[ly][lx - d][0];
+                    const float corrected_right = sTile[ly][lx + d][0];
+                    const float raw_left = sTile[ly][lx - d][1];
+                    const float raw_right = sTile[ly][lx + d][1];
+                    const float gt_left = sTile[ly][lx - d][2];
+                    const float gt_right = sTile[ly][lx + d][2];
+                    const float ml = mask_tile[ly][lx - d] * w;
+                    const float mr = mask_tile[ly][lx + d] * w;
+
+                    sum_corrected += corrected_left * ml + corrected_right * mr;
+                    sum_raw += raw_left * ml + raw_right * mr;
+                    sum_raw_sq += (raw_left * raw_left) * ml + (raw_right * raw_right) * mr;
+                    sum_gt += gt_left * ml + gt_right * mr;
+                    sum_gt_sq += (gt_left * gt_left) * ml + (gt_right * gt_right) * mr;
+                    sum_raw_gt += (raw_left * gt_left) * ml + (raw_right * gt_right) * mr;
+                }
+
+                {
+                    const float corrected_center = sTile[ly][lx][0];
+                    const float raw_center = sTile[ly][lx][1];
+                    const float gt_center = sTile[ly][lx][2];
+                    const float wc = cGauss[HALO] * mask_tile[ly][lx];
+
+                    sum_corrected += corrected_center * wc;
+                    sum_raw += raw_center * wc;
+                    sum_raw_sq += (raw_center * raw_center) * wc;
+                    sum_gt += gt_center * wc;
+                    sum_gt_sq += (gt_center * gt_center) * wc;
+                    sum_raw_gt += (raw_center * gt_center) * wc;
+                }
+
+                xconv[ly][threadIdx.x][0] = sum_corrected;
+                xconv[ly][threadIdx.x][1] = sum_raw;
+                xconv[ly][threadIdx.x][2] = sum_raw_sq;
+                xconv[ly][threadIdx.x][3] = sum_gt;
+                xconv[ly][threadIdx.x][4] = sum_gt_sq;
+                xconv[ly][threadIdx.x][5] = sum_raw_gt;
+
+                const int ly2 = ly + BLOCK_Y;
+                if (ly2 < CONV_Y) {
+                    sum_corrected = 0.f;
+                    sum_raw = 0.f;
+                    sum_raw_sq = 0.f;
+                    sum_gt = 0.f;
+                    sum_gt_sq = 0.f;
+                    sum_raw_gt = 0.f;
+
+#pragma unroll
+                    for (int d = 1; d <= HALO; ++d) {
+                        const float w = cGauss[HALO - d];
+
+                        const float corrected_left = sTile[ly2][lx - d][0];
+                        const float corrected_right = sTile[ly2][lx + d][0];
+                        const float raw_left = sTile[ly2][lx - d][1];
+                        const float raw_right = sTile[ly2][lx + d][1];
+                        const float gt_left = sTile[ly2][lx - d][2];
+                        const float gt_right = sTile[ly2][lx + d][2];
+                        const float ml = mask_tile[ly2][lx - d] * w;
+                        const float mr = mask_tile[ly2][lx + d] * w;
+
+                        sum_corrected += corrected_left * ml + corrected_right * mr;
+                        sum_raw += raw_left * ml + raw_right * mr;
+                        sum_raw_sq += (raw_left * raw_left) * ml + (raw_right * raw_right) * mr;
+                        sum_gt += gt_left * ml + gt_right * mr;
+                        sum_gt_sq += (gt_left * gt_left) * ml + (gt_right * gt_right) * mr;
+                        sum_raw_gt += (raw_left * gt_left) * ml + (raw_right * gt_right) * mr;
+                    }
+
+                    {
+                        const float corrected_center = sTile[ly2][lx][0];
+                        const float raw_center = sTile[ly2][lx][1];
+                        const float gt_center = sTile[ly2][lx][2];
+                        const float wc = cGauss[HALO] * mask_tile[ly2][lx];
+
+                        sum_corrected += corrected_center * wc;
+                        sum_raw += raw_center * wc;
+                        sum_raw_sq += (raw_center * raw_center) * wc;
+                        sum_gt += gt_center * wc;
+                        sum_gt_sq += (gt_center * gt_center) * wc;
+                        sum_raw_gt += (raw_center * gt_center) * wc;
+                    }
+
+                    xconv[ly2][threadIdx.x][0] = sum_corrected;
+                    xconv[ly2][threadIdx.x][1] = sum_raw;
+                    xconv[ly2][threadIdx.x][2] = sum_raw_sq;
+                    xconv[ly2][threadIdx.x][3] = sum_gt;
+                    xconv[ly2][threadIdx.x][4] = sum_gt_sq;
+                    xconv[ly2][threadIdx.x][5] = sum_raw_gt;
+                }
+            }
+            block.sync();
+
+            {
+                int ly = threadIdx.y + HALO;
+                int lx = threadIdx.x;
+
+                float corrected_conv = 0.f;
+                float raw_conv = 0.f;
+                float raw_sq_conv = 0.f;
+                float gt_conv = 0.f;
+                float gt_sq_conv = 0.f;
+                float raw_gt_conv = 0.f;
+
+#pragma unroll
+                for (int d = 1; d <= HALO; ++d) {
+                    const float w = cGauss[HALO - d];
+                    float* top = xconv[ly - d][lx];
+                    float* bot = xconv[ly + d][lx];
+
+                    corrected_conv += (top[0] + bot[0]) * w;
+                    raw_conv += (top[1] + bot[1]) * w;
+                    raw_sq_conv += (top[2] + bot[2]) * w;
+                    gt_conv += (top[3] + bot[3]) * w;
+                    gt_sq_conv += (top[4] + bot[4]) * w;
+                    raw_gt_conv += (top[5] + bot[5]) * w;
+                }
+
+                {
+                    const float wc = cGauss[HALO];
+                    float* ctr = xconv[ly][lx];
+                    corrected_conv += ctr[0] * wc;
+                    raw_conv += ctr[1] * wc;
+                    raw_sq_conv += ctr[2] * wc;
+                    gt_conv += ctr[3] * wc;
+                    gt_sq_conv += ctr[4] * wc;
+                    raw_gt_conv += ctr[5] * wc;
+                }
+
+                if (pix_x < W && pix_y < H) {
+                    const float mu_corrected = corrected_conv * inv_window;
+                    const float mu_raw = raw_conv * inv_window;
+                    const float mu_gt = gt_conv * inv_window;
+
+                    const float mu_corrected_sq = mu_corrected * mu_corrected;
+                    const float mu_raw_sq = mu_raw * mu_raw;
+                    const float mu_gt_sq = mu_gt * mu_gt;
+
+                    const float sigma_raw_sq = raw_sq_conv * inv_window - mu_raw_sq;
+                    const float sigma_gt_sq = gt_sq_conv * inv_window - mu_gt_sq;
+                    const float sigma12 = raw_gt_conv * inv_window - mu_raw * mu_gt;
+
+                    const float A_app = mu_corrected_sq + mu_gt_sq + C1;
+                    const float C_app = 2.f * mu_corrected * mu_gt + C1;
+                    const float luminance = C_app / A_app;
+
+                    const float B_raw = sigma_raw_sq + sigma_gt_sq + C2;
+                    const float D_raw = 2.f * sigma12 + C2;
+                    const float contrast_structure = D_raw / B_raw;
+
+                    const int global_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
+                    const float ssim_val = luminance * contrast_structure;
+                    ssim_sum += ssim_val;
+                    cs_sum += contrast_structure;
+
+                    if (app_dm_dmu1) {
+                        const float dl_dmu1 =
+                            2.f * (mu_gt * A_app - mu_corrected * C_app) / (A_app * A_app);
+                        app_dm_dmu1[global_idx] = static_cast<__half>(contrast_structure * dl_dmu1 * derivative_weight);
+
+                        const float ds1sq = ssim_weight * (-(luminance * D_raw) / (B_raw * B_raw));
+                        const float ds12 = ssim_weight * ((2.f * luminance) / B_raw);
+                        raw_dm_dsigma1_sq[global_idx] = static_cast<__half>(ds1sq * derivative_weight);
+                        raw_dm_dsigma12[global_idx] = static_cast<__half>(ds12 * derivative_weight);
+                        // center / mass < 16 can overflow the raw mean partial
+                        // in half even for raw RGB = 3. Remove that amplification
+                        // with an exact power of two; backward restores it in float.
+                        raw_dm_dmu1[global_idx] =
+                            static_cast<__half>((ds1sq * (-2.f * mu_raw) + ds12 * (-mu_gt)) * (derivative_weight * (1.0f / 16.0f)));
+                    }
+                }
+            }
+        }
+
+        if (pix_x < W && pix_y < H) {
+            const float inv_c = 1.0f / static_cast<float>(CH);
+            if (ssim_map) {
+                ssim_map[bIdx * num_pix + pix_id] = center_weight > 0.0f ? ssim_sum * inv_c : 1.0f;
+            }
+            if (cs_map) {
+                cs_map[bIdx * num_pix + pix_id] = center_weight > 0.0f ? cs_sum * inv_c : 1.0f;
+            }
         }
     }
 
@@ -1030,7 +1457,7 @@ namespace {
     // contiguous across x. The CUDA kernel above processes every channel in a
     // block and stores interleaved derivative components in shared memory,
     // which is poorly matched to the LDS access pattern on AMD GPUs.
-    template <typename TargetT, typename PartialT, bool HasSigmaPartials>
+    template <typename TargetT, typename PartialT, bool HasSigmaPartials, bool Accumulate>
     __global__ void fusedL1SSIMBackwardHIP(
         float ssim_weight,
         int H,
@@ -1055,7 +1482,8 @@ namespace {
         const int start_y = static_cast<int>(blockIdx.y) * HIP_SSIM_BLOCK_Y;
         const int pix_x = start_x + threadIdx.x;
         const int pix_y = start_y + threadIdx.y;
-        const bool crop = apply_valid_padding && H > 10 && W > 10;
+        const bool crop_y = apply_valid_padding && H > 10;
+        const bool crop_x = apply_valid_padding && W > 10;
 
         for (int row = threadIdx.y; row < HIP_SSIM_SHARED_Y; row += HIP_SSIM_BLOCK_Y) {
             const int gy = start_y + row - HALO;
@@ -1066,7 +1494,7 @@ namespace {
                 float vs1 = 0.0f;
                 float vs12 = 0.0f;
                 if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
-                    if (!crop || (gx >= HALO && gx < W - HALO && gy >= HALO && gy < H - HALO))
+                    if ((!crop_x || (gx >= HALO && gx < W - HALO)) && (!crop_y || (gy >= HALO && gy < H - HALO)))
                         chain = grad_per_pixel;
                     vmu = get_pix_value(dm_dmu1, batch, channel, gy, gx, CH, H, W);
                     if constexpr (HasSigmaPartials) {
@@ -1120,16 +1548,20 @@ namespace {
             const float p2 = pixel_value(img2, index);
             const float grad_ssim = convolved[0] + (2.0f * p1) * convolved[1] + p2 * convolved[2];
             const bool inside_valid_region =
-                !crop || (pix_x >= HALO && pix_x < W - HALO && pix_y >= HALO && pix_y < H - HALO);
+                (!crop_x || (pix_x >= HALO && pix_x < W - HALO)) && (!crop_y || (pix_y >= HALO && pix_y < H - HALO));
             const float chain = inside_valid_region ? grad_per_pixel : 0.0f;
             const float sign = p1 == p2 ? 0.0f : copysignf(1.0f, p1 - p2);
             const float grad_l1 = (1.0f - ssim_weight) * sign * chain;
-            dL_dimg1[index] = grad_ssim + grad_l1;
+            if constexpr (Accumulate) {
+                dL_dimg1[index] += grad_ssim + grad_l1;
+            } else {
+                dL_dimg1[index] = grad_ssim + grad_l1;
+            }
         }
     }
 #endif
 
-    template <typename TargetT, typename PartialT, bool HasSigmaPartials>
+    template <typename TargetT, typename PartialT, bool HasSigmaPartials, bool Accumulate>
     void launch_fused_l1_ssim_backward(
         float ssim_weight,
         int N,
@@ -1154,7 +1586,7 @@ namespace {
         if (planes <= 65535 && grid_y <= 65535) {
             const dim3 grid(grid_x, grid_y, static_cast<unsigned int>(planes));
             const dim3 block(HIP_SSIM_BLOCK_X, HIP_SSIM_BLOCK_Y);
-            fusedL1SSIMBackwardHIP<TargetT, PartialT, HasSigmaPartials><<<grid, block, 0, stream>>>(
+            fusedL1SSIMBackwardHIP<TargetT, PartialT, HasSigmaPartials, Accumulate><<<grid, block, 0, stream>>>(
                 ssim_weight, H, W, CH, grad_per_pixel, apply_valid_padding,
                 img1, img2, dL_dimg1, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
             return;
@@ -1162,13 +1594,14 @@ namespace {
 #endif
         const dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, N);
         const dim3 block(BLOCK_X, BLOCK_Y);
-        fusedL1SSIMBackwardCUDA<TargetT, PartialT><<<grid, block, 0, stream>>>(
+        fusedL1SSIMBackwardCUDA<TargetT, HasSigmaPartials, Accumulate><<<grid, block, 0, stream>>>(
             ssim_weight, H, W, CH, C1, C2, grad_per_pixel, apply_valid_padding,
             img1, img2, dL_dimg1, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
     }
 
-    // Masked Fused L1+SSIM Backward Kernel
-    template <typename TargetT, typename MaskT>
+    // Masked Fused L1+SSIM Backward Kernel.
+    // HasSigmaPartials=false: appearance branch skips unused sigma partials.
+    template <typename TargetT, typename MaskT, bool HasSigmaPartials = true, bool Accumulate = false, bool ScaledMeanPartial = false>
     __global__ void maskedFusedL1SSIMBackwardCUDA(
         float ssim_weight,
         float inv_mask_sum, // 1.0 / mask_sum for normalization
@@ -1181,9 +1614,9 @@ namespace {
         const TargetT* __restrict__ img2,
         const MaskT* __restrict__ mask,
         float* __restrict__ dL_dimg1,
-        const float* __restrict__ dm_dmu1,
-        const float* __restrict__ dm_dsigma1_sq,
-        const float* __restrict__ dm_dsigma12) {
+        const __half* __restrict__ dm_dmu1,
+        const __half* __restrict__ dm_dsigma1_sq,
+        const __half* __restrict__ dm_dsigma12) {
 
         auto block = cg::this_thread_block();
         const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
@@ -1198,6 +1631,16 @@ namespace {
         float mask_val = 0.0f;
         if (pix_x < W && pix_y < H) {
             mask_val = mask_value(mask, pix_y * W + pix_x);
+        }
+
+        // No sample gradient can cross into an ignored output tile.
+        if (!__syncthreads_or(mask_val != 0.0f)) {
+            if constexpr (!Accumulate) {
+                if (pix_x < W && pix_y < H)
+                    for (int c = 0; c < CH; ++c)
+                        dL_dimg1[bIdx * CH * num_pix + c * num_pix + pix_id] = 0.0f;
+            }
+            return;
         }
 
         __shared__ float sData[SHARED_Y][SHARED_X][3];
@@ -1226,14 +1669,17 @@ namespace {
                     for (int col = lane_id; col < SHARED_X; col += 32) {
                         int gx = start_x + col - HALO;
 
-                        float local_mask = (gx >= 0 && gx < W && gy >= 0 && gy < H)
-                                               ? mask_value(mask, gy * W + gx)
-                                               : 0.0f;
-                        float chain = local_mask * inv_mask_sum;
+                        // Forward partials include center weight / window mass.
+                        const float chain = inv_mask_sum;
 
                         float vmu = get_pix_value(dm_dmu1, bIdx, c, gy, gx, CH, H, W);
-                        float vs1 = get_pix_value(dm_dsigma1_sq, bIdx, c, gy, gx, CH, H, W);
-                        float vs12 = get_pix_value(dm_dsigma12, bIdx, c, gy, gx, CH, H, W);
+                        if constexpr (ScaledMeanPartial)
+                            vmu *= 16.0f;
+                        float vs1 = 0.f, vs12 = 0.f;
+                        if constexpr (HasSigmaPartials) {
+                            vs1 = get_pix_value(dm_dsigma1_sq, bIdx, c, gy, gx, CH, H, W);
+                            vs12 = get_pix_value(dm_dsigma12, bIdx, c, gy, gx, CH, H, W);
+                        }
 
                         sData[row][col][0] = -ssim_weight * vmu * chain;
                         sData[row][col][1] = -ssim_weight * vs1 * chain;
@@ -1300,14 +1746,17 @@ namespace {
                     sum2 += ctr[2] * wc;
                 }
 
-                float grad_ssim = sum0 + (2.f * p1) * sum1 + p2 * sum2;
+                float grad_ssim = mask_val * (sum0 + (2.f * p1) * sum1 + p2 * sum2);
 
                 // L1 gradient with mask
                 float sign_grad = (p1 == p2) ? 0.0f : copysignf(1.0f, p1 - p2);
                 float grad_l1 = l1_weight * sign_grad * mask_val * inv_mask_sum;
 
                 int out_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
-                dL_dimg1[out_idx] = grad_ssim + grad_l1;
+                if constexpr (Accumulate)
+                    dL_dimg1[out_idx] += grad_ssim + grad_l1;
+                else
+                    dL_dimg1[out_idx] = grad_ssim + grad_l1;
             }
             block.sync();
         }
@@ -1324,11 +1773,12 @@ namespace {
         const float* __restrict__ corrected_img,
         const float* __restrict__ raw_img,
         const TargetT* __restrict__ gt_img,
-        float* __restrict__ app_dm_dmu1,
-        float* __restrict__ raw_dm_dmu1,
-        float* __restrict__ raw_dm_dsigma1_sq,
-        float* __restrict__ raw_dm_dsigma12,
-        float* __restrict__ ssim_map) {
+        __half* __restrict__ app_dm_dmu1,
+        __half* __restrict__ raw_dm_dmu1,
+        __half* __restrict__ raw_dm_dsigma1_sq,
+        __half* __restrict__ raw_dm_dsigma12,
+        float* __restrict__ ssim_map,
+        float* __restrict__ cs_map) {
 
         auto block = cg::this_thread_block();
         const int bIdx = block.group_index().z;
@@ -1342,6 +1792,7 @@ namespace {
         __shared__ float xconv[CONV_Y][CONV_X][6];
 
         float ssim_sum = 0.0f;
+        float cs_sum = 0.0f;
         for (int c = 0; c < CH; ++c) {
             {
                 const int tileSize = SHARED_Y * SHARED_X;
@@ -1529,24 +1980,158 @@ namespace {
                     const int global_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
                     const float ssim_val = luminance * contrast_structure;
                     ssim_sum += ssim_val;
+                    cs_sum += contrast_structure;
 
                     if (app_dm_dmu1) {
                         const float dl_dmu1 =
                             2.f * (mu_gt * A_app - mu_corrected * C_app) / (A_app * A_app);
-                        app_dm_dmu1[global_idx] = contrast_structure * dl_dmu1;
+                        app_dm_dmu1[global_idx] = static_cast<__half>(contrast_structure * dl_dmu1);
 
                         const float ds1sq = ssim_weight * (-(luminance * D_raw) / (B_raw * B_raw));
                         const float ds12 = ssim_weight * ((2.f * luminance) / B_raw);
-                        raw_dm_dsigma1_sq[global_idx] = ds1sq;
-                        raw_dm_dsigma12[global_idx] = ds12;
-                        raw_dm_dmu1[global_idx] = ds1sq * (-2.f * mu_raw) + ds12 * (-mu_gt);
+                        raw_dm_dsigma1_sq[global_idx] = static_cast<__half>(ds1sq);
+                        raw_dm_dsigma12[global_idx] = static_cast<__half>(ds12);
+                        raw_dm_dmu1[global_idx] =
+                            static_cast<__half>(ds1sq * (-2.f * mu_raw) + ds12 * (-mu_gt));
                     }
                 }
             }
         }
 
-        if (ssim_map && pix_x < W && pix_y < H) {
-            ssim_map[bIdx * num_pix + pix_id] = ssim_sum / static_cast<float>(CH);
+        if (pix_x < W && pix_y < H) {
+            const float inv_c = 1.0f / static_cast<float>(CH);
+            if (ssim_map) {
+                ssim_map[bIdx * num_pix + pix_id] = ssim_sum * inv_c;
+            }
+            if (cs_map) {
+                cs_map[bIdx * num_pix + pix_id] = cs_sum * inv_c;
+            }
+        }
+    }
+
+    // Evaluation needs only the map: normalized masked moments, without backward
+    // partials or contrast buffers. Keep the unmasked kernels independent.
+    template <typename TargetT, typename MaskT>
+    __global__ void maskedSSIMMapCUDA(
+        int H, int W, int CH, const float* __restrict__ pred,
+        const TargetT* __restrict__ target, const MaskT* __restrict__ mask,
+        float* __restrict__ map) {
+        const auto block = cg::this_thread_block();
+        const int start_y = block.group_index().y * BLOCK_Y;
+        const int start_x = block.group_index().x * BLOCK_X;
+        const int py = start_y + threadIdx.y, px = start_x + threadIdx.x;
+        const int b = block.group_index().z;
+        __shared__ float samples[SHARED_Y][SHARED_X][2];
+        __shared__ float weights[SHARED_Y][SHARED_X];
+        __shared__ float horizontal[CONV_Y][CONV_X][5];
+        bool all_one = true;
+        for (int i = block.thread_rank(); i < SHARED_Y * SHARED_X; i += BLOCK_X * BLOCK_Y) {
+            const int y = i / SHARED_X, x = i % SHARED_X;
+            const int gy = start_y + y - HALO, gx = start_x + x - HALO;
+            // Byte masks represent binary support, as in the training loss.
+            // Preserve zero-valued image padding outside the image with unit support.
+            const float value = gx >= 0 && gx < W && gy >= 0 && gy < H
+                                    ? mask_value(mask, gy * W + gx)
+                                    : 1.0f;
+            weights[y][x] = value;
+            all_one = all_one && value == 1.0f;
+        }
+        const bool full_support = __syncthreads_and(all_one);
+        const bool kept = px < W && py < H && weights[threadIdx.y + HALO][threadIdx.x + HALO] > 0.0f;
+        if (!__syncthreads_or(kept)) {
+            if (px < W && py < H)
+                for (int c = 0; c < CH; ++c)
+                    map[(b * CH + c) * H * W + py * W + px] = 1.0f;
+            return;
+        }
+        float inv_mass = 1.0f;
+        if (!full_support) {
+            const int x = threadIdx.x + HALO;
+            for (int y = threadIdx.y; y < CONV_Y; y += BLOCK_Y) {
+                float mass = weights[y][x] * cGauss[HALO];
+#pragma unroll
+                for (int d = 1; d <= HALO; ++d)
+                    mass += (weights[y][x - d] + weights[y][x + d]) * cGauss[HALO - d];
+                horizontal[y][threadIdx.x][0] = mass;
+            }
+            block.sync();
+            const int y = threadIdx.y + HALO;
+            float mass = horizontal[y][threadIdx.x][0] * cGauss[HALO];
+#pragma unroll
+            for (int d = 1; d <= HALO; ++d)
+                mass += (horizontal[y - d][threadIdx.x][0] + horizontal[y + d][threadIdx.x][0]) * cGauss[HALO - d];
+            // Tiny support is neutral, including when subnormals are retained.
+            inv_mass = mass >= 1.0e-30f ? 1.0f / mass : 0.0f;
+            block.sync();
+        }
+        for (int c = 0; c < CH; ++c) {
+            for (int i = block.thread_rank(); i < SHARED_Y * SHARED_X; i += BLOCK_X * BLOCK_Y) {
+                const int y = i / SHARED_X, x = i % SHARED_X;
+                const int gy = start_y + y - HALO, gx = start_x + x - HALO;
+                const bool supported = weights[y][x] > 0.0f;
+                samples[y][x][0] = supported ? get_pix_value(pred, b, c, gy, gx, CH, H, W) : 0.0f;
+                samples[y][x][1] = supported ? get_pix_value(target, b, c, gy, gx, CH, H, W) : 0.0f;
+            }
+            block.sync();
+            const int x = threadIdx.x + HALO;
+            for (int y = threadIdx.y; y < CONV_Y; y += BLOCK_Y) {
+                float sx = 0, sxx = 0, sy = 0, syy = 0, sxy = 0;
+#pragma unroll
+                for (int d = 1; d <= HALO; ++d) {
+                    const float w = cGauss[HALO - d];
+                    const float xl = samples[y][x - d][0], xr = samples[y][x + d][0];
+                    const float yl = samples[y][x - d][1], yr = samples[y][x + d][1];
+                    if (full_support) {
+                        sx = __fmaf_rn(xl + xr, w, sx);
+                        sxx = __fmaf_rn(xl * xl + xr * xr, w, sxx);
+                        sy = __fmaf_rn(yl + yr, w, sy);
+                        syy = __fmaf_rn(yl * yl + yr * yr, w, syy);
+                        sxy = __fmaf_rn(xl * yl + xr * yr, w, sxy);
+                    } else {
+                        const float ml = weights[y][x - d] * w, mr = weights[y][x + d] * w;
+                        sx += xl * ml + xr * mr;
+                        sxx += xl * xl * ml + xr * xr * mr;
+                        sy += yl * ml + yr * mr;
+                        syy += yl * yl * ml + yr * yr * mr;
+                        sxy += xl * yl * ml + xr * yr * mr;
+                    }
+                }
+                const float cx = samples[y][x][0], cy = samples[y][x][1];
+                const float wc = full_support ? cGauss[HALO] : cGauss[HALO] * weights[y][x];
+                horizontal[y][threadIdx.x][0] = sx + cx * wc;
+                horizontal[y][threadIdx.x][1] = sxx + cx * cx * wc;
+                horizontal[y][threadIdx.x][2] = sy + cy * wc;
+                horizontal[y][threadIdx.x][3] = syy + cy * cy * wc;
+                horizontal[y][threadIdx.x][4] = sxy + cx * cy * wc;
+            }
+            block.sync();
+            const int y = threadIdx.y + HALO;
+            float moments[5] = {};
+#pragma unroll
+            for (int d = 1; d <= HALO; ++d)
+#pragma unroll
+                for (int k = 0; k < 5; ++k)
+                    moments[k] += (horizontal[y - d][threadIdx.x][k] + horizontal[y + d][threadIdx.x][k]) * cGauss[HALO - d];
+#pragma unroll
+            for (int k = 0; k < 5; ++k)
+                moments[k] += horizontal[y][threadIdx.x][k] * cGauss[HALO];
+            // Preserve the unmasked kernel's FMA rounding with full support.
+            if (!full_support) {
+#pragma unroll
+                for (int k = 0; k < 5; ++k)
+                    moments[k] *= inv_mass;
+            }
+            if (px < W && py < H) {
+                const float mx = moments[0], my = moments[2];
+                const float xx = mx * mx, yy = my * my;
+                const float vx = moments[1] - xx, vy = moments[3] - yy;
+                const float xy = moments[4] - mx * my;
+                constexpr float C1 = 0.01f * 0.01f, C2 = 0.03f * 0.03f;
+                const float A = xx + yy + C1, B = vx + vy + C2;
+                const float C = __fmaf_rn(2.0f * mx, my, C1), D = 2.0f * xy + C2;
+                map[(b * CH + c) * H * W + py * W + px] = kept ? (C * D) / (A * B) : 1.0f;
+            }
+            block.sync();
         }
     }
 
@@ -1573,6 +2158,23 @@ namespace {
 // LibTorch-Free API
 namespace lfs::training::kernels {
 
+    namespace {
+        void validate_ssim_context(const SSIMContext& ctx) {
+            validate_loss_context_images(ctx.img1, ctx.img2, ctx.original_h, ctx.original_w);
+            const auto validate_derivative = [&](const lfs::core::Tensor& tensor, const std::string_view name) {
+                LFS_ASSERT_MSG(tensor.is_valid() && tensor.device() == lfs::core::Device::CUDA &&
+                                   tensor.dtype() == lfs::core::DataType::Float16 &&
+                                   tensor.is_contiguous() && tensor.shape() == ctx.img1.shape(),
+                               lfs::core::detail::format_cuda_safe(
+                                   "{} must be a contiguous Float16 CUDA tensor matching {} (shape={})",
+                                   name, ctx.img1.shape().str(), tensor.shape().str()));
+            };
+            validate_derivative(ctx.dm_dmu1, "SSIM dmu derivative");
+            validate_derivative(ctx.dm_dsigma1_sq, "SSIM variance derivative");
+            validate_derivative(ctx.dm_dsigma12, "SSIM covariance derivative");
+        }
+    } // namespace
+
     std::pair<lfs::core::Tensor, SSIMContext> ssim_forward(
         const lfs::core::Tensor& img1_input,
         const lfs::core::Tensor& img2_input,
@@ -1581,16 +2183,9 @@ namespace lfs::training::kernels {
         const float C1 = 0.01f * 0.01f;
         const float C2 = 0.03f * 0.03f;
 
-        // Make tensors contiguous and ensure 4D [N, C, H, W]
-        auto img1 = img1_input.contiguous();
-        auto img2 = img2_input.contiguous();
-
-        if (img1.ndim() == 3) {
-            img1 = img1.unsqueeze(0);
-        }
-        if (img2.ndim() == 3) {
-            img2 = img2.unsqueeze(0);
-        }
+        auto prepared_images = prepare_loss_images(img1_input, img2_input);
+        auto& img1 = prepared_images.prediction;
+        auto& img2 = prepared_images.target;
 
         int N = static_cast<int>(img1.shape()[0]);
         int C = static_cast<int>(img1.shape()[1]);
@@ -1606,21 +2201,25 @@ namespace lfs::training::kernels {
         // Output SSIM map
         auto ssim_map = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
 
-        // Allocate derivative Tensors
-        auto dm_dmu1 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
-        auto dm_dsigma1_sq = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
-        auto dm_dsigma12 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
+        auto dm_dmu1 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA,
+                                                lfs::core::DataType::Float16);
+        auto dm_dsigma1_sq = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA,
+                                                      lfs::core::DataType::Float16);
+        auto dm_dsigma12 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA,
+                                                    lfs::core::DataType::Float16);
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(),
                 img2_ptr,
                 ssim_map.ptr<float>(),
-                dm_dmu1.ptr<float>(),
-                dm_dsigma1_sq.ptr<float>(),
-                dm_dsigma12.ptr<float>());
+                /*cs_map=*/nullptr,
+                dm_dmu1.ptr<__half>(),
+                dm_dsigma1_sq.ptr<__half>(),
+                dm_dsigma12.ptr<__half>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.forward");
         });
 
         // Store original dimensions
@@ -1630,8 +2229,13 @@ namespace lfs::training::kernels {
         // Apply valid padding (crop 5 pixels from each side) using efficient view slicing
         // Then compute mean using optimized tensor reduction (matches PyTorch speed!)
         lfs::core::Tensor ssim_map_cropped = ssim_map;
-        if (apply_valid_padding && H > 10 && W > 10) {
-            ssim_map_cropped = ssim_map.slice(2, 5, H - 5).slice(3, 5, W - 5);
+        if (apply_valid_padding) {
+            if (H > 10) {
+                ssim_map_cropped = ssim_map_cropped.slice(2, 5, H - 5);
+            }
+            if (W > 10) {
+                ssim_map_cropped = ssim_map_cropped.slice(3, 5, W - 5);
+            }
         }
 
         // Use tensor library's optimized mean (warp reductions + vectorized loads)
@@ -1660,12 +2264,9 @@ namespace lfs::training::kernels {
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
-        auto img1 = img1_input.contiguous();
-        auto img2 = img2_input.contiguous();
-        if (img1.ndim() == 3)
-            img1 = img1.unsqueeze(0);
-        if (img2.ndim() == 3)
-            img2 = img2.unsqueeze(0);
+        auto prepared_images = prepare_loss_images(img1_input, img2_input);
+        auto& img1 = prepared_images.prediction;
+        auto& img2 = prepared_images.target;
 
         const int N = static_cast<int>(img1.shape()[0]);
         const int C = static_cast<int>(img1.shape()[1]);
@@ -1676,26 +2277,39 @@ namespace lfs::training::kernels {
         const dim3 block(BLOCK_X, BLOCK_Y);
 
         auto ssim_map = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
-        auto dm_dmu1 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
-        auto dm_dsigma1_sq = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
-        auto dm_dsigma12 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
+        auto cs_map = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA);
+        // dm_* fp16 (map path still materializes them for SSIMContext).
+        auto dm_dmu1 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA,
+                                                lfs::core::DataType::Float16);
+        auto dm_dsigma1_sq = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA,
+                                                      lfs::core::DataType::Float16);
+        auto dm_dsigma12 = lfs::core::Tensor::zeros(img1.shape(), lfs::core::Device::CUDA,
+                                                    lfs::core::DataType::Float16);
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(), img2_ptr,
-                ssim_map.ptr<float>(), dm_dmu1.ptr<float>(),
-                dm_dsigma1_sq.ptr<float>(), dm_dsigma12.ptr<float>());
+                ssim_map.ptr<float>(), cs_map.ptr<float>(),
+                dm_dmu1.ptr<__half>(),
+                dm_dsigma1_sq.ptr<__half>(), dm_dsigma12.ptr<__half>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.forward_map");
         });
 
         lfs::core::Tensor ssim_map_for_mean = ssim_map;
-        if (apply_valid_padding && H > 10 && W > 10) {
-            ssim_map_for_mean = ssim_map.slice(2, 5, H - 5).slice(3, 5, W - 5);
+        if (apply_valid_padding) {
+            if (H > 10) {
+                ssim_map_for_mean = ssim_map_for_mean.slice(2, 5, H - 5);
+            }
+            if (W > 10) {
+                ssim_map_for_mean = ssim_map_for_mean.slice(3, 5, W - 5);
+            }
         }
 
         return SSIMMapResult{
             .ssim_map = ssim_map,
+            .cs_map = cs_map,
             .ssim_value = ssim_map_for_mean.mean(),
             .ctx = SSIMContext{
                 .img1 = img1,
@@ -1708,23 +2322,48 @@ namespace lfs::training::kernels {
                 .apply_valid_padding = apply_valid_padding}};
     }
 
+    lfs::core::Tensor masked_ssim_map_forward(
+        const lfs::core::Tensor& pred_input, const lfs::core::Tensor& target_input,
+        const lfs::core::Tensor& mask_input) {
+        auto images = prepare_loss_images(pred_input, target_input);
+        auto& pred = images.prediction;
+        auto& target = images.target;
+        const auto dtype = mask_input.dtype();
+        const auto mask = prepare_loss_mask(
+            mask_input.to(lfs::core::Device::CUDA).to(dtype == lfs::core::DataType::UInt8 || dtype == lfs::core::DataType::Bool ? dtype : lfs::core::DataType::Float32), pred);
+        auto map = lfs::core::Tensor::empty(pred.shape(), lfs::core::Device::CUDA);
+        const int N = pred.shape()[0], C = pred.shape()[1], H = pred.shape()[2], W = pred.shape()[3];
+        const dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, N);
+        const dim3 block(BLOCK_X, BLOCK_Y);
+        dispatch_target_ptr(target, [&](auto* target_ptr) {
+            using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(target_ptr)>>;
+            dispatch_mask_ptr(mask, [&](auto* mask_ptr) {
+                using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
+                maskedSSIMMapCUDA<TargetT, MaskT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                    H, W, C, pred.ptr<float>(), target_ptr, mask_ptr, map.ptr<float>());
+                LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_metric_map");
+            });
+        });
+        return map;
+    }
+
     void ssim_error_map_forward(
         const lfs::core::Tensor& img1_input,
         const lfs::core::Tensor& img2_input,
         SSIMMapWorkspace& workspace,
-        lfs::core::Tensor& error_map) {
+        lfs::core::Tensor& error_map,
+        bool contrast_structure_only) {
 
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
-        auto img1 = img1_input.contiguous();
-        auto img2 = img2_input.contiguous();
-        if (img1.ndim() == 3)
-            img1 = img1.unsqueeze(0);
-        if (img2.ndim() == 3)
-            img2 = img2.unsqueeze(0);
-
-        assert(img1.shape() == img2.shape());
+        auto prepared_images = prepare_loss_images(img1_input, img2_input);
+        auto& img1 = prepared_images.prediction;
+        auto& img2 = prepared_images.target;
+        LFS_ASSERT_MSG(img1.shape()[0] == 1,
+                       lfs::core::detail::format_cuda_safe(
+                           "SSIM error maps require a single-image batch (shape={})",
+                           img1.shape().str()));
 
         const int N = static_cast<int>(img1.shape()[0]);
         const int C = static_cast<int>(img1.shape()[1]);
@@ -1738,14 +2377,20 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(), img2_ptr,
                 workspace.ssim_map.ptr<float>(),
-                nullptr, nullptr, nullptr);
+                workspace.cs_map.ptr<float>(),
+                static_cast<__half*>(nullptr), static_cast<__half*>(nullptr),
+                static_cast<__half*>(nullptr));
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.error_map_forward");
         });
 
         if (!error_map.is_valid() ||
+            error_map.device() != lfs::core::Device::CUDA ||
+            error_map.dtype() != lfs::core::DataType::Float32 ||
+            !error_map.is_contiguous() ||
             error_map.ndim() != 2 ||
             error_map.shape()[0] != static_cast<size_t>(H) ||
             error_map.shape()[1] != static_cast<size_t>(W)) {
@@ -1753,12 +2398,16 @@ namespace lfs::training::kernels {
                                                  lfs::core::Device::CUDA);
         }
 
-        launch_ssim_to_error_map(workspace.ssim_map, error_map);
+        launch_ssim_to_error_map(
+            contrast_structure_only ? workspace.cs_map : workspace.ssim_map, error_map);
     }
 
     lfs::core::Tensor ssim_backward(
         const SSIMContext& ctx,
         float grad_loss) {
+
+        validate_ssim_context(ctx);
+        LFS_ASSERT_MSG(std::isfinite(grad_loss), "SSIM loss gradient must be finite");
 
         const float C1 = 0.01f * 0.01f;
         const float C2 = 0.03f * 0.03f;
@@ -1770,9 +2419,9 @@ namespace lfs::training::kernels {
         size_t C = ctx.img1.shape()[1];
         size_t numel = N * C * grad_h * grad_w;
 
-        if (ctx.apply_valid_padding && grad_h > 10 && grad_w > 10) {
-            grad_h -= 10; // Remove 5 pixels from each side
-            grad_w -= 10;
+        if (ctx.apply_valid_padding) {
+            grad_h = grad_h > 10 ? grad_h - 10 : grad_h;
+            grad_w = grad_w > 10 ? grad_w - 10 : grad_w;
             numel = N * C * grad_h * grad_w;
         }
 
@@ -1784,14 +2433,14 @@ namespace lfs::training::kernels {
         // Create gradient tensor for cropped region
         auto dL_dmap = lfs::core::Tensor::zeros(ctx.img1.shape(), lfs::core::Device::CUDA);
 
-        if (ctx.apply_valid_padding && ctx.original_h > 10 && ctx.original_w > 10) {
-            // Fill cropped region with gradient (use stream-aware version to avoid sync)
-            auto cropped_view = dL_dmap.slice(2, 5, ctx.original_h - 5).slice(3, 5, ctx.original_w - 5);
-            cropped_view.fill_(grad_per_pixel, nullptr); // stream-aware version, no sync
-        } else {
-            // No cropping - fill entire map (use stream-aware version to avoid sync)
-            dL_dmap.fill_(grad_per_pixel, nullptr);
+        auto cropped_view = dL_dmap;
+        if (ctx.apply_valid_padding && ctx.original_h > 10) {
+            cropped_view = cropped_view.slice(2, 5, ctx.original_h - 5);
         }
+        if (ctx.apply_valid_padding && ctx.original_w > 10) {
+            cropped_view = cropped_view.slice(3, 5, ctx.original_w - 5);
+        }
+        cropped_view.fill_(grad_per_pixel, nullptr);
 
         // Allocate output gradient
         auto dL_dimg1 = lfs::core::Tensor::zeros(ctx.img1.shape(), lfs::core::Device::CUDA);
@@ -1804,15 +2453,16 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssim_backwardCUDA<TargetT><<<grid, block>>>(
+            fusedssim_backwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.original_h, ctx.original_w, static_cast<int>(C), C1, C2,
                 ctx.img1.ptr<float>(),
                 img2_ptr,
                 dL_dmap.ptr<float>(),
                 dL_dimg1.ptr<float>(),
-                ctx.dm_dmu1.ptr<float>(),
-                ctx.dm_dsigma1_sq.ptr<float>(),
-                ctx.dm_dsigma12.ptr<float>());
+                ctx.dm_dmu1.ptr<__half>(),
+                ctx.dm_dsigma1_sq.ptr<__half>(),
+                ctx.dm_dsigma12.ptr<__half>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.backward");
         });
 
         return dL_dimg1;
@@ -1821,6 +2471,13 @@ namespace lfs::training::kernels {
     lfs::core::Tensor ssim_backward_with_grad_map(
         const SSIMContext& ctx,
         const lfs::core::Tensor& dL_dmap) {
+
+        validate_ssim_context(ctx);
+        auto gradient_map = prepare_loss_prediction(dL_dmap, "SSIM gradient map");
+        LFS_ASSERT_MSG(gradient_map.shape() == ctx.img1.shape(),
+                       lfs::core::detail::format_cuda_safe(
+                           "SSIM gradient map must match the context image (gradient={}, image={})",
+                           gradient_map.shape().str(), ctx.img1.shape().str()));
 
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
@@ -1834,11 +2491,12 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssim_backwardCUDA<TargetT><<<grid, block>>>(
+            fusedssim_backwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.original_h, ctx.original_w, static_cast<int>(C), C1, C2,
-                ctx.img1.ptr<float>(), img2_ptr, dL_dmap.ptr<float>(),
-                dL_dimg1.ptr<float>(), ctx.dm_dmu1.ptr<float>(),
-                ctx.dm_dsigma1_sq.ptr<float>(), ctx.dm_dsigma12.ptr<float>());
+                ctx.img1.ptr<float>(), img2_ptr, gradient_map.ptr<float>(),
+                dL_dimg1.ptr<float>(), ctx.dm_dmu1.ptr<__half>(),
+                ctx.dm_dsigma1_sq.ptr<__half>(), ctx.dm_dsigma12.ptr<__half>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.backward_grad_map");
         });
 
         return dL_dimg1;
@@ -1854,16 +2512,9 @@ namespace lfs::training::kernels {
         const float C1 = 0.01f * 0.01f;
         const float C2 = 0.03f * 0.03f;
 
-        // Make tensors contiguous and ensure 4D [N, C, H, W]
-        auto img1 = img1_input.contiguous();
-        auto img2 = img2_input.contiguous();
-
-        if (img1.ndim() == 3) {
-            img1 = img1.unsqueeze(0);
-        }
-        if (img2.ndim() == 3) {
-            img2 = img2.unsqueeze(0);
-        }
+        auto prepared_images = prepare_loss_images(img1_input, img2_input);
+        auto& img1 = prepared_images.prediction;
+        auto& img2 = prepared_images.target;
 
         int N = static_cast<int>(img1.shape()[0]);
         int C = static_cast<int>(img1.shape()[1]);
@@ -1887,14 +2538,16 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(),
                 img2_ptr,
                 workspace.ssim_map.ptr<float>(),
-                workspace.dm_dmu1.ptr<float>(),
-                workspace.dm_dsigma1_sq.ptr<float>(),
-                workspace.dm_dsigma12.ptr<float>());
+                workspace.cs_map.ptr<float>(),
+                workspace.dm_dmu1.ptr<__half>(),
+                workspace.dm_dsigma1_sq.ptr<__half>(),
+                workspace.dm_dsigma12.ptr<__half>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.forward");
         });
 
         // Store original dimensions
@@ -1908,7 +2561,9 @@ namespace lfs::training::kernels {
             N, C, H, W,
             apply_valid_padding,
             workspace.ssim_map.stream());
-        lfs::core::Tensor ssim_value_tensor = workspace.reduction_result.clone();
+        // The returned scalar aliases the workspace and must be consumed before
+        // the next forward using this workspace.
+        lfs::core::Tensor ssim_value_tensor = workspace.reduction_result;
 
         // Save context for backward (reference workspace buffers, not copies!)
         SSIMContext ctx;
@@ -1930,6 +2585,10 @@ namespace lfs::training::kernels {
         SSIMWorkspace& workspace,
         float grad_loss) {
 
+        validate_ssim_context(ctx);
+        LFS_ASSERT_MSG(std::isfinite(grad_loss), "SSIM loss gradient must be finite");
+        workspace.ensure_size(ctx.img1.shape().dims());
+
         const float C1 = 0.01f * 0.01f;
         const float C2 = 0.03f * 0.03f;
 
@@ -1940,9 +2599,9 @@ namespace lfs::training::kernels {
         size_t C = ctx.img1.shape()[1];
         size_t numel = N * C * grad_h * grad_w;
 
-        if (ctx.apply_valid_padding && grad_h > 10 && grad_w > 10) {
-            grad_h -= 10;
-            grad_w -= 10;
+        if (ctx.apply_valid_padding) {
+            grad_h = grad_h > 10 ? grad_h - 10 : grad_h;
+            grad_w = grad_w > 10 ? grad_w - 10 : grad_w;
             numel = N * C * grad_h * grad_w;
         }
 
@@ -1951,12 +2610,14 @@ namespace lfs::training::kernels {
         // Use pre-allocated workspace buffer
         workspace.dL_dmap.zero_();
 
-        if (ctx.apply_valid_padding && ctx.original_h > 10 && ctx.original_w > 10) {
-            auto cropped_view = workspace.dL_dmap.slice(2, 5, ctx.original_h - 5).slice(3, 5, ctx.original_w - 5);
-            cropped_view.fill_(grad_per_pixel, nullptr); // stream-aware version, no sync
-        } else {
-            workspace.dL_dmap.fill_(grad_per_pixel, nullptr);
+        auto cropped_view = workspace.dL_dmap;
+        if (ctx.apply_valid_padding && ctx.original_h > 10) {
+            cropped_view = cropped_view.slice(2, 5, ctx.original_h - 5);
         }
+        if (ctx.apply_valid_padding && ctx.original_w > 10) {
+            cropped_view = cropped_view.slice(3, 5, ctx.original_w - 5);
+        }
+        cropped_view.fill_(grad_per_pixel, nullptr);
 
         // Use pre-allocated output buffer
         workspace.dL_dimg1.zero_();
@@ -1969,15 +2630,16 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssim_backwardCUDA<TargetT><<<grid, block>>>(
+            fusedssim_backwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.original_h, ctx.original_w, static_cast<int>(C), C1, C2,
                 ctx.img1.ptr<float>(),
                 img2_ptr,
                 workspace.dL_dmap.ptr<float>(),
                 workspace.dL_dimg1.ptr<float>(),
-                ctx.dm_dmu1.ptr<float>(),
-                ctx.dm_dsigma1_sq.ptr<float>(),
-                ctx.dm_dsigma12.ptr<float>());
+                ctx.dm_dmu1.ptr<__half>(),
+                ctx.dm_dsigma1_sq.ptr<__half>(),
+                ctx.dm_dsigma12.ptr<__half>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.backward");
         });
 
         return workspace.dL_dimg1;
@@ -1997,13 +2659,10 @@ namespace lfs::training::kernels {
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
-        auto img1 = img1_input.contiguous();
-        auto img2 = img2_input.contiguous();
-
-        if (img1.ndim() == 3)
-            img1 = img1.unsqueeze(0);
-        if (img2.ndim() == 3)
-            img2 = img2.unsqueeze(0);
+        validate_loss_weight(ssim_weight);
+        auto prepared_images = prepare_loss_images(img1_input, img2_input);
+        auto& img1 = prepared_images.prediction;
+        auto& img2 = prepared_images.target;
 
         const int N = static_cast<int>(img1.shape()[0]);
         const int C = static_cast<int>(img1.shape()[1]);
@@ -2017,13 +2676,15 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
+            fusedL1SSIMForwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(), img2_ptr,
                 workspace.dm_dmu1.ptr<__half>(),
                 workspace.dm_dsigma1_sq.ptr<__half>(),
                 workspace.dm_dsigma12.ptr<__half>(),
-                workspace.ssim_map.ptr<float>());
+                workspace.ssim_map.ptr<float>(),
+                workspace.cs_map.ptr<float>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.fused_l1_forward");
 
             launch_fused_l1_ssim_mean_device(
                 img1.ptr<float>(),
@@ -2036,7 +2697,7 @@ namespace lfs::training::kernels {
                 apply_valid_padding,
                 workspace.ssim_map.stream());
         });
-        lfs::core::Tensor loss_scalar = workspace.reduction_result.clone();
+        lfs::core::Tensor loss_scalar = workspace.reduction_result;
 
         FusedL1SSIMContext ctx{
             .img1 = img1,
@@ -2056,6 +2717,10 @@ namespace lfs::training::kernels {
         const FusedL1SSIMContext& ctx,
         FusedL1SSIMWorkspace& workspace) {
 
+        validate_loss_context_images(ctx.img1, ctx.img2, ctx.H, ctx.W);
+        validate_loss_weight(ctx.ssim_weight);
+        workspace.ensure_size(ctx.img1.shape().dims());
+
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
@@ -2065,24 +2730,23 @@ namespace lfs::training::kernels {
         // Compute gradient normalization factor
         int grad_h = ctx.H;
         int grad_w = ctx.W;
-        if (ctx.apply_valid_padding && grad_h > 10 && grad_w > 10) {
-            grad_h -= 10;
-            grad_w -= 10;
+        if (ctx.apply_valid_padding) {
+            grad_h = grad_h > 10 ? grad_h - 10 : grad_h;
+            grad_w = grad_w > 10 ? grad_w - 10 : grad_w;
         }
         const size_t numel = N * C * grad_h * grad_w;
         const float grad_per_pixel = 1.0f / static_cast<float>(numel);
 
-        workspace.grad_img.zero_();
-
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            launch_fused_l1_ssim_backward<TargetT, __half, true>(
+            launch_fused_l1_ssim_backward<TargetT, __half, true, false>(
                 ctx.ssim_weight, static_cast<int>(N), ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                 grad_per_pixel, ctx.apply_valid_padding,
                 ctx.img1.ptr<float>(), img2_ptr,
                 workspace.grad_img.ptr<float>(),
                 ctx.dm_dmu1.ptr<__half>(), ctx.dm_dsigma1_sq.ptr<__half>(),
                 ctx.dm_dsigma12.ptr<__half>(), lfs::core::getCurrentCUDAStream());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.fused_l1_backward");
         });
 
         return workspace.grad_img;
@@ -2103,19 +2767,14 @@ namespace lfs::training::kernels {
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
-        auto corrected = corrected_input.contiguous();
-        auto raw = raw_input.contiguous();
-        auto gt = gt_input.contiguous();
-
-        if (corrected.ndim() == 3)
-            corrected = corrected.unsqueeze(0);
-        if (raw.ndim() == 3)
-            raw = raw.unsqueeze(0);
-        if (gt.ndim() == 3)
-            gt = gt.unsqueeze(0);
-
-        assert(corrected.shape() == raw.shape());
-        assert(corrected.shape() == gt.shape());
+        validate_loss_weight(ssim_weight);
+        auto corrected = prepare_loss_prediction(corrected_input, "Corrected loss image");
+        auto raw = prepare_loss_prediction(raw_input, "Raw loss image");
+        auto gt = prepare_loss_target(gt_input, "Loss target");
+        LFS_ASSERT_MSG(corrected.shape() == raw.shape() && corrected.shape() == gt.shape(),
+                       lfs::core::detail::format_cuda_safe(
+                           "Decoupled loss image shapes must match (corrected={}, raw={}, target={})",
+                           corrected.shape().str(), raw.shape().str(), gt.shape().str()));
 
         const int N = static_cast<int>(corrected.shape()[0]);
         const int C = static_cast<int>(corrected.shape()[1]);
@@ -2129,14 +2788,16 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(gt, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            decoupledFusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
+            decoupledFusedL1SSIMForwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2, ssim_weight,
                 corrected.ptr<float>(), raw.ptr<float>(), gt_ptr,
-                workspace.app_dm_dmu1.ptr<float>(),
-                workspace.raw_dm_dmu1.ptr<float>(),
-                workspace.raw_dm_dsigma1_sq.ptr<float>(),
-                workspace.raw_dm_dsigma12.ptr<float>(),
-                workspace.ssim_map.ptr<float>());
+                workspace.app_dm_dmu1.ptr<__half>(),
+                workspace.raw_dm_dmu1.ptr<__half>(),
+                workspace.raw_dm_dsigma1_sq.ptr<__half>(),
+                workspace.raw_dm_dsigma12.ptr<__half>(),
+                workspace.ssim_map.ptr<float>(),
+                workspace.cs_map.ptr<float>());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.decoupled_fused_l1_forward");
 
             launch_fused_l1_ssim_mean_device(
                 corrected.ptr<float>(),
@@ -2149,7 +2810,7 @@ namespace lfs::training::kernels {
                 apply_valid_padding,
                 workspace.ssim_map.stream());
         });
-        lfs::core::Tensor loss_scalar = workspace.reduction_result.clone();
+        lfs::core::Tensor loss_scalar = workspace.reduction_result;
 
         DecoupledFusedL1SSIMContext ctx{
             .corrected_img = corrected,
@@ -2171,6 +2832,11 @@ namespace lfs::training::kernels {
         const DecoupledFusedL1SSIMContext& ctx,
         DecoupledFusedL1SSIMWorkspace& workspace) {
 
+        validate_loss_context_images(ctx.corrected_img, ctx.gt_img, ctx.H, ctx.W);
+        validate_loss_context_images(ctx.raw_img, ctx.gt_img, ctx.H, ctx.W);
+        validate_loss_weight(ctx.ssim_weight);
+        workspace.ensure_size(ctx.corrected_img.shape().dims());
+
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
@@ -2179,39 +2845,110 @@ namespace lfs::training::kernels {
 
         int grad_h = ctx.H;
         int grad_w = ctx.W;
-        if (ctx.apply_valid_padding && grad_h > 10 && grad_w > 10) {
-            grad_h -= 10;
-            grad_w -= 10;
+        if (ctx.apply_valid_padding) {
+            grad_h = grad_h > 10 ? grad_h - 10 : grad_h;
+            grad_w = grad_w > 10 ? grad_w - 10 : grad_w;
         }
         const size_t numel = N * C * grad_h * grad_w;
         const float grad_per_pixel = 1.0f / static_cast<float>(numel);
 
         dispatch_target_ptr(ctx.gt_img, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            workspace.grad_corrected.zero_();
-            launch_fused_l1_ssim_backward<TargetT, float, false>(
+            launch_fused_l1_ssim_backward<TargetT, __half, false, false>(
                 ctx.ssim_weight, static_cast<int>(N), ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                 grad_per_pixel, ctx.apply_valid_padding,
                 ctx.corrected_img.ptr<float>(), gt_ptr,
                 workspace.grad_corrected.ptr<float>(),
-                ctx.app_dm_dmu1.ptr<float>(),
-                workspace.zero_terms.ptr<float>(),
-                workspace.zero_terms.ptr<float>(), lfs::core::getCurrentCUDAStream());
-
-            workspace.grad_raw.zero_();
-            launch_fused_l1_ssim_backward<TargetT, float, true>(
-                1.0f, static_cast<int>(N), ctx.H, ctx.W, static_cast<int>(C), C1, C2,
-                grad_per_pixel, ctx.apply_valid_padding,
-                ctx.raw_img.ptr<float>(), gt_ptr,
-                workspace.grad_raw.ptr<float>(),
-                ctx.raw_dm_dmu1.ptr<float>(),
-                ctx.raw_dm_dsigma1_sq.ptr<float>(),
-                ctx.raw_dm_dsigma12.ptr<float>(), lfs::core::getCurrentCUDAStream());
+                ctx.app_dm_dmu1.ptr<__half>(),
+                /*dm_dsigma1_sq=*/nullptr,
+                /*dm_dsigma12=*/nullptr, lfs::core::getCurrentCUDAStream());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.decoupled_fused_l1_backward");
         });
 
-        return DecoupledGradients{
-            .grad_corrected = workspace.grad_corrected,
-            .grad_raw = workspace.grad_raw};
+        return DecoupledGradients{.grad_corrected = workspace.grad_corrected};
+    }
+
+    DecoupledRawGradient decoupled_raw_gradient(const DecoupledFusedL1SSIMContext& ctx) {
+        return DecoupledRawGradient{
+            .raw_img = ctx.raw_img,
+            .gt_img = ctx.gt_img,
+            .raw_dm_dmu1 = ctx.raw_dm_dmu1,
+            .raw_dm_dsigma1_sq = ctx.raw_dm_dsigma1_sq,
+            .raw_dm_dsigma12 = ctx.raw_dm_dsigma12,
+            .H = ctx.H,
+            .W = ctx.W,
+            .apply_valid_padding = ctx.apply_valid_padding};
+    }
+
+    DecoupledRawGradient decoupled_raw_gradient(const MaskedDecoupledFusedL1SSIMContext& ctx) {
+        return DecoupledRawGradient{
+            .raw_img = ctx.raw_img,
+            .gt_img = ctx.gt_img,
+            .mask = ctx.mask,
+            .raw_dm_dmu1 = ctx.raw_dm_dmu1,
+            .raw_dm_dsigma1_sq = ctx.raw_dm_dsigma1_sq,
+            .raw_dm_dsigma12 = ctx.raw_dm_dsigma12,
+            .mask_sum_value = ctx.mask_sum_value,
+            .H = ctx.H,
+            .W = ctx.W};
+    }
+
+    void accumulate_decoupled_raw_gradient(const DecoupledRawGradient& raw, lfs::core::Tensor& grad_image) {
+        validate_loss_context_images(raw.raw_img, raw.gt_img, raw.H, raw.W);
+        LFS_ASSERT(grad_image.is_contiguous() && grad_image.dtype() == lfs::core::DataType::Float32 &&
+                   grad_image.numel() == raw.raw_img.numel());
+
+        constexpr float C1 = 0.01f * 0.01f;
+        constexpr float C2 = 0.03f * 0.03f;
+
+        const size_t N = raw.raw_img.shape()[0];
+        const size_t C = raw.raw_img.shape()[1];
+        if (raw.mask.is_valid()) {
+            const dim3 grid((raw.W + BLOCK_X - 1) / BLOCK_X, (raw.H + BLOCK_Y - 1) / BLOCK_Y, N);
+            const dim3 block(BLOCK_X, BLOCK_Y);
+            LFS_ASSERT_MSG(std::isfinite(raw.mask_sum_value) && raw.mask_sum_value > 0.0f,
+                           "Masked loss normalization must be positive and finite");
+            const auto mask = prepare_loss_mask(raw.mask, raw.raw_img);
+            const float inv_mask_sum = 1.0f / raw.mask_sum_value;
+            dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
+                using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
+                dispatch_mask_ptr(mask, [&](auto* mask_ptr) {
+                    using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
+                    maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/true, /*Accumulate=*/true, /*ScaledMeanPartial=*/true>
+                        <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                            1.0f, inv_mask_sum, raw.H, raw.W, static_cast<int>(C), C1, C2,
+                            raw.raw_img.ptr<float>(), gt_ptr, mask_ptr,
+                            grad_image.ptr<float>(),
+                            raw.raw_dm_dmu1.ptr<__half>(),
+                            raw.raw_dm_dsigma1_sq.ptr<__half>(),
+                            raw.raw_dm_dsigma12.ptr<__half>());
+                    LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_decoupled_raw_backward");
+                });
+            });
+            return;
+        }
+
+        int grad_h = raw.H;
+        int grad_w = raw.W;
+        if (raw.apply_valid_padding) {
+            grad_h = grad_h > 10 ? grad_h - 10 : grad_h;
+            grad_w = grad_w > 10 ? grad_w - 10 : grad_w;
+        }
+        const size_t numel = N * C * grad_h * grad_w;
+        const float grad_per_pixel = 1.0f / static_cast<float>(numel);
+
+        dispatch_target_ptr(raw.gt_img, [&](auto* gt_ptr) {
+            using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
+            launch_fused_l1_ssim_backward<TargetT, __half, true, true>(
+                1.0f, static_cast<int>(N), raw.H, raw.W, static_cast<int>(C), C1, C2,
+                grad_per_pixel, raw.apply_valid_padding,
+                raw.raw_img.ptr<float>(), gt_ptr,
+                grad_image.ptr<float>(),
+                raw.raw_dm_dmu1.ptr<__half>(),
+                raw.raw_dm_dsigma1_sq.ptr<__half>(),
+                raw.raw_dm_dsigma12.ptr<__half>(), lfs::core::getCurrentCUDAStream());
+            LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.decoupled_raw_backward");
+        });
     }
 
     // ============================================================================
@@ -2223,22 +2960,17 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& img2_input,
         const lfs::core::Tensor& mask_input,
         float ssim_weight,
-        MaskedFusedL1SSIMWorkspace& workspace) {
+        MaskedFusedL1SSIMWorkspace& workspace, float denominator) {
+        LFS_ASSERT(std::isfinite(denominator) && denominator >= 0.0f);
 
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
-        auto img1 = img1_input.contiguous();
-        auto img2 = img2_input.contiguous();
-        auto mask = mask_input.contiguous();
-
-        if (img1.ndim() == 3)
-            img1 = img1.unsqueeze(0);
-        if (img2.ndim() == 3)
-            img2 = img2.unsqueeze(0);
-
-        // Ensure mask is 2D [H, W]
-        auto mask_2d = mask.ndim() == 3 ? mask.squeeze(0) : mask;
+        validate_loss_weight(ssim_weight);
+        auto prepared_images = prepare_loss_images(img1_input, img2_input);
+        auto& img1 = prepared_images.prediction;
+        auto& img2 = prepared_images.target;
+        auto mask_2d = prepare_loss_mask(mask_input, img1);
 
         const int N = static_cast<int>(img1.shape()[0]);
         const int C = static_cast<int>(img1.shape()[1]);
@@ -2253,15 +2985,18 @@ namespace lfs::training::kernels {
         const auto stream = workspace.ssim_map.stream();
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            maskedFusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
-                H, W, C, C1, C2,
-                img1.ptr<float>(), img2_ptr,
-                workspace.dm_dmu1.ptr<float>(),
-                workspace.dm_dsigma1_sq.ptr<float>(),
-                workspace.dm_dsigma12.ptr<float>(),
-                workspace.ssim_map.ptr<float>());
-
             dispatch_mask_ptr(mask_2d, [&](auto* mask_ptr) {
+                using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
+                maskedFusedL1SSIMForwardCUDA<TargetT, MaskT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                    H, W, C, C1, C2,
+                    img1.ptr<float>(), img2_ptr, mask_ptr,
+                    workspace.dm_dmu1.ptr<__half>(),
+                    workspace.dm_dsigma1_sq.ptr<__half>(),
+                    workspace.dm_dsigma12.ptr<__half>(),
+                    workspace.ssim_map.ptr<float>(),
+                    workspace.cs_map.ptr<float>());
+                LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_fused_l1_forward");
+
                 launch_masked_fused_l1_ssim_mean_device(
                     img1.ptr<float>(),
                     img2_ptr,
@@ -2272,12 +3007,12 @@ namespace lfs::training::kernels {
                     workspace.masked_loss.ptr<float>(),
                     workspace.mask_sum.ptr<float>(),
                     N, C, H, W,
-                    stream);
+                    stream, denominator);
             });
         });
 
-        auto loss_scalar = workspace.masked_loss.clone();
-        const float mask_sum = workspace.mask_sum.item<float>();
+        auto loss_scalar = workspace.masked_loss;
+        const float mask_sum = denominator > 0.0f ? denominator : workspace.mask_sum.item<float>();
 
         MaskedFusedL1SSIMContext ctx{
             .img1 = img1,
@@ -2298,6 +3033,13 @@ namespace lfs::training::kernels {
         const MaskedFusedL1SSIMContext& ctx,
         MaskedFusedL1SSIMWorkspace& workspace) {
 
+        validate_loss_context_images(ctx.img1, ctx.img2, ctx.H, ctx.W);
+        validate_loss_weight(ctx.ssim_weight);
+        LFS_ASSERT_MSG(std::isfinite(ctx.mask_sum_value) && ctx.mask_sum_value > 0.0f,
+                       "Masked loss normalization must be positive and finite");
+        const auto mask = prepare_loss_mask(ctx.mask, ctx.img1);
+        workspace.ensure_size(ctx.img1.shape().dims());
+
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
@@ -2305,21 +3047,21 @@ namespace lfs::training::kernels {
         const size_t C = ctx.img1.shape()[1];
         const float inv_mask_sum = 1.0f / ctx.mask_sum_value;
 
-        workspace.grad_img.zero_();
-
         const dim3 grid((ctx.W + BLOCK_X - 1) / BLOCK_X, (ctx.H + BLOCK_Y - 1) / BLOCK_Y, N);
         const dim3 block(BLOCK_X, BLOCK_Y);
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            dispatch_mask_ptr(ctx.mask, [&](auto* mask_ptr) {
+            dispatch_mask_ptr(mask, [&](auto* mask_ptr) {
                 using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
-                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block>>>(
-                    ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
-                    ctx.img1.ptr<float>(), img2_ptr, mask_ptr,
-                    workspace.grad_img.ptr<float>(),
-                    ctx.dm_dmu1.ptr<float>(), ctx.dm_dsigma1_sq.ptr<float>(),
-                    ctx.dm_dsigma12.ptr<float>());
+                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/true>
+                    <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                        ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
+                        ctx.img1.ptr<float>(), img2_ptr, mask_ptr,
+                        workspace.grad_img.ptr<float>(),
+                        ctx.dm_dmu1.ptr<__half>(), ctx.dm_dsigma1_sq.ptr<__half>(),
+                        ctx.dm_dsigma12.ptr<__half>());
+                LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_fused_l1_backward");
             });
         });
 
@@ -2332,27 +3074,22 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& gt_input,
         const lfs::core::Tensor& mask_input,
         float ssim_weight,
-        MaskedDecoupledFusedL1SSIMWorkspace& workspace) {
+        MaskedDecoupledFusedL1SSIMWorkspace& workspace, float denominator) {
+        LFS_ASSERT(std::isfinite(denominator) && denominator >= 0.0f);
 
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
-        auto corrected = corrected_input.contiguous();
-        auto raw = raw_input.contiguous();
-        auto gt = gt_input.contiguous();
-        auto mask = mask_input.contiguous();
-
-        if (corrected.ndim() == 3)
-            corrected = corrected.unsqueeze(0);
-        if (raw.ndim() == 3)
-            raw = raw.unsqueeze(0);
-        if (gt.ndim() == 3)
-            gt = gt.unsqueeze(0);
-
-        auto mask_2d = mask.ndim() == 3 ? mask.squeeze(0) : mask;
-
-        assert(corrected.shape() == raw.shape());
-        assert(corrected.shape() == gt.shape());
+        validate_loss_weight(ssim_weight);
+        auto corrected = prepare_loss_prediction(corrected_input, "Corrected loss image");
+        auto raw = prepare_loss_prediction(raw_input, "Raw loss image");
+        auto gt = prepare_loss_target(gt_input, "Loss target");
+        LFS_ASSERT_MSG(corrected.shape() == raw.shape() && corrected.shape() == gt.shape(),
+                       lfs::core::detail::format_cuda_safe(
+                           "Masked decoupled loss image shapes must match "
+                           "(corrected={}, raw={}, target={})",
+                           corrected.shape().str(), raw.shape().str(), gt.shape().str()));
+        auto mask_2d = prepare_loss_mask(mask_input, corrected);
 
         const int N = static_cast<int>(corrected.shape()[0]);
         const int C = static_cast<int>(corrected.shape()[1]);
@@ -2367,16 +3104,19 @@ namespace lfs::training::kernels {
         const auto stream = workspace.ssim_map.stream();
         dispatch_target_ptr(gt, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            decoupledFusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
-                H, W, C, C1, C2, ssim_weight,
-                corrected.ptr<float>(), raw.ptr<float>(), gt_ptr,
-                workspace.app_dm_dmu1.ptr<float>(),
-                workspace.raw_dm_dmu1.ptr<float>(),
-                workspace.raw_dm_dsigma1_sq.ptr<float>(),
-                workspace.raw_dm_dsigma12.ptr<float>(),
-                workspace.ssim_map.ptr<float>());
-
             dispatch_mask_ptr(mask_2d, [&](auto* mask_ptr) {
+                using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
+                maskedDecoupledFusedL1SSIMForwardCUDA<TargetT, MaskT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                    H, W, C, C1, C2, ssim_weight,
+                    corrected.ptr<float>(), raw.ptr<float>(), gt_ptr, mask_ptr,
+                    workspace.app_dm_dmu1.ptr<__half>(),
+                    workspace.raw_dm_dmu1.ptr<__half>(),
+                    workspace.raw_dm_dsigma1_sq.ptr<__half>(),
+                    workspace.raw_dm_dsigma12.ptr<__half>(),
+                    workspace.ssim_map.ptr<float>(),
+                    workspace.cs_map.ptr<float>());
+                LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_decoupled_fused_l1_forward");
+
                 launch_masked_fused_l1_ssim_mean_device(
                     corrected.ptr<float>(),
                     gt_ptr,
@@ -2387,12 +3127,12 @@ namespace lfs::training::kernels {
                     workspace.masked_loss.ptr<float>(),
                     workspace.mask_sum.ptr<float>(),
                     N, C, H, W,
-                    stream);
+                    stream, denominator);
             });
         });
 
-        auto loss_scalar = workspace.masked_loss.clone();
-        const float mask_sum = workspace.mask_sum.item<float>();
+        auto loss_scalar = workspace.masked_loss;
+        const float mask_sum = denominator > 0.0f ? denominator : workspace.mask_sum.item<float>();
 
         MaskedDecoupledFusedL1SSIMContext ctx{
             .corrected_img = corrected,
@@ -2415,6 +3155,14 @@ namespace lfs::training::kernels {
         const MaskedDecoupledFusedL1SSIMContext& ctx,
         MaskedDecoupledFusedL1SSIMWorkspace& workspace) {
 
+        validate_loss_context_images(ctx.corrected_img, ctx.gt_img, ctx.H, ctx.W);
+        validate_loss_context_images(ctx.raw_img, ctx.gt_img, ctx.H, ctx.W);
+        validate_loss_weight(ctx.ssim_weight);
+        LFS_ASSERT_MSG(std::isfinite(ctx.mask_sum_value) && ctx.mask_sum_value > 0.0f,
+                       "Masked loss normalization must be positive and finite");
+        const auto mask = prepare_loss_mask(ctx.mask, ctx.corrected_img);
+        workspace.ensure_size(ctx.corrected_img.shape().dims());
+
         constexpr float C1 = 0.01f * 0.01f;
         constexpr float C2 = 0.03f * 0.03f;
 
@@ -2427,31 +3175,21 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.gt_img, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            dispatch_mask_ptr(ctx.mask, [&](auto* mask_ptr) {
+            dispatch_mask_ptr(mask, [&](auto* mask_ptr) {
                 using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
-                workspace.grad_corrected.zero_();
-                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block>>>(
-                    ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
-                    ctx.corrected_img.ptr<float>(), gt_ptr, mask_ptr,
-                    workspace.grad_corrected.ptr<float>(),
-                    ctx.app_dm_dmu1.ptr<float>(),
-                    workspace.zero_terms.ptr<float>(),
-                    workspace.zero_terms.ptr<float>());
-
-                workspace.grad_raw.zero_();
-                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block>>>(
-                    1.0f, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
-                    ctx.raw_img.ptr<float>(), gt_ptr, mask_ptr,
-                    workspace.grad_raw.ptr<float>(),
-                    ctx.raw_dm_dmu1.ptr<float>(),
-                    ctx.raw_dm_dsigma1_sq.ptr<float>(),
-                    ctx.raw_dm_dsigma12.ptr<float>());
+                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT, /*HasSigmaPartials=*/false>
+                    <<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
+                        ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
+                        ctx.corrected_img.ptr<float>(), gt_ptr, mask_ptr,
+                        workspace.grad_corrected.ptr<float>(),
+                        ctx.app_dm_dmu1.ptr<__half>(),
+                        /*dm_dsigma1_sq=*/nullptr,
+                        /*dm_dsigma12=*/nullptr);
+                LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.masked_decoupled_fused_l1_backward");
             });
         });
 
-        return DecoupledGradients{
-            .grad_corrected = workspace.grad_corrected,
-            .grad_raw = workspace.grad_raw};
+        return DecoupledGradients{.grad_corrected = workspace.grad_corrected};
     }
 
     // Fused SSIM map [1, C, H, W] → error map [H, W]
@@ -2481,26 +3219,646 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& ssim_map,
         lfs::core::Tensor& error_map) {
 
-        assert(ssim_map.ndim() == 4);
-        assert(ssim_map.shape()[0] == 1);
+        LFS_ASSERT_MSG(ssim_map.is_valid() && ssim_map.device() == lfs::core::Device::CUDA &&
+                           ssim_map.dtype() == lfs::core::DataType::Float32 &&
+                           ssim_map.is_contiguous() && ssim_map.ndim() == 4 &&
+                           ssim_map.shape()[0] == 1 && ssim_map.shape()[1] > 0 &&
+                           ssim_map.shape()[2] > 0 && ssim_map.shape()[3] > 0,
+                       lfs::core::detail::format_cuda_safe(
+                           "SSIM map must be contiguous Float32 CUDA [1,C,H,W] (shape={})",
+                           ssim_map.shape().str()));
 
         const int C = static_cast<int>(ssim_map.shape()[1]);
         const int H = static_cast<int>(ssim_map.shape()[2]);
         const int W = static_cast<int>(ssim_map.shape()[3]);
         const int HW = H * W;
 
-        assert(error_map.ndim() == 2);
-        assert(error_map.shape()[0] == static_cast<size_t>(H));
-        assert(error_map.shape()[1] == static_cast<size_t>(W));
+        LFS_ASSERT_MSG(error_map.is_valid() && error_map.device() == lfs::core::Device::CUDA &&
+                           error_map.dtype() == lfs::core::DataType::Float32 &&
+                           error_map.is_contiguous() && error_map.ndim() == 2 &&
+                           error_map.shape()[0] == static_cast<size_t>(H) &&
+                           error_map.shape()[1] == static_cast<size_t>(W),
+                       lfs::core::detail::format_cuda_safe(
+                           "SSIM error map must be contiguous Float32 CUDA [H,W] "
+                           "(map={}, expected=[{}, {}])",
+                           error_map.shape().str(), H, W));
 
         constexpr int THREADS = 256;
         dim3 grid((HW + THREADS - 1) / THREADS);
         dim3 block(THREADS);
 
-        ssim_to_error_map_kernel<<<grid, block>>>(
+        ssim_to_error_map_kernel<<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
             ssim_map.ptr<float>(),
             error_map.ptr<float>(),
             C, H, W);
+        LFS_CUDA_LAUNCH_CHECK(lfs::core::getCurrentCUDAStream(), "training.ssim.to_error_map");
+    }
+
+    // =========================================================================
+    // LossWorkspaceArena + independent ensure_size fallbacks
+    // =========================================================================
+    namespace {
+        constexpr size_t kArenaAlign = 256;
+
+        size_t align_up_bytes(size_t x) {
+            return (x + kArenaAlign - 1) & ~(kArenaAlign - 1);
+        }
+
+        size_t numel_of(const std::vector<size_t>& shape) {
+            size_t n = 1;
+            for (size_t d : shape) {
+                n *= d;
+            }
+            return n;
+        }
+
+        size_t field_bytes(const std::vector<size_t>& shape, lfs::core::DataType dtype) {
+            return numel_of(shape) * lfs::core::dtype_size(dtype);
+        }
+
+        size_t pack_fields(std::initializer_list<size_t> field_sizes) {
+            size_t total = 0;
+            for (size_t s : field_sizes) {
+                total = align_up_bytes(total) + s;
+            }
+            return align_up_bytes(total);
+        }
+
+        void ensure_independent_cs_map(lfs::core::Tensor& cs_map, const lfs::core::Tensor& ssim_map) {
+            if (!ssim_map.is_valid())
+                return;
+            if (cs_map.is_valid() && cs_map.shape() == ssim_map.shape() &&
+                cs_map.dtype() == ssim_map.dtype() && cs_map.device() == ssim_map.device() &&
+                cs_map.is_contiguous()) {
+                return;
+            }
+            cs_map = ssim_map.device() == lfs::core::Device::CUDA
+                         ? lfs::core::Tensor::empty_exact(ssim_map.shape(), ssim_map.dtype())
+                         : lfs::core::Tensor::empty(ssim_map.shape(), ssim_map.device(), ssim_map.dtype());
+        }
+    } // namespace
+
+    namespace {
+        void rehome_tensor_stream(lfs::core::Tensor& tensor, cudaStream_t stream) {
+            if (tensor.is_valid() && tensor.stream() != stream) {
+                tensor.set_stream(stream);
+            }
+        }
+
+        void rehome_workspace_stream(FusedL1SSIMWorkspace& workspace, cudaStream_t stream) {
+            rehome_tensor_stream(workspace.ssim_map, stream);
+            rehome_tensor_stream(workspace.cs_map, stream);
+            rehome_tensor_stream(workspace.dm_dmu1, stream);
+            rehome_tensor_stream(workspace.dm_dsigma1_sq, stream);
+            rehome_tensor_stream(workspace.dm_dsigma12, stream);
+            rehome_tensor_stream(workspace.grad_img, stream);
+            rehome_tensor_stream(workspace.reduction_temp, stream);
+            rehome_tensor_stream(workspace.reduction_result, stream);
+        }
+
+        void rehome_workspace_stream(DecoupledFusedL1SSIMWorkspace& workspace, cudaStream_t stream) {
+            rehome_tensor_stream(workspace.ssim_map, stream);
+            rehome_tensor_stream(workspace.cs_map, stream);
+            rehome_tensor_stream(workspace.app_dm_dmu1, stream);
+            rehome_tensor_stream(workspace.raw_dm_dmu1, stream);
+            rehome_tensor_stream(workspace.raw_dm_dsigma1_sq, stream);
+            rehome_tensor_stream(workspace.raw_dm_dsigma12, stream);
+            rehome_tensor_stream(workspace.grad_corrected, stream);
+            rehome_tensor_stream(workspace.reduction_temp, stream);
+            rehome_tensor_stream(workspace.reduction_result, stream);
+        }
+    } // namespace
+
+    void SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
+        if (arena) {
+            arena->ensure_pure_ssim(shape);
+            ensure_independent_cs_map(cs_map, ssim_map);
+            return;
+        }
+        if (allocated_shape != shape) {
+            lfs::core::TensorShape tshape(shape);
+            ssim_map = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA);
+            dm_dmu1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            dm_dsigma1_sq = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            dm_dsigma12 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            dL_dmap = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA);
+            dL_dimg1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA);
+            reduction_temp = lfs::core::Tensor::empty({1024}, lfs::core::Device::CUDA);
+            reduction_result = lfs::core::Tensor::empty({1}, lfs::core::Device::CUDA);
+            allocated_shape = shape;
+        }
+        ensure_independent_cs_map(cs_map, ssim_map);
+    }
+
+    void FusedL1SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
+        const auto stream = lfs::core::getCurrentCUDAStream();
+        if (arena) {
+            arena->ensure_fused(shape);
+            ensure_independent_cs_map(cs_map, ssim_map);
+            rehome_workspace_stream(*this, stream);
+            return;
+        }
+        if (allocated_shape != shape) {
+            lfs::core::TensorShape tshape(shape);
+            std::vector<size_t> map_shape = shape;
+            map_shape[1] = 1;
+            ssim_map = lfs::core::Tensor::empty(lfs::core::TensorShape(map_shape), lfs::core::Device::CUDA);
+            dm_dmu1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            dm_dsigma1_sq = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            dm_dsigma12 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            grad_img = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA);
+            reduction_temp = lfs::core::Tensor::empty({1024}, lfs::core::Device::CUDA);
+            reduction_result = lfs::core::Tensor::empty({1}, lfs::core::Device::CUDA);
+            allocated_shape = shape;
+        }
+        ensure_independent_cs_map(cs_map, ssim_map);
+        rehome_workspace_stream(*this, stream);
+    }
+
+    void DecoupledFusedL1SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
+        const auto stream = lfs::core::getCurrentCUDAStream();
+        if (arena) {
+            arena->ensure_decoupled(shape);
+            ensure_independent_cs_map(cs_map, ssim_map);
+            rehome_workspace_stream(*this, stream);
+            return;
+        }
+        if (allocated_shape != shape) {
+            lfs::core::TensorShape tshape(shape);
+            std::vector<size_t> map_shape = shape;
+            map_shape[1] = 1;
+            ssim_map = lfs::core::Tensor::empty(lfs::core::TensorShape(map_shape), lfs::core::Device::CUDA);
+            app_dm_dmu1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            raw_dm_dmu1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            raw_dm_dsigma1_sq = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            raw_dm_dsigma12 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            grad_corrected = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA);
+            reduction_temp = lfs::core::Tensor::empty({1024}, lfs::core::Device::CUDA);
+            reduction_result = lfs::core::Tensor::empty({1}, lfs::core::Device::CUDA);
+            allocated_shape = shape;
+        }
+        ensure_independent_cs_map(cs_map, ssim_map);
+        rehome_workspace_stream(*this, stream);
+    }
+
+    void MaskedFusedL1SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
+        if (arena) {
+            arena->ensure_masked_fused(shape);
+            ensure_independent_cs_map(cs_map, ssim_map);
+            return;
+        }
+        if (allocated_shape != shape) {
+            lfs::core::TensorShape tshape(shape);
+            std::vector<size_t> map_shape = shape;
+            map_shape[1] = 1;
+            ssim_map = lfs::core::Tensor::empty(lfs::core::TensorShape(map_shape), lfs::core::Device::CUDA);
+            dm_dmu1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            dm_dsigma1_sq = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            dm_dsigma12 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            grad_img = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA);
+            reduction_temp = lfs::core::Tensor::empty({2048}, lfs::core::Device::CUDA);
+            masked_loss = lfs::core::Tensor::empty({1}, lfs::core::Device::CUDA);
+            mask_sum = lfs::core::Tensor::empty({1}, lfs::core::Device::CUDA);
+            allocated_shape = shape;
+        }
+        ensure_independent_cs_map(cs_map, ssim_map);
+    }
+
+    void MaskedDecoupledFusedL1SSIMWorkspace::ensure_size(const std::vector<size_t>& shape) {
+        if (arena) {
+            arena->ensure_masked_decoupled(shape);
+            ensure_independent_cs_map(cs_map, ssim_map);
+            return;
+        }
+        if (allocated_shape != shape) {
+            lfs::core::TensorShape tshape(shape);
+            std::vector<size_t> map_shape = shape;
+            map_shape[1] = 1;
+            ssim_map = lfs::core::Tensor::empty(lfs::core::TensorShape(map_shape), lfs::core::Device::CUDA);
+            app_dm_dmu1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            raw_dm_dmu1 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            raw_dm_dsigma1_sq = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            raw_dm_dsigma12 = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+            grad_corrected = lfs::core::Tensor::empty(tshape, lfs::core::Device::CUDA);
+            reduction_temp = lfs::core::Tensor::empty({2048}, lfs::core::Device::CUDA);
+            masked_loss = lfs::core::Tensor::empty({1}, lfs::core::Device::CUDA);
+            mask_sum = lfs::core::Tensor::empty({1}, lfs::core::Device::CUDA);
+            allocated_shape = shape;
+        }
+        ensure_independent_cs_map(cs_map, ssim_map);
+    }
+
+    size_t LossWorkspaceArena::fused_layout_bytes(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        return pack_fields({
+            field_bytes(map_shape, lfs::core::DataType::Float32),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float32),
+            1024 * sizeof(float),
+            sizeof(float),
+        });
+    }
+
+    size_t LossWorkspaceArena::pure_ssim_layout_bytes(const std::vector<size_t>& shape) {
+        // 3× dm_* fp16; ssim_map / dL_dmap / dL_dimg1 stay fp32.
+        return pack_fields({
+            field_bytes(shape, lfs::core::DataType::Float32),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float32),
+            field_bytes(shape, lfs::core::DataType::Float32),
+            1024 * sizeof(float),
+            sizeof(float),
+        });
+    }
+
+    size_t LossWorkspaceArena::decoupled_layout_bytes(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        // Four dm_* fields use fp16; the corrected gradient remains fp32. The raw-render
+        // gradient accumulates into the caller's buffer. There is no zero_terms field.
+        return pack_fields({
+            field_bytes(map_shape, lfs::core::DataType::Float32),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float32),
+            1024 * sizeof(float),
+            sizeof(float),
+        });
+    }
+
+    size_t LossWorkspaceArena::masked_fused_layout_bytes(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        return pack_fields({
+            field_bytes(map_shape, lfs::core::DataType::Float32),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float32),
+            2048 * sizeof(float),
+            sizeof(float),
+            sizeof(float),
+        });
+    }
+
+    size_t LossWorkspaceArena::masked_decoupled_layout_bytes(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        // Four dm_* fields use fp16, with no zero_terms field.
+        return pack_fields({
+            field_bytes(map_shape, lfs::core::DataType::Float32),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float16),
+            field_bytes(shape, lfs::core::DataType::Float32),
+            2048 * sizeof(float),
+            sizeof(float),
+            sizeof(float),
+        });
+    }
+
+    size_t LossWorkspaceArena::max_variant_bytes(const std::vector<size_t>& shape) {
+        return std::max({fused_layout_bytes(shape), pure_ssim_layout_bytes(shape),
+                         decoupled_layout_bytes(shape), masked_fused_layout_bytes(shape),
+                         masked_decoupled_layout_bytes(shape)});
+    }
+
+    size_t LossWorkspaceArena::required_bytes() const {
+        if (active_shape_.empty()) {
+            return 0;
+        }
+        switch (active_kind_) {
+        case Kind::Fused:
+            return fused_layout_bytes(active_shape_);
+        case Kind::PureSSIM:
+            return pure_ssim_layout_bytes(active_shape_);
+        case Kind::Decoupled:
+            return decoupled_layout_bytes(active_shape_);
+        case Kind::MaskedFused:
+            return masked_fused_layout_bytes(active_shape_);
+        case Kind::MaskedDecoupled:
+            return masked_decoupled_layout_bytes(active_shape_);
+        case Kind::None:
+            return 0;
+        }
+        return 0;
+    }
+
+    void LossWorkspaceArena::replace_storage_exact(const size_t bytes) {
+        const size_t required_capacity = align_up_bytes(bytes);
+        LFS_ASSERT_MSG(required_capacity > 0,
+                       "LossWorkspaceArena cannot allocate an empty active layout");
+
+        auto new_storage = lfs::core::Tensor::empty_exact({required_capacity}, lfs::core::DataType::UInt8);
+        // Stamp the home stream so from_blob views inherit a valid producer stream.
+        if (new_storage.stream() != lfs::core::getCurrentCUDAStream()) {
+            new_storage.set_stream(lfs::core::getCurrentCUDAStream());
+        }
+
+        clear_all_views();
+        storage_ = std::move(new_storage);
+        capacity_bytes_ = required_capacity;
+        active_kind_ = Kind::None;
+        active_shape_.clear();
+    }
+
+    void LossWorkspaceArena::ensure_capacity_for(const Kind kind, const size_t bytes) {
+        const size_t required_capacity = align_up_bytes(bytes);
+        const bool variant_changed = active_kind_ != Kind::None && active_kind_ != kind;
+        const bool must_allocate = !storage_.is_valid() || variant_changed ||
+                                   required_capacity > capacity_bytes_;
+        if (!must_allocate) {
+            const auto current_stream = lfs::core::getCurrentCUDAStream();
+            if (storage_.stream() != current_stream) {
+                storage_.set_stream(current_stream);
+            }
+            return;
+        }
+        // Variant switches are exact in either direction. Within one variant,
+        // shape changes only grow; smaller shapes rebind into the retained block.
+        replace_storage_exact(required_capacity);
+    }
+
+    void LossWorkspaceArena::clear_all_views() {
+        auto clear_fused = [](FusedL1SSIMWorkspace& w) {
+            w.ssim_map = {};
+            w.dm_dmu1 = {};
+            w.dm_dsigma1_sq = {};
+            w.dm_dsigma12 = {};
+            w.grad_img = {};
+            w.reduction_temp = {};
+            w.reduction_result = {};
+            w.allocated_shape.clear();
+        };
+        auto clear_ssim = [](SSIMWorkspace& w) {
+            w.ssim_map = {};
+            w.dm_dmu1 = {};
+            w.dm_dsigma1_sq = {};
+            w.dm_dsigma12 = {};
+            w.dL_dmap = {};
+            w.dL_dimg1 = {};
+            w.reduction_temp = {};
+            w.reduction_result = {};
+            w.allocated_shape.clear();
+        };
+        auto clear_decoupled = [](DecoupledFusedL1SSIMWorkspace& w) {
+            w.ssim_map = {};
+            w.app_dm_dmu1 = {};
+            w.raw_dm_dmu1 = {};
+            w.raw_dm_dsigma1_sq = {};
+            w.raw_dm_dsigma12 = {};
+            w.grad_corrected = {};
+            w.reduction_temp = {};
+            w.reduction_result = {};
+            w.allocated_shape.clear();
+        };
+        auto clear_masked = [](MaskedFusedL1SSIMWorkspace& w) {
+            w.ssim_map = {};
+            w.dm_dmu1 = {};
+            w.dm_dsigma1_sq = {};
+            w.dm_dsigma12 = {};
+            w.grad_img = {};
+            w.reduction_temp = {};
+            w.masked_loss = {};
+            w.mask_sum = {};
+            w.allocated_shape.clear();
+        };
+        auto clear_masked_dec = [](MaskedDecoupledFusedL1SSIMWorkspace& w) {
+            w.ssim_map = {};
+            w.app_dm_dmu1 = {};
+            w.raw_dm_dmu1 = {};
+            w.raw_dm_dsigma1_sq = {};
+            w.raw_dm_dsigma12 = {};
+            w.grad_corrected = {};
+            w.reduction_temp = {};
+            w.masked_loss = {};
+            w.mask_sum = {};
+            w.allocated_shape.clear();
+        };
+        clear_fused(fused_);
+        clear_ssim(pure_ssim_);
+        clear_decoupled(decoupled_);
+        clear_masked(masked_fused_);
+        clear_masked_dec(masked_decoupled_);
+        fused_.arena = this;
+        pure_ssim_.arena = this;
+        decoupled_.arena = this;
+        masked_fused_.arena = this;
+        masked_decoupled_.arena = this;
+    }
+
+    lfs::core::Tensor LossWorkspaceArena::make_view(size_t& offset,
+                                                    const std::vector<size_t>& shape,
+                                                    lfs::core::DataType dtype) {
+        const size_t nbytes = field_bytes(shape, dtype);
+        offset = align_up_bytes(offset);
+        LFS_ASSERT_MSG(offset + nbytes <= capacity_bytes_,
+                       lfs::core::detail::format_cuda_safe(
+                           "LossWorkspaceArena view exceeds capacity (offset={}, need={}, cap={})",
+                           offset, nbytes, capacity_bytes_));
+        void* ptr = static_cast<char*>(storage_.data_ptr()) + offset;
+        offset += nbytes;
+        // Prefer current stream (matches training step); fall back to storage home.
+        cudaStream_t home = lfs::core::getCurrentCUDAStream();
+        if (home == nullptr) {
+            home = storage_.stream();
+        }
+        return lfs::core::Tensor::from_blob(ptr, lfs::core::TensorShape(shape),
+                                            lfs::core::Device::CUDA, dtype, home);
+    }
+
+    void LossWorkspaceArena::bind_fused(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        size_t off = 0;
+        fused_.ssim_map = make_view(off, map_shape, lfs::core::DataType::Float32);
+        fused_.dm_dmu1 = make_view(off, shape, lfs::core::DataType::Float16);
+        fused_.dm_dsigma1_sq = make_view(off, shape, lfs::core::DataType::Float16);
+        fused_.dm_dsigma12 = make_view(off, shape, lfs::core::DataType::Float16);
+        fused_.grad_img = make_view(off, shape, lfs::core::DataType::Float32);
+        fused_.reduction_temp = make_view(off, {1024}, lfs::core::DataType::Float32);
+        fused_.reduction_result = make_view(off, {1}, lfs::core::DataType::Float32);
+        fused_.allocated_shape = shape;
+        fused_.arena = this;
+    }
+
+    void LossWorkspaceArena::bind_pure_ssim(const std::vector<size_t>& shape) {
+        size_t off = 0;
+        pure_ssim_.ssim_map = make_view(off, shape, lfs::core::DataType::Float32);
+        pure_ssim_.dm_dmu1 = make_view(off, shape, lfs::core::DataType::Float16);
+        pure_ssim_.dm_dsigma1_sq = make_view(off, shape, lfs::core::DataType::Float16);
+        pure_ssim_.dm_dsigma12 = make_view(off, shape, lfs::core::DataType::Float16);
+        pure_ssim_.dL_dmap = make_view(off, shape, lfs::core::DataType::Float32);
+        pure_ssim_.dL_dimg1 = make_view(off, shape, lfs::core::DataType::Float32);
+        pure_ssim_.reduction_temp = make_view(off, {1024}, lfs::core::DataType::Float32);
+        pure_ssim_.reduction_result = make_view(off, {1}, lfs::core::DataType::Float32);
+        pure_ssim_.allocated_shape = shape;
+        pure_ssim_.arena = this;
+    }
+
+    void LossWorkspaceArena::bind_decoupled(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        size_t off = 0;
+        decoupled_.ssim_map = make_view(off, map_shape, lfs::core::DataType::Float32);
+        decoupled_.app_dm_dmu1 = make_view(off, shape, lfs::core::DataType::Float16);
+        decoupled_.raw_dm_dmu1 = make_view(off, shape, lfs::core::DataType::Float16);
+        decoupled_.raw_dm_dsigma1_sq = make_view(off, shape, lfs::core::DataType::Float16);
+        decoupled_.raw_dm_dsigma12 = make_view(off, shape, lfs::core::DataType::Float16);
+        decoupled_.grad_corrected = make_view(off, shape, lfs::core::DataType::Float32);
+        decoupled_.reduction_temp = make_view(off, {1024}, lfs::core::DataType::Float32);
+        decoupled_.reduction_result = make_view(off, {1}, lfs::core::DataType::Float32);
+        decoupled_.allocated_shape = shape;
+        decoupled_.arena = this;
+    }
+
+    void LossWorkspaceArena::bind_masked_fused(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        size_t off = 0;
+        masked_fused_.ssim_map = make_view(off, map_shape, lfs::core::DataType::Float32);
+        masked_fused_.dm_dmu1 = make_view(off, shape, lfs::core::DataType::Float16);
+        masked_fused_.dm_dsigma1_sq = make_view(off, shape, lfs::core::DataType::Float16);
+        masked_fused_.dm_dsigma12 = make_view(off, shape, lfs::core::DataType::Float16);
+        masked_fused_.grad_img = make_view(off, shape, lfs::core::DataType::Float32);
+        masked_fused_.reduction_temp = make_view(off, {2048}, lfs::core::DataType::Float32);
+        masked_fused_.masked_loss = make_view(off, {1}, lfs::core::DataType::Float32);
+        masked_fused_.mask_sum = make_view(off, {1}, lfs::core::DataType::Float32);
+        masked_fused_.allocated_shape = shape;
+        masked_fused_.arena = this;
+    }
+
+    void LossWorkspaceArena::bind_masked_decoupled(const std::vector<size_t>& shape) {
+        std::vector<size_t> map_shape = shape;
+        map_shape[1] = 1;
+        size_t off = 0;
+        masked_decoupled_.ssim_map = make_view(off, map_shape, lfs::core::DataType::Float32);
+        masked_decoupled_.app_dm_dmu1 = make_view(off, shape, lfs::core::DataType::Float16);
+        masked_decoupled_.raw_dm_dmu1 = make_view(off, shape, lfs::core::DataType::Float16);
+        masked_decoupled_.raw_dm_dsigma1_sq = make_view(off, shape, lfs::core::DataType::Float16);
+        masked_decoupled_.raw_dm_dsigma12 = make_view(off, shape, lfs::core::DataType::Float16);
+        masked_decoupled_.grad_corrected = make_view(off, shape, lfs::core::DataType::Float32);
+        masked_decoupled_.reduction_temp = make_view(off, {2048}, lfs::core::DataType::Float32);
+        masked_decoupled_.masked_loss = make_view(off, {1}, lfs::core::DataType::Float32);
+        masked_decoupled_.mask_sum = make_view(off, {1}, lfs::core::DataType::Float32);
+        masked_decoupled_.allocated_shape = shape;
+        masked_decoupled_.arena = this;
+    }
+
+    FusedL1SSIMWorkspace& LossWorkspaceArena::ensure_fused(const std::vector<size_t>& shape) {
+        ensure_capacity_for(Kind::Fused, fused_layout_bytes(shape));
+        if (active_kind_ == Kind::Fused && active_shape_ == shape && fused_.ssim_map.is_valid()) {
+            return fused_;
+        }
+        clear_all_views();
+        bind_fused(shape);
+        active_kind_ = Kind::Fused;
+        active_shape_ = shape;
+        return fused_;
+    }
+
+    SSIMWorkspace& LossWorkspaceArena::ensure_pure_ssim(const std::vector<size_t>& shape) {
+        ensure_capacity_for(Kind::PureSSIM, pure_ssim_layout_bytes(shape));
+        if (active_kind_ == Kind::PureSSIM && active_shape_ == shape && pure_ssim_.ssim_map.is_valid()) {
+            return pure_ssim_;
+        }
+        clear_all_views();
+        bind_pure_ssim(shape);
+        active_kind_ = Kind::PureSSIM;
+        active_shape_ = shape;
+        return pure_ssim_;
+    }
+
+    DecoupledFusedL1SSIMWorkspace& LossWorkspaceArena::ensure_decoupled(const std::vector<size_t>& shape) {
+        ensure_capacity_for(Kind::Decoupled, decoupled_layout_bytes(shape));
+        if (active_kind_ == Kind::Decoupled && active_shape_ == shape && decoupled_.ssim_map.is_valid()) {
+            return decoupled_;
+        }
+        clear_all_views();
+        bind_decoupled(shape);
+        active_kind_ = Kind::Decoupled;
+        active_shape_ = shape;
+        return decoupled_;
+    }
+
+    MaskedFusedL1SSIMWorkspace& LossWorkspaceArena::ensure_masked_fused(const std::vector<size_t>& shape) {
+        ensure_capacity_for(Kind::MaskedFused, masked_fused_layout_bytes(shape));
+        if (active_kind_ == Kind::MaskedFused && active_shape_ == shape &&
+            masked_fused_.ssim_map.is_valid()) {
+            return masked_fused_;
+        }
+        clear_all_views();
+        bind_masked_fused(shape);
+        active_kind_ = Kind::MaskedFused;
+        active_shape_ = shape;
+        return masked_fused_;
+    }
+
+    MaskedDecoupledFusedL1SSIMWorkspace&
+    LossWorkspaceArena::ensure_masked_decoupled(const std::vector<size_t>& shape) {
+        ensure_capacity_for(Kind::MaskedDecoupled, masked_decoupled_layout_bytes(shape));
+        if (active_kind_ == Kind::MaskedDecoupled && active_shape_ == shape &&
+            masked_decoupled_.ssim_map.is_valid()) {
+            return masked_decoupled_;
+        }
+        clear_all_views();
+        bind_masked_decoupled(shape);
+        active_kind_ = Kind::MaskedDecoupled;
+        active_shape_ = shape;
+        return masked_decoupled_;
+    }
+
+    void LossWorkspaceArena::shrink_to_required() {
+        if (active_kind_ == Kind::None || active_shape_.empty()) {
+            reset();
+            return;
+        }
+
+        const Kind kind = active_kind_;
+        const std::vector<size_t> shape = active_shape_;
+        const size_t required_capacity = align_up_bytes(required_bytes());
+        if (storage_.is_valid() && capacity_bytes_ == required_capacity) {
+            return;
+        }
+
+        replace_storage_exact(required_capacity);
+        switch (kind) {
+        case Kind::Fused:
+            bind_fused(shape);
+            break;
+        case Kind::PureSSIM:
+            bind_pure_ssim(shape);
+            break;
+        case Kind::Decoupled:
+            bind_decoupled(shape);
+            break;
+        case Kind::MaskedFused:
+            bind_masked_fused(shape);
+            break;
+        case Kind::MaskedDecoupled:
+            bind_masked_decoupled(shape);
+            break;
+        case Kind::None:
+            return;
+        }
+        active_kind_ = kind;
+        active_shape_ = shape;
+    }
+
+    void LossWorkspaceArena::reset() {
+        clear_all_views();
+        storage_ = {};
+        capacity_bytes_ = 0;
+        active_kind_ = Kind::None;
+        active_shape_.clear();
     }
 
 } // namespace lfs::training::kernels

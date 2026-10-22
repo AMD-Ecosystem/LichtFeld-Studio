@@ -14,6 +14,10 @@
  * This test runs on Windows CI without requiring CUDA/GPU.
  */
 
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -24,15 +28,23 @@
 #include <vector>
 
 // Check if we have access to the full library (not standalone unicode test build)
-#if __has_include("core/parameters.hpp")
+#if __has_include("core/parameters.hpp") && !defined(LFS_UNICODE_TEST_STANDALONE)
 #define LFS_HAS_FULL_LIBRARY 1
 #include "core/parameters.hpp"
 #include <nlohmann/json.hpp>
 #endif
 
+#include "core/environment.hpp"
 #include "core/path_utils.hpp"
+#include "io/atomic_output_path.hpp"
 
-namespace fs = std::filesystem;
+#include <stb_image.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+namespace fs = lfs::core::native_fs;
 using namespace lfs::core;
 
 // ============================================================================
@@ -56,7 +68,12 @@ protected:
     void SetUp() override {
         // Create test root with short name to maximize path budget for realistic test scenarios
         // The Unicode testing happens in the actual test paths, not the root directory
-        test_root_ = fs::temp_directory_path() / "lfs_uni_test";
+#ifdef _WIN32
+        const auto process_id = GetCurrentProcessId();
+#else
+        const auto process_id = getpid();
+#endif
+        test_root_ = fs::temp_directory_path() / ("lfsu" + std::to_string(process_id));
         fs::create_directories(test_root_);
     }
 
@@ -211,6 +228,120 @@ TEST_F(UnicodePathTest, PathToUtf8Conversion) {
         std::string utf8 = path_to_utf8(long_path);
         EXPECT_FALSE(utf8.empty());
     }
+}
+
+TEST_F(UnicodePathTest, ProcessBoundaryHelpersPreserveJapanese) {
+    const auto japanese_path = test_root_ / utf8_to_path("山田_プロジェクト");
+
+#ifdef _WIN32
+    wchar_t arg0[] = L"lichtfeld.exe";
+    wchar_t arg1[] = L"--project";
+    wchar_t arg2[] = L"C:\\Users\\山田\\プロジェクト.licht";
+    wchar_t* wide_argv[] = {arg0, arg1, arg2};
+    const auto arguments = utf8_argv(3, wide_argv);
+#else
+    char arg0[] = "lichtfeld";
+    char arg1[] = "--project";
+    char arg2[] = "山田/プロジェクト.licht";
+    char* narrow_argv[] = {arg0, arg1, arg2};
+    const auto arguments = utf8_argv(3, narrow_argv);
+#endif
+    ASSERT_EQ(arguments.size(), 3);
+    EXPECT_EQ(arguments[1], "--project");
+#ifdef _WIN32
+    EXPECT_EQ(arguments[2], "C:\\Users\\山田\\プロジェクト.licht");
+#else
+    EXPECT_EQ(arguments[2], "山田/プロジェクト.licht");
+#endif
+
+    constexpr const char* environment_name = "LFS_UNICODE_PATH_TEST";
+    const auto previous = lfs::core::environment::value(environment_name);
+    const auto japanese_path_utf8 = path_to_utf8(japanese_path);
+    ASSERT_TRUE(environment::set_value(environment_name, japanese_path_utf8));
+#ifdef _WIN32
+    const auto wide_name = utf8_to_wstring(environment_name);
+    const auto* const raw_wide = _wgetenv(wide_name.c_str());
+    ASSERT_NE(raw_wide, nullptr);
+    EXPECT_EQ(wstring_to_utf8(raw_wide), japanese_path_utf8);
+#else
+    const auto* const raw = std::getenv(environment_name);
+    ASSERT_NE(raw, nullptr);
+    EXPECT_STREQ(raw, japanese_path_utf8.c_str());
+#endif
+    const auto observed = lfs::core::environment::value(environment_name);
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(utf8_to_path(*observed), japanese_path);
+#ifdef _WIN32
+    if (previous) {
+        const auto previous_wide = utf8_to_wstring(*previous);
+        _wputenv_s(wide_name.c_str(), previous_wide.c_str());
+    } else {
+        _wputenv_s(wide_name.c_str(), L"");
+    }
+#else
+    if (previous)
+        setenv(environment_name, previous->c_str(), 1);
+    else
+        unsetenv(environment_name);
+#endif
+}
+
+TEST_F(UnicodePathTest, PathToGenericUtf8UsesForwardSlashes) {
+#ifdef _WIN32
+    const fs::path relative(L"画像\\写真.jpg");
+#else
+    const fs::path relative = fs::path("画像") / "写真.jpg";
+#endif
+    EXPECT_EQ(path_to_generic_utf8(relative), "画像/写真.jpg");
+}
+
+TEST_F(UnicodePathTest, PathAwareFileAndStbiRead) {
+    const auto image_path = test_root_ / utf8_to_path("画像_日本語.ppm");
+    const std::vector<uint8_t> ppm = {
+        'P',
+        '6',
+        '\n',
+        '1',
+        ' ',
+        '1',
+        '\n',
+        '2',
+        '5',
+        '5',
+        '\n',
+        255,
+        0,
+        0,
+    };
+    fs::create_directories(image_path.parent_path());
+    FILE* file = open_file(image_path, "wb");
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(fwrite(ppm.data(), 1, ppm.size(), file), ppm.size());
+    fclose(file);
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* pixels = stbi_load(path_to_utf8(image_path).c_str(),
+                                &width, &height, &channels, 4);
+    ASSERT_NE(pixels, nullptr);
+    EXPECT_EQ(width, 1);
+    EXPECT_EQ(height, 1);
+    stbi_image_free(pixels);
+}
+
+TEST_F(UnicodePathTest, AtomicOutputTempNamingPreservesJapanesePath) {
+    const auto output = test_root_ / utf8_to_path("成果物_日本語.licht");
+    const auto appended = lfs::io::make_atomic_temp_output_path(output);
+    const auto preserved = lfs::io::make_atomic_temp_output_path(
+        output, lfs::io::AtomicOutputTempName::PreserveExtension);
+
+    EXPECT_EQ(appended.parent_path(), output.parent_path());
+    EXPECT_EQ(preserved.parent_path(), output.parent_path());
+    EXPECT_NE(appended, output);
+    EXPECT_NE(preserved, output);
+    EXPECT_EQ(preserved.extension(), output.extension());
+    EXPECT_EQ(path_to_utf8(preserved.parent_path()), path_to_utf8(output.parent_path()));
 }
 
 // ============================================================================
@@ -878,8 +1009,14 @@ TEST_F(UnicodePathTest, RealWorld_ExportWorkflow) {
     auto sog_path = exports_dir / "故宮_ForbiddenCity_紫禁城.sog";
     // SOG is a ZIP archive, create minimal ZIP header
     std::vector<uint8_t> zip_header = {
-        0x50, 0x4B, 0x03, 0x04, // ZIP local file header signature
-        0x14, 0x00, 0x00, 0x00, // Version, flags
+        0x50,
+        0x4B,
+        0x03,
+        0x04, // ZIP local file header signature
+        0x14,
+        0x00,
+        0x00,
+        0x00, // Version, flags
     };
     create_binary_file(sog_path, zip_header);
     verify_file(sog_path);
@@ -1166,7 +1303,7 @@ TEST_F(UnicodePathTest, Utf8RoundTrip) {
     // Iterate and convert paths (like file_browser.cpp does)
     for (const auto& entry : fs::directory_iterator(utf8_to_path(current_path_str))) {
         // This is what file_browser does: store UTF-8 string
-        std::string selected_file_str = path_to_utf8(entry.path());
+        std::string selected_file_str = path_to_utf8(fs::entry_path(unicode_dir, entry.path()));
         EXPECT_FALSE(selected_file_str.empty()) << "path_to_utf8 failed for entry";
 
         // Convert back to path (for filesystem operations)
@@ -1179,7 +1316,7 @@ TEST_F(UnicodePathTest, Utf8RoundTrip) {
         EXPECT_FALSE(dirname_utf8.empty()) << "path_to_utf8 failed for filename";
 
         // Verify the comparison would work
-        std::string entry_path_utf8 = path_to_utf8(entry.path());
+        std::string entry_path_utf8 = path_to_utf8(fs::entry_path(unicode_dir, entry.path()));
         EXPECT_EQ(selected_file_str, entry_path_utf8)
             << "UTF-8 path comparison would fail in file browser";
     }
@@ -1219,7 +1356,7 @@ TEST_F(UnicodePathTest, DirectoryIterationWithPathToUtf8) {
         if (entry.is_directory()) {
             // This is exactly what the fixed file_browser.cpp does:
             std::string dirname = path_to_utf8(entry.path().filename());
-            std::string full_path = path_to_utf8(entry.path());
+            std::string full_path = path_to_utf8(fs::entry_path(test_dir, entry.path()));
 
             iteration_results.push_back({dirname, full_path});
 
@@ -1276,7 +1413,7 @@ TEST_F(UnicodePathTest, PathComparisonForSelection) {
     // Iterate and check selection (like file_browser does)
     int selected_count = 0;
     for (const auto& entry : fs::directory_iterator(test_dir)) {
-        std::string entry_path_utf8 = path_to_utf8(entry.path());
+        std::string entry_path_utf8 = path_to_utf8(fs::entry_path(test_dir, entry.path()));
         bool is_selected = (selected_file == entry_path_utf8);
 
         if (is_selected) {
@@ -1554,7 +1691,7 @@ TEST_F(UnicodePathTest, SingleUnicodeCharacterPaths) {
 // ============================================================================
 
 TEST_F(UnicodePathTest, FileBrowserDisplayStrings) {
-    // Test the exact string generation used for ImGui display in file_browser.cpp
+    // Test the exact string generation used for GUI display in file_browser.cpp
     // Pattern: dirname = "[DIR] " + path_to_utf8(dir.path().filename())
 
     auto test_dir = test_root_ / "display_test";
@@ -1578,7 +1715,7 @@ TEST_F(UnicodePathTest, FileBrowserDisplayStrings) {
             // This is the exact pattern from the fix:
             std::string dirname = std::string(directory_prefix) + path_to_utf8(entry.path().filename());
 
-            // Verify the string is valid for ImGui display
+            // Verify the string is valid for GUI display
             EXPECT_FALSE(dirname.empty()) << "Display string is empty";
             EXPECT_TRUE(dirname.starts_with(directory_prefix)) << "Prefix missing";
             EXPECT_GT(dirname.length(), strlen(directory_prefix)) << "No filename after prefix";
@@ -1586,7 +1723,7 @@ TEST_F(UnicodePathTest, FileBrowserDisplayStrings) {
             // Verify the UTF-8 is valid (no null bytes in middle, reasonable length)
             EXPECT_EQ(dirname.find('\0'), std::string::npos) << "Null byte in display string";
 
-            // Verify we can get c_str() safely (what ImGui::Selectable uses)
+            // Verify we can get c_str() safely (what selectable UI control uses)
             const char* c_str = dirname.c_str();
             EXPECT_NE(c_str, nullptr);
             EXPECT_GT(strlen(c_str), 0);
@@ -1760,12 +1897,14 @@ TEST_F(UnicodePathTest, DragDropPathHandling) {
         "ドラッグ_drag_드래그_拖拽.png",
         "ドロップ_drop_드롭_放下.jpg",
         "混合ファイル_Mixed_혼합파일_混合文件.ply",
-        "Special (file) [test].sog"};
+        "Special (file) [test].sog",
+        "カメラ_Cameras_相机.TXT",
+        "拡張子_扩展.测试"};
 
     std::vector<std::string> received_paths;
 
     for (const auto& filename : dropped_filenames) {
-        auto file_path = test_dir / filename;
+        auto file_path = test_dir / utf8_to_path(filename);
         create_file(file_path, "dropped content");
 
         // Simulate what the Windows drop handler does:
@@ -1779,6 +1918,28 @@ TEST_F(UnicodePathTest, DragDropPathHandling) {
         // Verify the path is usable
         fs::path recovered = utf8_to_path(utf8_path);
         EXPECT_TRUE(fs::exists(recovered)) << "Dropped path not accessible: " << utf8_path;
+
+        std::string extension;
+        std::string basename;
+        EXPECT_NO_THROW({
+            extension = path_to_utf8(recovered.extension());
+            basename = path_to_utf8(recovered.filename());
+        });
+        EXPECT_FALSE(extension.empty());
+        EXPECT_EQ(basename, filename);
+
+        std::ranges::transform(
+            extension, extension.begin(), [](const unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+        std::ranges::transform(
+            basename, basename.begin(), [](const unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+        if (filename.ends_with(".TXT")) {
+            EXPECT_EQ(extension, ".txt");
+            EXPECT_TRUE(basename.ends_with(".txt"));
+        }
 
         received_paths.push_back(utf8_path);
     }
@@ -1821,8 +1982,8 @@ TEST_F(UnicodePathTest, SaveDirectoryPopupPathDerivation) {
         std::string output_buffer = path_to_utf8(derived_output);
         EXPECT_FALSE(output_buffer.empty()) << "Output path buffer is empty";
 
-        // Simulate storing in input buffer (like ImGui text input)
-        // This tests that the UTF-8 string can be used with ImGui
+        // Simulate storing in input buffer (like text input)
+        // This tests that the UTF-8 string can be used with GUI text controls
         const char* c_str = output_buffer.c_str();
         EXPECT_NE(c_str, nullptr);
         EXPECT_GT(strlen(c_str), 0);
@@ -1840,7 +2001,7 @@ TEST_F(UnicodePathTest, SaveDirectoryPopupPathDerivation) {
 
         EXPECT_FALSE(dataset_str.empty());
 
-        // Verify it can be used for ImGui::Text display
+        // Verify it can be used for text display
         const char* display_str = dataset_str.c_str();
         EXPECT_NE(display_str, nullptr);
         EXPECT_GT(strlen(display_str), 0);
@@ -2257,43 +2418,44 @@ TEST_F(UnicodePathTest, OpenFileHelpers_AppendMode) {
 }
 
 // ============================================================================
-// Test 41: Checkpoint Save/Load Simulation with Unicode Paths
+// Test 41: Atomic project.licht save/load under Unicode output paths
+// Catches: CJK multi-script output paths that cannot open/write/rename/read a
+// binary project file; leftover .tmp after replace; sequential saves leaving
+// more than one project file under the output directory.
 // ============================================================================
 
 TEST_F(UnicodePathTest, CheckpointSaveLoad) {
-    // Simulate checkpoint operations from checkpoint.cpp
+    // Simulate product-default project save: <output>/project.licht with atomic replace
     auto output_dir = test_root_ / "出力_output_輸出_출력";
-    auto checkpoints_dir = output_dir / "checkpoints";
-    fs::create_directories(checkpoints_dir);
+    fs::create_directories(output_dir);
 
-    // Checkpoint header structure simulation
-    struct MockCheckpointHeader {
+    // Mock project header (path-encoding + atomic replace only; not a format parser)
+    struct MockProjectHeader {
         uint32_t magic = 0x4C465343; // "LFSC"
         uint32_t version = 1;
         uint32_t iteration;
         uint32_t num_gaussians;
     };
 
-    const auto checkpoint_path = checkpoints_dir / "checkpoint.resume";
-    auto temp_checkpoint_path = checkpoint_path;
-    temp_checkpoint_path += ".tmp";
+    const auto project_path = output_dir / "project.licht";
+    auto temp_project_path = project_path;
+    temp_project_path += ".tmp";
 
-    // Test repeated checkpoint saves to the same file
-    std::vector<std::pair<int, int>> checkpoints = {
+    // Test repeated atomic project saves to the same file
+    std::vector<std::pair<int, int>> project_saves = {
         {1000, 50000},
         {5000, 75000},
         {10000, 100000},
     };
 
-    for (const auto& [iteration, num_gaussians] : checkpoints) {
-        // Simulate save_checkpoint
+    for (const auto& [iteration, num_gaussians] : project_saves) {
         {
             std::ofstream file;
-            EXPECT_TRUE(open_file_for_write(temp_checkpoint_path, std::ios::binary, file))
-                << "Failed to open checkpoint for writing: " << path_to_utf8(temp_checkpoint_path);
+            EXPECT_TRUE(open_file_for_write(temp_project_path, std::ios::binary, file))
+                << "Failed to open project.licht.tmp for writing: " << path_to_utf8(temp_project_path);
 
             if (file.is_open()) {
-                MockCheckpointHeader header;
+                MockProjectHeader header;
                 header.iteration = iteration;
                 header.num_gaussians = num_gaussians;
                 file.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -2307,20 +2469,19 @@ TEST_F(UnicodePathTest, CheckpointSaveLoad) {
         }
 
         std::error_code ec;
-        fs::remove(checkpoint_path, ec);
-        EXPECT_FALSE(ec) << "Failed to remove checkpoint: " << ec.message();
+        fs::remove(project_path, ec);
+        EXPECT_FALSE(ec) << "Failed to remove project.licht: " << ec.message();
 
-        fs::rename(temp_checkpoint_path, checkpoint_path, ec);
-        EXPECT_FALSE(ec) << "Failed to replace checkpoint: " << ec.message();
+        fs::rename(temp_project_path, project_path, ec);
+        EXPECT_FALSE(ec) << "Failed to replace project.licht: " << ec.message();
 
-        // Simulate load_checkpoint
         {
             std::ifstream file;
-            EXPECT_TRUE(open_file_for_read(checkpoint_path, std::ios::binary, file))
-                << "Failed to open checkpoint for reading: " << path_to_utf8(checkpoint_path);
+            EXPECT_TRUE(open_file_for_read(project_path, std::ios::binary, file))
+                << "Failed to open project.licht for reading: " << path_to_utf8(project_path);
 
             if (file.is_open()) {
-                MockCheckpointHeader header;
+                MockProjectHeader header;
                 file.read(reinterpret_cast<char*>(&header), sizeof(header));
                 EXPECT_EQ(header.magic, 0x4C465343u);
                 EXPECT_EQ(header.iteration, static_cast<uint32_t>(iteration));
@@ -2328,11 +2489,11 @@ TEST_F(UnicodePathTest, CheckpointSaveLoad) {
             }
         }
 
-        EXPECT_TRUE(fs::exists(checkpoint_path))
-            << "Checkpoint file missing: " << path_to_utf8(checkpoint_path);
-        EXPECT_FALSE(fs::exists(temp_checkpoint_path))
-            << "Temporary checkpoint file not cleaned up: " << path_to_utf8(temp_checkpoint_path);
-        EXPECT_EQ(std::distance(fs::directory_iterator(checkpoints_dir), fs::directory_iterator()), 1);
+        EXPECT_TRUE(fs::exists(project_path))
+            << "Project file missing: " << path_to_utf8(project_path);
+        EXPECT_FALSE(fs::exists(temp_project_path))
+            << "Temporary project file not cleaned up: " << path_to_utf8(temp_project_path);
+        EXPECT_EQ(std::distance(fs::directory_iterator(output_dir), std::filesystem::directory_iterator()), 1);
     }
 }
 
@@ -2766,13 +2927,14 @@ TEST_F(UnicodePathTest, CacheFileOperations) {
 // ============================================================================
 
 TEST_F(UnicodePathTest, CompleteExportWorkflow) {
-    // Simulate a complete training + export workflow with Unicode paths
+    // Simulate a complete training + export workflow with Unicode paths.
+    // Catches: multi-step export fails when intermediate project.licht lives
+    // under Unicode project/output path components.
     auto project_dir = test_root_ / "プロジェクト_project_项目_프로젝트";
     auto output_dir = project_dir / "出力_output";
-    auto checkpoints_dir = output_dir / "checkpoints";
     auto exports_dir = output_dir / "exports";
 
-    fs::create_directories(checkpoints_dir);
+    fs::create_directories(output_dir);
     fs::create_directories(exports_dir);
 
     // 1. Save training config
@@ -2785,15 +2947,15 @@ TEST_F(UnicodePathTest, CompleteExportWorkflow) {
         EXPECT_TRUE(fs::exists(config_path));
     }
 
-    // 2. Save checkpoints at intervals
+    // 2. Save product-default project.licht at intervals (single file, overwritten)
     for (int iter : {10000, 20000, 30000}) {
-        auto cp_path = checkpoints_dir / "checkpoint.resume";
+        auto project_path = output_dir / "project.licht";
         std::ofstream file;
-        EXPECT_TRUE(open_file_for_write(cp_path, std::ios::binary, file));
+        EXPECT_TRUE(open_file_for_write(project_path, std::ios::binary, file));
         uint32_t header[4] = {0x4C465343, 1, static_cast<uint32_t>(iter), 100000};
         file.write(reinterpret_cast<const char*>(header), sizeof(header));
         file.close();
-        EXPECT_TRUE(fs::exists(cp_path));
+        EXPECT_TRUE(fs::exists(project_path));
     }
 
     // 3. Save metrics
@@ -2836,8 +2998,8 @@ TEST_F(UnicodePathTest, CompleteExportWorkflow) {
     }
 
     // Verify complete workflow succeeded
-    EXPECT_EQ(std::distance(fs::directory_iterator(checkpoints_dir), fs::directory_iterator()), 1);
-    EXPECT_EQ(fs::directory_iterator(exports_dir) != fs::directory_iterator(), true);
+    EXPECT_TRUE(fs::exists(output_dir / "project.licht"));
+    EXPECT_EQ(fs::directory_iterator(exports_dir) != std::filesystem::directory_iterator(), true);
 }
 
 // ============================================================================
@@ -2933,15 +3095,15 @@ TEST_F(UnicodePathTest, DatasetConfigJsonRoundTrip) {
 
 // ============================================================================
 // Test 53: utf8_to_path handles strings with embedded null characters
-// This simulates ImGui InputText buffers which are resized with null padding
+// This simulates text input buffers which are resized with null padding
 // ============================================================================
 
 TEST_F(UnicodePathTest, Utf8ToPathHandlesEmbeddedNullCharacters) {
-    // Simulate ImGui InputText buffer: actual path followed by null padding
+    // Simulate text input buffer: actual path followed by null padding
     constexpr size_t BUFFER_SIZE = 1024;
     std::string buffer = path_to_utf8(test_root_ / "output");
     size_t original_length = buffer.size();
-    buffer.resize(BUFFER_SIZE); // Pads with null characters like ImGui does
+    buffer.resize(BUFFER_SIZE); // Pads with null characters like fixed-size text input buffers do
 
     // Verify buffer has embedded nulls
     ASSERT_GT(buffer.size(), original_length);
@@ -2975,7 +3137,7 @@ TEST_F(UnicodePathTest, Utf8ToPathHandlesUnicodeWithEmbeddedNulls) {
     fs::create_directories(unicode_dir);
     ASSERT_TRUE(fs::exists(unicode_dir));
 
-    // Simulate ImGui buffer with Unicode path
+    // Simulate text input buffer with Unicode path
     constexpr size_t BUFFER_SIZE = 1024;
     std::string buffer = path_to_utf8(unicode_dir);
     size_t original_length = buffer.size();
@@ -2985,24 +3147,24 @@ TEST_F(UnicodePathTest, Utf8ToPathHandlesUnicodeWithEmbeddedNulls) {
     fs::path converted = utf8_to_path(buffer);
     EXPECT_EQ(converted, unicode_dir);
 
-    // Test path append with checkpoint-like structure
-    fs::path checkpoint_dir = converted / "checkpoints";
-    fs::path checkpoint_file = checkpoint_dir / "checkpoint.resume";
+    // Test path append with product-default project layout
+    fs::path project_file = converted / "project.licht";
 
     // Verify path operations worked (not truncated by embedded nulls)
-    std::string checkpoint_str = path_to_utf8(checkpoint_file);
-    EXPECT_TRUE(checkpoint_str.find("日本語_output") != std::string::npos);
-    EXPECT_TRUE(checkpoint_str.find("checkpoints") != std::string::npos);
-    EXPECT_TRUE(checkpoint_str.find("checkpoint.resume") != std::string::npos);
+    std::string project_str = path_to_utf8(project_file);
+    EXPECT_TRUE(project_str.find("日本語_output") != std::string::npos);
+    EXPECT_TRUE(project_str.find("project.licht") != std::string::npos);
 
     // Create the structure
-    fs::create_directories(checkpoint_dir);
-    EXPECT_TRUE(fs::exists(checkpoint_dir));
+    fs::create_directories(converted);
+    EXPECT_TRUE(fs::exists(converted));
 }
 
 // ============================================================================
-// Test 55: Checkpoint path construction with buffer-padded paths
-// Simulates the exact scenario that was failing: SaveDirectoryPopup → Trainer
+// Test 55: project.licht path construction with buffer-padded paths
+// Simulates SaveDirectoryPopup buffer padding → utf8_to_path → project path.
+// Catches: buffer padding corrupts utf8_to_path so appending project.licht or
+// creating/writing under Unicode output fails.
 // ============================================================================
 
 TEST_F(UnicodePathTest, CheckpointPathConstructionWithBufferPadding) {
@@ -3026,33 +3188,31 @@ TEST_F(UnicodePathTest, CheckpointPathConstructionWithBufferPadding) {
         std::string buffer = path_to_utf8(base_dir);
         buffer.resize(BUFFER_SIZE); // This was causing the bug!
 
-        // This is what Trainer::save_checkpoint receives
         fs::path output_path = utf8_to_path(buffer);
 
-        // This is what checkpoint.cpp does
-        fs::path checkpoint_dir = output_path / "checkpoints";
-        fs::path checkpoint_file = checkpoint_dir / "checkpoint.resume";
+        // Product default: <output>/project.licht
+        fs::path project_file = output_path / "project.licht";
 
         // Verify the paths are correctly constructed
-        EXPECT_NE(checkpoint_dir, output_path)
+        EXPECT_NE(project_file, output_path)
             << "Path append failed for: " << name;
-        EXPECT_TRUE(checkpoint_dir.string().length() > output_path.string().length())
-            << "Checkpoint dir not longer than output path for: " << name;
+        EXPECT_TRUE(project_file.string().length() > output_path.string().length())
+            << "Project path not longer than output path for: " << name;
 
         // Verify we can create and use these paths
         std::error_code ec;
-        fs::create_directories(checkpoint_dir, ec);
-        EXPECT_FALSE(ec) << "Failed to create checkpoint dir for: " << name << " - " << ec.message();
-        EXPECT_TRUE(fs::exists(checkpoint_dir)) << "Checkpoint dir doesn't exist for: " << name;
+        fs::create_directories(output_path, ec);
+        EXPECT_FALSE(ec) << "Failed to create output dir for: " << name << " - " << ec.message();
+        EXPECT_TRUE(fs::exists(output_path)) << "Output dir doesn't exist for: " << name;
 
-        // Write a test file to the checkpoint path
+        // Write a test file to the project path
         std::ofstream file;
-        open_file_for_write(checkpoint_file, std::ios::binary, file);
-        EXPECT_TRUE(file.is_open()) << "Failed to open checkpoint file for: " << name;
+        open_file_for_write(project_file, std::ios::binary, file);
+        EXPECT_TRUE(file.is_open()) << "Failed to open project.licht for: " << name;
         if (file.is_open()) {
-            file << "test checkpoint data";
+            file << "test project data";
             file.close();
-            EXPECT_TRUE(fs::exists(checkpoint_file)) << "Checkpoint file doesn't exist for: " << name;
+            EXPECT_TRUE(fs::exists(project_file)) << "project.licht doesn't exist for: " << name;
         }
     }
 }

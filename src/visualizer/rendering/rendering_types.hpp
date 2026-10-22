@@ -10,21 +10,41 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace lfs::vis {
 
     constexpr int GPU_ALIGNMENT = 16;
+    inline constexpr std::size_t DEFAULT_LOD_MAX_SPLATS = 2'500'000;
+    inline constexpr float DEFAULT_LOD_PIXEL_SCALE_LIMIT = 0.0001f;
+    inline constexpr float DEFAULT_LOD_RENDER_SCALE = 1.0f;
+    inline constexpr float DEFAULT_LOD_BEHIND_CAMERA_FOVEATION = 0.2f;
+    inline constexpr float DEFAULT_LOD_CONE_FOVEATION = 0.4f;
+    inline constexpr float DEFAULT_LOD_CONE_INNER_DEGREES = 90.0f;
+    inline constexpr float DEFAULT_LOD_CONE_OUTER_DEGREES = 120.0f;
+    inline constexpr float DEFAULT_LOD_OUTSIDE_VIEW_FOVEATION = 0.05f;
+    inline constexpr float DEFAULT_LOD_PREFETCH_PIXEL_SCALE_RATIO = 0.65f;
+    inline constexpr std::size_t DEFAULT_LOD_PAGE_POOL_SPLATS = 0; // 0 = auto (derived from lod_max_splats)
+    inline constexpr float DEFAULT_LOD_POOL_VRAM_FRACTION = 0.15f; // out-of-core page pool share of free VRAM
+    inline constexpr int DEFAULT_LOD_FADE_FRAMES = 12;             // fade-in of newly streamed pages (0 = off)
 
     enum class SplitViewMode {
         Disabled,
         PLYComparison,
         GTComparison,
         IndependentDual
+    };
+
+    enum class GTComparisonMode {
+        RGB = 0,
+        Normal = 1,
+        Depth = 2,
     };
 
     enum class SplitViewPanelId : uint8_t {
@@ -52,12 +72,56 @@ namespace lfs::vis {
         return mode == SplitViewMode::PLYComparison;
     }
 
+    // Ordered pair of visible splat-node indices for a PLY-comparison offset.
+    // The sequence walks unique unordered pairs (0,1), (0,2), ..., (n-2,n-1).
+    [[nodiscard]] inline std::optional<std::pair<size_t, size_t>>
+    plyComparisonPairForOffset(const size_t node_count, const size_t offset) {
+        if (node_count < 2) {
+            return std::nullopt;
+        }
+
+        size_t remaining = offset % ((node_count * (node_count - 1)) / 2);
+        for (size_t left = 0; left + 1 < node_count; ++left) {
+            const size_t row_count = node_count - left - 1;
+            if (remaining < row_count) {
+                return std::pair<size_t, size_t>{left, left + 1 + remaining};
+            }
+            remaining -= row_count;
+        }
+
+        return std::nullopt;
+    }
+
+    // Select a validation pair containing the provisional node without changing
+    // the stored comparison offset. Keep the displayed left model when possible.
+    [[nodiscard]] inline size_t plyComparisonImportOffset(size_t count, size_t offset, size_t provisional) {
+        const auto displayed = plyComparisonPairForOffset(count, offset);
+        if (!displayed || provisional >= count || displayed->first == provisional || displayed->second == provisional)
+            return offset;
+        const size_t left = std::min(displayed->first, provisional);
+        const size_t right = std::max(displayed->first, provisional);
+        return left * (2 * count - left - 1) / 2 + right - left - 1;
+    }
+
     [[nodiscard]] inline bool splitViewUsesGTComparison(const SplitViewMode mode) {
         return mode == SplitViewMode::GTComparison;
     }
 
     [[nodiscard]] inline bool splitViewUsesIndependentPanels(const SplitViewMode mode) {
         return mode == SplitViewMode::IndependentDual;
+    }
+
+    [[nodiscard]] inline float effectiveSceneRenderScale(
+        const float base_scale,
+        const float upscaler_scale,
+        const bool reconstruction_enabled) {
+        const float base = std::isfinite(base_scale) ? std::clamp(base_scale, 0.25f, 1.0f) : 1.0f;
+        if (!reconstruction_enabled)
+            return base;
+        const float reconstruction = std::isfinite(upscaler_scale)
+                                         ? std::clamp(upscaler_scale, 0.25f, 1.0f)
+                                         : 1.0f;
+        return std::clamp(base * reconstruction, 0.25f, 1.0f);
     }
 
     struct SplitViewPanelLayout {
@@ -101,12 +165,79 @@ namespace lfs::vis {
         }};
     };
 
+    struct PlyComparisonPanelLayout {
+        SplitViewPanelLayout panel;
+        // Maps full-viewport UVs into the panel render target. The render target
+        // includes a margin around the cached splitter position.
+        glm::vec2 texcoord_scale{1.0f, 1.0f};
+        glm::vec2 texcoord_offset{0.0f, 0.0f};
+    };
+
+    inline constexpr float PLY_COMPARISON_SPLITTER_MARGIN_FRACTION = 0.125f;
+
+    [[nodiscard]] inline std::array<PlyComparisonPanelLayout, 2>
+    makePlyComparisonPanelLayouts(const int total_width, const float split_position) {
+        const int divider_x = splitViewDividerPixel(total_width, split_position);
+        const int margin = std::clamp(
+            static_cast<int>(std::lround(static_cast<float>(std::max(total_width, 0)) *
+                                         PLY_COMPARISON_SPLITTER_MARGIN_FRACTION)),
+            0,
+            std::max(total_width, 0));
+        const int left_render_width = std::min(total_width, divider_x + margin);
+        const int right_render_x = std::max(0, divider_x - margin);
+        const int right_render_width = std::max(total_width - right_render_x, 0);
+        const auto normalized = [total_width](const int x) {
+            return total_width > 0 ? static_cast<float>(x) / static_cast<float>(total_width) : 0.0f;
+        };
+        const auto scale = [total_width](const int width) {
+            return width > 0 ? static_cast<float>(total_width) / static_cast<float>(width) : 1.0f;
+        };
+        return {{
+            {.panel = {.panel = SplitViewPanelId::Left,
+                       .x = 0,
+                       .width = std::max(left_render_width, 0),
+                       .start_position = 0.0f,
+                       .end_position = normalized(left_render_width)},
+             .texcoord_scale = {scale(left_render_width), 1.0f},
+             .texcoord_offset = {0.0f, 0.0f}},
+            {.panel = {.panel = SplitViewPanelId::Right,
+                       .x = right_render_x,
+                       .width = right_render_width,
+                       .start_position = normalized(right_render_x),
+                       .end_position = 1.0f},
+             .texcoord_scale = {scale(right_render_width), 1.0f},
+             .texcoord_offset = {-normalized(right_render_x) * scale(right_render_width), 0.0f}},
+        }};
+    }
+
+    [[nodiscard]] inline bool plyComparisonSplitterWithinMargin(
+        const int total_width, const float cached_split_position, const float current_split_position) {
+        if (total_width <= 0) {
+            return false;
+        }
+        const int margin = static_cast<int>(std::lround(
+            static_cast<float>(total_width) * PLY_COMPARISON_SPLITTER_MARGIN_FRACTION));
+        return std::abs(static_cast<float>(splitViewDividerPixel(total_width, cached_split_position) -
+                                           splitViewDividerPixel(total_width, current_split_position))) <= margin;
+    }
+
+    // Normalized texture coordinates address pixel centers at (pixel + 0.5) / extent.
+    // Using extent - 1 here stretches clipped comparison panels by a different amount
+    // whenever their cached widths change, so a divider refresh appears to reframe them.
+    [[nodiscard]] inline float splitViewPixelCenterUv(
+        const int pixel, const int rect_origin, const int rect_extent) {
+        return (static_cast<float>(pixel - rect_origin) + 0.5f) /
+               static_cast<float>(std::max(rect_extent, 1));
+    }
+
     enum class SelectionPreviewMode {
         Centers,
         Rectangle,
         Polygon,
         Lasso,
         Rings,
+        Box,
+        Sphere,
         Color
     };
 
@@ -161,6 +292,9 @@ namespace lfs::vis {
         bool mip_filter = false;
         int sh_degree = 3;
         float render_scale = 1.0f; // Viewer resolution scale (0.25-1.0), does not affect training
+        std::string scene_upscaler = "native";
+        std::string scene_upscaler_preset = "native";
+        float scene_upscaler_scale = 1.0f;
         CameraMetricsMode camera_metrics_mode = CameraMetricsMode::Off;
 
         // Crop box (data stored in scene graph CropBoxData, these are UI toggles only)
@@ -170,7 +304,7 @@ namespace lfs::vis {
         bool show_ellipsoid = false;
         bool use_ellipsoid = false;
         bool desaturate_unselected = false;     // Desaturate unselected PLYs when one is selected
-        bool desaturate_cropping = true;        // Desaturate outside crop box/ellipsoid instead of hiding
+        bool desaturate_cropping = false;       // Desaturate outside crop box/ellipsoid instead of hiding
         bool hide_outside_depth_box = false;    // Hide gaussians outside the selection depth box
         bool crop_filter_for_selection = false; // Use crop box/ellipsoid as selection filter
 
@@ -180,6 +314,11 @@ namespace lfs::vis {
                                AUTO = 1 };
         PPISPMode ppisp_mode = PPISPMode::AUTO;
         PPISPOverrides ppisp_overrides;
+
+        // Display color: tone IDs match none, linear, filmic, hejl, aces, aces2, neutral.
+        float color_exposure = 1.0f;
+        int color_tonemapping = 0;
+        int splat_render_profile = 0; // 0: Studio, 1: standard portal
 
         // Background
         glm::vec3 background_color = glm::vec3(0.0f, 0.0f, 0.0f);
@@ -218,18 +357,24 @@ namespace lfs::vis {
 
         // Split view
         SplitViewMode split_view_mode = SplitViewMode::Disabled;
+        GTComparisonMode gt_comparison_mode = GTComparisonMode::RGB;
         float split_position = 0.5f;
         size_t split_view_offset = 0;
 
         lfs::rendering::GaussianRasterBackend raster_backend = lfs::rendering::GaussianRasterBackend::ThreeDgs;
         bool gut = false;
         bool equirectangular = false;
+        // Live projection override; persisted as optional VIEW state, excluded from render proxies.
+        std::optional<lfs::rendering::GaussianRasterBackend> raster_backend_before_equirectangular;
         bool orthographic = false;
         float ortho_scale = 100.0f; // Pixels per world unit (larger = more zoomed in)
         bool depth_view = false;
+        float depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
+        float depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
+        lfs::rendering::DepthVisualizationMode depth_visualization_mode =
+            lfs::rendering::DepthVisualizationMode::Palette;
 
-        // Selection colors (RGB: committed=219,83,83 preview=0,222,76 center=0,154,187)
-        glm::vec3 selection_color_committed{0.859f, 0.325f, 0.325f};
+        // Selection colors (RGB: preview=0,222,76 center=0,154,187); committed splats use their group color
         glm::vec3 selection_color_preview{0.0f, 0.871f, 0.298f};
         glm::vec3 selection_color_center_marker{0.0f, 0.604f, 0.733f};
 
@@ -252,13 +397,83 @@ namespace lfs::vis {
         glm::vec3 depth_filter_min = glm::vec3(-50.0f, -10000.0f, 0.0f);
         glm::vec3 depth_filter_max = glm::vec3(50.0f, 10000.0f, 100.0f);
         lfs::geometry::EuclideanTransform depth_filter_transform;
+
+        // ---- LOD (Spark-style) ----
+        bool lod_enabled = false;                       // Master toggle
+        bool lod_auto_enable_rad = false;               // Keep LOD off by default, even for .rad
+        size_t lod_max_splats = DEFAULT_LOD_MAX_SPLATS; // Spark desktop default
+        float lod_render_scale = DEFAULT_LOD_RENDER_SCALE;
+        float lod_behind_camera_penalty = DEFAULT_LOD_BEHIND_CAMERA_FOVEATION;
+        float lod_cone_foveation = DEFAULT_LOD_CONE_FOVEATION;
+        float lod_cone_inner_degrees = DEFAULT_LOD_CONE_INNER_DEGREES;
+        float lod_cone_outer_degrees = DEFAULT_LOD_CONE_OUTER_DEGREES;
+        size_t lod_page_pool_splats = DEFAULT_LOD_PAGE_POOL_SPLATS;    // VRAM page-pool budget for RAD streaming (0 = auto)
+        float lod_pool_vram_fraction = DEFAULT_LOD_POOL_VRAM_FRACTION; // out-of-core pool share of free VRAM
+        int lod_fade_frames = DEFAULT_LOD_FADE_FRAMES;                 // newly streamed pages fade in over N frames
+        bool lod_debug_colors = false;                                 // Per-level color tinting
     };
 
-    inline void enforceProjectionBackend(RenderSettings& settings) {
+    inline void sanitizeDepthViewSettings(RenderSettings& settings) {
+        constexpr float kMinGap = 1.0e-4f;
+
+        if (!std::isfinite(settings.depth_view_min)) {
+            settings.depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
+        }
+        if (!std::isfinite(settings.depth_view_max)) {
+            settings.depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
+        }
+        settings.depth_view_min = std::clamp(
+            settings.depth_view_min,
+            0.0f,
+            lfs::rendering::MAX_DEPTH_VIEW_DISTANCE - kMinGap);
+        settings.depth_view_max = std::clamp(
+            settings.depth_view_max,
+            settings.depth_view_min + kMinGap,
+            lfs::rendering::MAX_DEPTH_VIEW_DISTANCE);
+
+        switch (settings.depth_visualization_mode) {
+        case lfs::rendering::DepthVisualizationMode::Palette:
+        case lfs::rendering::DepthVisualizationMode::Grayscale:
+            break;
+        default:
+            settings.depth_visualization_mode = lfs::rendering::DepthVisualizationMode::Palette;
+            break;
+        }
+    }
+
+    inline void sanitizeGTComparisonSettings(RenderSettings& settings) {
+        switch (settings.gt_comparison_mode) {
+        case GTComparisonMode::RGB:
+        case GTComparisonMode::Normal:
+        case GTComparisonMode::Depth:
+            break;
+        default:
+            settings.gt_comparison_mode = GTComparisonMode::RGB;
+            break;
+        }
+    }
+
+    inline void enforceProjectionBackend(RenderSettings& settings, const bool remember_backend = false) {
+        using Backend = lfs::rendering::GaussianRasterBackend;
+        auto& previous_backend = settings.raster_backend_before_equirectangular;
+        // Full settings restoration must use its saved backend, without a live override.
+        if (!remember_backend) {
+            previous_backend.reset();
+        }
         if (!settings.equirectangular) {
+            if (previous_backend) {
+                if (settings.raster_backend == Backend::ThreeDgut) {
+                    settings.raster_backend = *previous_backend;
+                }
+                settings.gut = lfs::rendering::isGutBackend(settings.raster_backend);
+                previous_backend.reset();
+            }
             return;
         }
-        settings.raster_backend = lfs::rendering::GaussianRasterBackend::ThreeDgut;
+        if (remember_backend && !previous_backend && settings.raster_backend != Backend::ThreeDgut) {
+            previous_backend = settings.raster_backend;
+        }
+        settings.raster_backend = Backend::ThreeDgut;
         settings.gut = true;
     }
 
@@ -270,7 +485,7 @@ namespace lfs::vis {
     [[nodiscard]] inline bool environmentBackgroundUsesTransparentViewerCompositing(
         const RenderSettings& settings) {
         return environmentBackgroundEnabled(settings) &&
-               !splitViewEnabled(settings.split_view_mode);
+               !splitViewUsesGTComparison(settings.split_view_mode);
     }
 
     struct SplitViewInfo {
@@ -279,6 +494,8 @@ namespace lfs::vis {
         std::string detail_label;
         std::string left_name;
         std::string right_name;
+
+        [[nodiscard]] friend bool operator==(const SplitViewInfo&, const SplitViewInfo&) = default;
     };
 
     struct ViewportRegion {

@@ -17,9 +17,12 @@
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
 #define LFS_WARP_REDUCE_SIZE (lfs::kWarpSize)
 #define LFS_WARP_REDUCE_MASK LFS_FULL_WARP_MASK
+// block_reduce_min4/min2 fold 32-lane groups and finish in threads 0-31 only.
+#define LFS_WARP_REDUCE_GROUP32_MASK LFS_GROUP32_LANE_MASK
 #else
 #define LFS_WARP_REDUCE_SIZE 32
 #define LFS_WARP_REDUCE_MASK 0xffffffffu
+#define LFS_WARP_REDUCE_GROUP32_MASK 0xffffffffu
 #endif
 
 namespace lfs::core {
@@ -122,6 +125,8 @@ namespace lfs::core {
                 val = warp_reduce_sum(val);
             }
 
+            __syncthreads();
+
             return val;
         }
 
@@ -146,6 +151,8 @@ namespace lfs::core {
                 val = (threadIdx.x < (blockDim.x + LFS_WARP_REDUCE_SIZE - 1) / LFS_WARP_REDUCE_SIZE) ? shared[lane] : -std::numeric_limits<T>::infinity();
                 val = warp_reduce_max(val);
             }
+
+            __syncthreads();
 
             return val;
         }
@@ -172,7 +179,105 @@ namespace lfs::core {
                 val = warp_reduce_min(val);
             }
 
+            __syncthreads();
+
             return val;
+        }
+
+        /**
+         * @brief Fused block min of float4 via __shfl_xor butterfly + one shared round.
+         *
+         * joint Adam bounds pack {u_min, -u_max, s_min, -s_max} so one
+         * min4 replace four alternating min/max block reduces (which raced on
+         * static __shared__ storage and cost 4 barriers). One barrier here;
+         * result valid in warp 0 (thread 0 reads for bounds write).
+         */
+        __device__ inline float4 block_reduce_min4(float4 val) {
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float4 o = make_float4(
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.z, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.w, offset));
+                val.x = fminf(val.x, o.x);
+                val.y = fminf(val.y, o.y);
+                val.z = fminf(val.z, o.z);
+                val.w = fminf(val.w, o.w);
+            }
+
+            // __shared__ has static storage duration: one allocation for ALL inlined
+            // call sites of this function. Consecutive calls to the same block-reduce
+            // need an intervening __syncthreads() (or use a distinct function).
+            __shared__ float4 shared[32];
+            const int lane = static_cast<int>(threadIdx.x) % 32;
+            const int warp_id = static_cast<int>(threadIdx.x) / 32;
+            if (lane == 0) {
+                shared[warp_id] = val;
+            }
+            __syncthreads();
+
+            if (warp_id == 0) {
+                constexpr float kInf = 1e30f;
+                val = (threadIdx.x < (blockDim.x + 31u) / 32u)
+                          ? shared[lane]
+                          : make_float4(kInf, kInf, kInf, kInf);
+#pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    const float4 o = make_float4(
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.z, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.w, offset));
+                    val.x = fminf(val.x, o.x);
+                    val.y = fminf(val.y, o.y);
+                    val.z = fminf(val.z, o.z);
+                    val.w = fminf(val.w, o.w);
+                }
+            }
+            return val; // valid in warp 0
+        }
+
+        /**
+         * @brief Fused block min of float2 via __shfl_xor butterfly + one shared round.
+         *
+         * Distinct function from block_reduce_min4 so its __shared__ float2[32] is a
+         * separate allocation. Safe to call adjacent to min4 without an extra barrier.
+         * Result valid in warp 0.
+         */
+        __device__ inline float2 block_reduce_min2(float2 val) {
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float2 o = make_float2(
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                    __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset));
+                val.x = fminf(val.x, o.x);
+                val.y = fminf(val.y, o.y);
+            }
+
+            __shared__ float2 shared[32];
+            const int lane = static_cast<int>(threadIdx.x) % 32;
+            const int warp_id = static_cast<int>(threadIdx.x) / 32;
+            if (lane == 0) {
+                shared[warp_id] = val;
+            }
+            __syncthreads();
+
+            if (warp_id == 0) {
+                constexpr float kInf = 1e30f;
+                val = (threadIdx.x < (blockDim.x + 31u) / 32u)
+                          ? shared[lane]
+                          : make_float2(kInf, kInf);
+#pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    const float2 o = make_float2(
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.x, offset),
+                        __shfl_xor_sync(LFS_WARP_REDUCE_GROUP32_MASK, val.y, offset));
+                    val.x = fminf(val.x, o.x);
+                    val.y = fminf(val.y, o.y);
+                }
+            }
+            return val; // valid in warp 0
         }
 
         /**
@@ -196,6 +301,8 @@ namespace lfs::core {
                 val = (threadIdx.x < (blockDim.x + LFS_WARP_REDUCE_SIZE - 1) / LFS_WARP_REDUCE_SIZE) ? shared[lane] : T(1);
                 val = warp_reduce_prod(val);
             }
+
+            __syncthreads();
 
             return val;
         }

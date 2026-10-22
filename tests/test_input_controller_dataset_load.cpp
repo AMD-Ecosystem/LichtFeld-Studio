@@ -1,6 +1,9 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/error_bus.hpp"
+#include "core/event_bridge/event_bridge.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
@@ -14,8 +17,8 @@
 #include "tools/tool_base.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
-#include <imgui.h>
 
 namespace lfs::vis {
 
@@ -23,19 +26,25 @@ namespace lfs::vis {
         class InputControllerDatasetLoadTest : public ::testing::Test {
         protected:
             void SetUp() override {
+                ASSERT_TRUE(lfs::event::LocalizationManager::getInstance().initialize(
+                    (std::filesystem::path(PROJECT_ROOT_PATH) / "src/visualizer/gui/resources/locales").string()));
+                lfs::event::EventBridge::instance().clear_all();
                 services().clear();
                 gui::guiFocusState().reset();
-
-                IMGUI_CHECKVERSION();
-                ImGui::CreateContext();
+                environment_path_ = std::filesystem::temp_directory_path() / "drag_drop_environment.hdr";
+                std::ofstream file(environment_path_, std::ios::binary);
+                file << "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n";
+                const unsigned char pixel[] = {64, 128, 192, 129};
+                file.write(reinterpret_cast<const char*>(pixel), sizeof(pixel));
             }
 
             void TearDown() override {
-                ImGui::DestroyContext();
-
+                std::filesystem::remove(environment_path_);
                 gui::guiFocusState().reset();
                 services().clear();
+                lfs::event::EventBridge::instance().clear_all();
             }
+            std::filesystem::path environment_path_;
         };
 
         std::shared_ptr<core::PointCloud> makePointCloud(const std::vector<float>& positions) {
@@ -51,7 +60,9 @@ namespace lfs::vis {
         }
     } // namespace
 
-    TEST_F(InputControllerDatasetLoadTest, DatasetLoadFramesSceneAndUpdatesHomeWhenBoundsAvailable) {
+    // Dataset load deliberately resets to the home pose instead of framing the
+    // scene (b8f9d6b8 "revert cam to home pos at dataloading").
+    TEST_F(InputControllerDatasetLoadTest, DatasetLoadResetsCameraToHome) {
         Viewport viewport(200, 200);
         InputController controller(nullptr, viewport);
         SceneManager scene_manager;
@@ -72,9 +83,9 @@ namespace lfs::vis {
         viewport.camera.home_t = glm::vec3(123.0f, 456.0f, 789.0f);
         viewport.camera.home_pivot = glm::vec3(10.0f, 20.0f, 30.0f);
         viewport.camera.home_R = glm::mat3(1.0f);
-        viewport.camera.t = viewport.camera.home_t;
-        viewport.camera.pivot = viewport.camera.home_pivot;
-        viewport.camera.R = viewport.camera.home_R;
+        viewport.camera.t = glm::vec3(-3.0f, 4.0f, 12.0f);
+        viewport.camera.pivot = glm::vec3(1.0f, 1.0f, 1.0f);
+        viewport.camera.R = glm::mat3(1.0f);
 
         core::events::state::DatasetLoadCompleted{
             .path = {},
@@ -85,16 +96,10 @@ namespace lfs::vis {
         }
             .emit();
 
-        const glm::vec3 expected_pivot =
-            lfs::rendering::visualizerWorldPointFromDataWorld(glm::vec3(0.0f, 1.0f, 2.0f));
-        EXPECT_NEAR(viewport.camera.getPivot().x, expected_pivot.x, 1e-5f);
-        EXPECT_NEAR(viewport.camera.getPivot().y, expected_pivot.y, 1e-5f);
-        EXPECT_NEAR(viewport.camera.getPivot().z, expected_pivot.z, 1e-5f);
-
-        EXPECT_NE(viewport.camera.home_t, glm::vec3(123.0f, 456.0f, 789.0f));
-        EXPECT_NE(viewport.camera.home_pivot, glm::vec3(10.0f, 20.0f, 30.0f));
-        EXPECT_EQ(viewport.camera.home_t, viewport.camera.t);
-        EXPECT_EQ(viewport.camera.home_pivot, viewport.camera.pivot);
+        EXPECT_EQ(viewport.camera.t, viewport.camera.home_t);
+        EXPECT_EQ(viewport.camera.pivot, viewport.camera.home_pivot);
+        EXPECT_EQ(viewport.camera.home_t, glm::vec3(123.0f, 456.0f, 789.0f));
+        EXPECT_EQ(viewport.camera.home_pivot, glm::vec3(10.0f, 20.0f, 30.0f));
     }
 
     TEST_F(InputControllerDatasetLoadTest, DroppedHdrUpdatesEnvironmentRenderSettings) {
@@ -109,6 +114,315 @@ namespace lfs::vis {
         const auto settings = rendering_manager.getSettings();
         EXPECT_EQ(settings.environment_mode, EnvironmentBackgroundMode::Equirectangular);
         EXPECT_EQ(lfs::core::utf8_to_path(settings.environment_map_path), drop_path);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, InvalidEnvironmentDropKeepsPreviousSettings) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        RenderingManager rendering_manager;
+        services().set(&rendering_manager);
+        const auto previous = rendering_manager.getSettings();
+        const auto path = std::filesystem::temp_directory_path() / "invalid_drop_environment.hdr";
+        std::filesystem::remove(path);
+        for (const auto& contents : {std::optional<std::string>{}, std::optional<std::string>{""},
+                                     std::optional<std::string>{std::string(5000, 'x')}}) {
+            SCOPED_TRACE(contents ? std::to_string(contents->size()) : "missing");
+            if (contents) {
+                std::ofstream file(path, std::ios::binary);
+                file << *contents;
+            }
+            controller.handleFileDrop({lfs::core::path_to_utf8(path)});
+            const auto actual = rendering_manager.getSettings();
+            EXPECT_EQ(actual.environment_map_path, previous.environment_map_path);
+            EXPECT_EQ(actual.environment_mode, previous.environment_mode);
+        }
+        std::filesystem::remove(path);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, UserEnvironmentChangesAreAtomicAndReportErrors) {
+        class Consumer final : public lfs::NativeErrorConsumer {
+        public:
+            void on_error(const lfs::ErrorNotification& notification,
+                          const lfs::ErrorDeliveryInfo&) noexcept override {
+                ++count;
+                code = notification.error.code();
+                surface = notification.surface;
+            }
+            int count = 0;
+            lfs::ErrorCode code = lfs::ErrorCode::Internal;
+            lfs::ErrorSurface surface = lfs::ErrorSurface::StatusOnly;
+        } consumer;
+        auto subscription = lfs::ErrorBus::instance().subscribe(consumer);
+        RenderingManager manager;
+        auto valid = manager.getSettings();
+        valid.environment_mode = EnvironmentBackgroundMode::Equirectangular;
+        valid.environment_map_path = lfs::core::path_to_utf8(environment_path_);
+        ASSERT_TRUE(manager.updateSettingsFromUser(valid));
+        EXPECT_EQ(consumer.count, 0);
+        auto invalid = valid;
+        invalid.environment_map_path.clear();
+        invalid.environment_exposure = 3.0f;
+        const auto result = manager.updateSettingsFromUser(invalid);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code(), lfs::ErrorCode::InvalidArgument);
+        EXPECT_EQ(consumer.count, 1);
+        EXPECT_EQ(consumer.surface, lfs::ErrorSurface::Toast);
+        EXPECT_EQ(manager.getSettings().environment_map_path, valid.environment_map_path);
+        EXPECT_EQ(manager.getSettings().environment_exposure, valid.environment_exposure);
+
+        valid.environment_rotation_degrees = 90.0f;
+        valid.environment_exposure = 2.0f;
+        // Changing other settings must not reopen an already selected map.
+        std::filesystem::remove(environment_path_);
+        ASSERT_TRUE(manager.updateSettingsFromUser(valid));
+        EXPECT_EQ(manager.getSettings().environment_rotation_degrees, 90.0f);
+        EXPECT_EQ(manager.getSettings().environment_exposure, 2.0f);
+        valid.environment_mode = EnvironmentBackgroundMode::SolidColor;
+        ASSERT_TRUE(manager.updateSettingsFromUser(valid));
+        EXPECT_EQ(manager.getSettings().environment_mode, EnvironmentBackgroundMode::SolidColor);
+        EXPECT_EQ(consumer.count, 1);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, InternalSettingsRestoreDoesNotValidateEnvironmentFiles) {
+        RenderingManager manager;
+        auto settings = manager.getSettings();
+        settings.environment_mode = EnvironmentBackgroundMode::Equirectangular;
+        settings.environment_map_path = "unavailable_saved_environment.hdr";
+        manager.updateSettings(settings);
+        EXPECT_EQ(manager.getSettings().environment_map_path, settings.environment_map_path);
+        EXPECT_EQ(manager.getSettings().environment_mode, settings.environment_mode);
+        settings.environment_exposure = 1.0f;
+        EXPECT_TRUE(manager.updateSettingsFromUser(settings));
+        EXPECT_EQ(manager.getSettings().environment_exposure, 1.0f);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, RestoringMissingEnvironmentMapReportsWithoutDroppingSettings) {
+        class Consumer final : public lfs::NativeErrorConsumer {
+        public:
+            void on_error(const lfs::ErrorNotification& notification,
+                          const lfs::ErrorDeliveryInfo&) noexcept override {
+                ++count;
+                surface = notification.surface;
+            }
+            int count = 0;
+            lfs::ErrorSurface surface = lfs::ErrorSurface::StatusOnly;
+        } consumer;
+        auto subscription = lfs::ErrorBus::instance().subscribe(consumer);
+        RenderingManager manager;
+        auto restored = manager.getSettings();
+        restored.environment_mode = EnvironmentBackgroundMode::Equirectangular;
+        restored.environment_map_path = "missing_saved_environment.hdr";
+        restored.environment_exposure = 1.25f;
+
+        // This mirrors the VIEW chapter restore path. It must keep accepting the
+        // saved settings while reporting a missing custom map to the user.
+        manager.restoreSettingsFromProject(restored);
+
+        EXPECT_EQ(consumer.count, 1);
+        EXPECT_EQ(consumer.surface, lfs::ErrorSurface::Toast);
+        EXPECT_EQ(manager.getSettings().environment_mode, restored.environment_mode);
+        EXPECT_EQ(manager.getSettings().environment_map_path, restored.environment_map_path);
+        EXPECT_FLOAT_EQ(manager.getSettings().environment_exposure, restored.environment_exposure);
+
+        restored.environment_map_path = lfs::core::path_to_utf8(environment_path_);
+        manager.restoreSettingsFromProject(restored);
+        EXPECT_EQ(consumer.count, 1);
+        EXPECT_EQ(manager.getSettings().environment_map_path, restored.environment_map_path);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, SingleDroppedVideoShowsVideoExtractor) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+
+        std::optional<std::filesystem::path> requested_video_path;
+        core::events::cmd::ShowVideoExtractor::when([&](const auto& e) {
+            requested_video_path = e.video_path;
+        });
+
+        const auto drop_path = std::filesystem::temp_directory_path() / "drag_drop_video.mp4";
+        controller.handleFileDrop({lfs::core::path_to_utf8(drop_path)});
+
+        ASSERT_TRUE(requested_video_path.has_value());
+        EXPECT_EQ(*requested_video_path, drop_path);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, SingleDroppedVideoExtensionIsCaseInsensitive) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+
+        std::optional<std::filesystem::path> requested_video_path;
+        core::events::cmd::ShowVideoExtractor::when([&](const auto& e) {
+            requested_video_path = e.video_path;
+        });
+
+        const auto drop_path = std::filesystem::temp_directory_path() / "drag_drop_video.MP4";
+        controller.handleFileDrop({lfs::core::path_to_utf8(drop_path)});
+
+        ASSERT_TRUE(requested_video_path.has_value());
+        EXPECT_EQ(*requested_video_path, drop_path);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, VideoMixedWithOtherDropDoesNotShowVideoExtractor) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        RenderingManager rendering_manager;
+        services().set(&rendering_manager);
+
+        bool video_extractor_requested = false;
+        std::optional<core::events::state::FileDropFailed> failure;
+        core::events::cmd::ShowVideoExtractor::when([&](const auto&) {
+            video_extractor_requested = true;
+        });
+        core::events::state::FileDropFailed::when([&](const auto& e) { failure = e; });
+
+        const auto video_path = std::filesystem::temp_directory_path() / "drag_drop_video.mp4";
+        const auto hdr_path = std::filesystem::temp_directory_path() / "drag_drop_environment.hdr";
+        controller.handleFileDrop({
+            lfs::core::path_to_utf8(video_path),
+            lfs::core::path_to_utf8(hdr_path),
+        });
+
+        EXPECT_FALSE(video_extractor_requested);
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_EQ(failure->files, std::vector<std::string>{lfs::core::path_to_utf8(video_path)});
+        EXPECT_NE(failure->error.find("separately"), std::string::npos);
+        const auto settings = rendering_manager.getSettings();
+        EXPECT_EQ(settings.environment_mode, EnvironmentBackgroundMode::Equirectangular);
+        EXPECT_EQ(lfs::core::utf8_to_path(settings.environment_map_path), hdr_path);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, MixedDropReportsEverySkippedItem) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        std::vector<core::events::cmd::LoadFile> loads;
+        std::optional<core::events::state::FileDropFailed> failure;
+        core::events::cmd::LoadFile::when([&](const auto& e) { loads.push_back(e); });
+        core::events::state::FileDropFailed::when([&](const auto& e) { failure = e; });
+
+        const auto splat = std::filesystem::temp_directory_path() / "drop_splat.ply";
+        const auto video = std::filesystem::temp_directory_path() / "drop_video.mp4";
+        const auto project = std::filesystem::temp_directory_path() / "drop_project.licht";
+        const auto unknown = std::filesystem::temp_directory_path() / "drop_unknown.xyz";
+        controller.handleFileDrop({lfs::core::path_to_utf8(video), lfs::core::path_to_utf8(splat),
+                                   lfs::core::path_to_utf8(project), lfs::core::path_to_utf8(unknown)});
+
+        ASSERT_EQ(loads.size(), 1u);
+        EXPECT_EQ(loads.front().paths, std::vector<std::filesystem::path>{splat});
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_EQ(failure->files,
+                  (std::vector<std::string>{lfs::core::path_to_utf8(video), lfs::core::path_to_utf8(project),
+                                            lfs::core::path_to_utf8(unknown)}));
+        EXPECT_NE(failure->error.find("separately"), std::string::npos);
+        EXPECT_NE(failure->error.find("Supported formats"), std::string::npos);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, TwoVideosAreReportedAsSkipped) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        std::vector<core::events::cmd::ShowVideoExtractor> extractors;
+        std::optional<core::events::state::FileDropFailed> failure;
+        core::events::cmd::ShowVideoExtractor::when([&](const auto& e) { extractors.push_back(e); });
+        core::events::state::FileDropFailed::when([&](const auto& e) { failure = e; });
+        const auto first = std::filesystem::temp_directory_path() / "drop_first.mp4";
+        const auto second = std::filesystem::temp_directory_path() / "drop_second.MOV";
+        controller.handleFileDrop({lfs::core::path_to_utf8(first), lfs::core::path_to_utf8(second)});
+        EXPECT_TRUE(extractors.empty());
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_EQ(failure->files,
+                  (std::vector<std::string>{lfs::core::path_to_utf8(first), lfs::core::path_to_utf8(second)}));
+        EXPECT_NE(failure->error.find("separately"), std::string::npos);
+        EXPECT_EQ(failure->error.find("Supported formats"), std::string::npos);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, UnknownAlongsideSplatIsReported) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        std::optional<core::events::state::FileDropFailed> failure;
+        core::events::state::FileDropFailed::when([&](const auto& e) { failure = e; });
+        const auto splat = std::filesystem::temp_directory_path() / "drop_splat.ply";
+        const auto unknown = std::filesystem::temp_directory_path() / "drop_unknown.xyz";
+        controller.handleFileDrop({lfs::core::path_to_utf8(splat), lfs::core::path_to_utf8(unknown)});
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_EQ(failure->files, std::vector<std::string>{lfs::core::path_to_utf8(unknown)});
+        EXPECT_NE(failure->error.find("Supported formats"), std::string::npos);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, UnknownDropLocalizesWholeSupportedFormatsDetail) {
+        auto& locale = lfs::event::LocalizationManager::getInstance();
+        locale.setOverride("file_drop.supported_formats_detail", "Valid inputs: {} plus dataset folders");
+
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        std::optional<core::events::state::FileDropFailed> failure;
+        core::events::state::FileDropFailed::when([&](const auto& e) { failure = e; });
+        controller.handleFileDrop({"drop_unknown.xyz"});
+
+        locale.clearOverride("file_drop.supported_formats_detail");
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_NE(failure->error.find("Valid inputs:"), std::string::npos);
+        EXPECT_NE(failure->error.find(".mp4"), std::string::npos);
+        EXPECT_EQ(failure->error.find("Supported formats:"), std::string::npos);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, MixedFileDropEmitsOneOrderedBatch) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        std::vector<core::events::cmd::LoadFile> commands;
+        core::events::cmd::LoadFile::when([&](const auto& command) { commands.push_back(command); });
+        const std::vector<std::string> paths{
+            "third.ply", "first.sog", "second.spz", "mesh.obj",
+            "fourth.ply", "fifth.sog", "sixth.spz", "last.ply"};
+        for (size_t count = 2; count <= paths.size(); ++count) {
+            commands.clear();
+            controller.handleFileDrop({paths.begin(), paths.begin() + count});
+            ASSERT_EQ(commands.size(), 1u);
+            ASSERT_EQ(commands[0].paths.size(), count);
+            EXPECT_TRUE(commands[0].user_batch);
+            EXPECT_EQ(commands[0].path, core::utf8_to_path(paths.front()));
+            for (size_t index = 0; index < count; ++index)
+                EXPECT_EQ(commands[0].paths[index], core::utf8_to_path(paths[index]));
+        }
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, SingleDroppedPlyStillUsesSplatLoader) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+
+        std::optional<core::events::cmd::LoadFile> load_file;
+        bool video_extractor_requested = false;
+        core::events::cmd::LoadFile::when([&](const auto& e) {
+            load_file = e;
+        });
+        core::events::cmd::ShowVideoExtractor::when([&](const auto&) {
+            video_extractor_requested = true;
+        });
+
+        const auto drop_path = std::filesystem::temp_directory_path() / "drag_drop_splat.ply";
+        controller.handleFileDrop({lfs::core::path_to_utf8(drop_path)});
+
+        ASSERT_TRUE(load_file.has_value());
+        EXPECT_EQ(load_file->path, drop_path);
+        EXPECT_FALSE(load_file->is_dataset);
+        EXPECT_TRUE(load_file->user_batch);
+        EXPECT_FALSE(video_extractor_requested);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, UnrecognizedSingleDropStillReportsFailure) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+
+        std::optional<core::events::state::FileDropFailed> failure;
+        core::events::state::FileDropFailed::when([&](const auto& e) {
+            failure = e;
+        });
+
+        const auto drop_path = std::filesystem::temp_directory_path() / "drag_drop_unknown.not_video";
+        controller.handleFileDrop({lfs::core::path_to_utf8(drop_path)});
+
+        ASSERT_TRUE(failure.has_value());
+        ASSERT_EQ(failure->files.size(), 1u);
+        EXPECT_EQ(failure->files.front(), lfs::core::path_to_utf8(drop_path));
+        EXPECT_NE(failure->error.find(".mp4"), std::string::npos);
     }
 
 } // namespace lfs::vis

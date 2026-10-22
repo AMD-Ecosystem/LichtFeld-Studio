@@ -50,7 +50,7 @@ jobs:
     steps:
       - name: Decide whether package build is needed
         id: decide
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const inputs = context.payload.inputs || {};
@@ -63,14 +63,14 @@ jobs:
             const stableVersion = isTagRelease
               ? refName.replace(/^v/, '')
               : (inputs.release_version || '').trim().replace(/^v/, '');
-            const stableVersionPattern = /^[0-9]+(\.[0-9]+){1,2}$/;
+            const stableVersionPattern = /^[0-9]+(\.[0-9]+){1,3}$/;
 
             if (isTagRelease || requestedChannel === 'stable') {
               core.setOutput('build_channel', 'stable');
               core.setOutput('previous_sha', '');
               if (!stableVersionPattern.test(stableVersion)) {
                 core.setFailed(
-                  `Stable publishes require a version like 0.5.2; got '${stableVersion || '<empty>'}'.`
+                  `Stable publishes require a version like 0.5.4.1; got '${stableVersion || '<empty>'}'.`
                 );
                 return;
               }
@@ -174,17 +174,24 @@ jobs:
             echo "- Decision: ${REASON}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  build-windows:
+  windows-preflight:
     needs: precheck
+    if: github.repository == 'MrNeRF/LichtFeld-Studio' && needs.precheck.outputs.should_build == 'true'
+    uses: ./.github/workflows/windows-build-preflight.yml
+
+  build-windows:
+    needs: [precheck, windows-preflight]
     if: github.repository == 'MrNeRF/LichtFeld-Studio' && needs.precheck.outputs.should_build == 'true'
     runs-on: windows-2022
     env:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
       VCPKG_BUILD_TYPE: release
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+      BUILD_DIR: b
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
@@ -197,13 +204,17 @@ jobs:
 
       - name: Set CUDA environment
         run: |
+          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Normalize vcpkg path
+        run: '"VCPKG_ROOT=$([System.IO.Path]::GetFullPath($env:VCPKG_ROOT))" >> $env:GITHUB_ENV'
+
       - name: Cache vcpkg tool
         id: cache-vcpkg-tool
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.VCPKG_ROOT }}
           key: vcpkg-tool-${{ runner.os }}-2026-03-12
@@ -217,17 +228,18 @@ jobs:
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
       - name: Cache vcpkg_installed
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
-          path: build/vcpkg_installed
-          key: vcpkg-installed-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-installed-${{ runner.os }}-
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-
 
       - name: Configure
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $cmakeArgs = '-B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF'
+          $buildDir = $env:BUILD_DIR
+          $cmakeArgs = "-B $buildDir -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF"
           $retryablePatterns = @(
             'status code 5\d\d',
             'timed out',
@@ -248,9 +260,10 @@ jobs:
             }
 
             $shouldRetry = $false
-            if (Test-Path 'build\vcpkg-manifest-install.log') {
+            $manifestLog = Join-Path $buildDir 'vcpkg-manifest-install.log'
+            if (Test-Path $manifestLog) {
               foreach ($pattern in $retryablePatterns) {
-                if (Select-String -Path 'build\vcpkg-manifest-install.log' -Pattern $pattern -Quiet) {
+                if (Select-String -Path $manifestLog -Pattern $pattern -Quiet) {
                   $shouldRetry = $true
                   break
                 }
@@ -262,30 +275,46 @@ jobs:
             }
 
             Write-Warning "Retryable configure failure detected, cleaning build tree before retry."
-            if (Test-Path 'build') {
-              Remove-Item -Recurse -Force 'build'
+            if (Test-Path $buildDir) {
+              Remove-Item -Recurse -Force $buildDir
             }
             Start-Sleep -Seconds (15 * $attempt)
           }
+
+      - name: Generate shader headers for preflight
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set PATH=%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%PATH%
+          cmake --build %BUILD_DIR% --target lfs_shader_headers --config Release -j 4
+
+      - name: Run configured MSVC preflight
+        shell: cmd
+        env:
+          LFS_PREFLIGHT_BASE: ${{ needs.precheck.outputs.previous_sha }}
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          python tools\windows_build_preflight.py --skip-source-checks --compile-commands %BUILD_DIR%\compile_commands.json --max-commands 512
 
       - name: Build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cmake --build build -j %NUMBER_OF_PROCESSORS%
+          cmake --build %BUILD_DIR% -j %NUMBER_OF_PROCESSORS%
 
       - name: Dump failure diagnostics
         if: failure()
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+          $buildDir = $env:BUILD_DIR
           $paths = @(
-            'build\vcpkg-manifest-install.log',
-            'build\vcpkg_installed\vcpkg\issue_body.md',
-            'build\CMakeFiles\CMakeConfigureLog.yaml',
-            'build\CMakeFiles\CMakeError.log',
-            'build\CMakeFiles\CMakeOutput.log',
-            'build\CMakeCache.txt'
+            "$buildDir\vcpkg-manifest-install.log",
+            "$buildDir\vcpkg_installed\vcpkg\issue_body.md",
+            "$buildDir\CMakeFiles\CMakeConfigureLog.yaml",
+            "$buildDir\CMakeFiles\CMakeError.log",
+            "$buildDir\CMakeFiles\CMakeOutput.log",
+            "$buildDir\CMakeCache.txt"
           )
 
           foreach ($path in $paths) {
@@ -300,19 +329,19 @@ jobs:
       # GitHub Actions artifact quota.
       - name: Upload failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-nightly-diagnostics-${{ github.run_number }}
           if-no-files-found: ignore
           retention-days: 7
           path: |
-            build/CMakeCache.txt
-            build/CMakeFiles/CMakeConfigureLog.yaml
-            build/CMakeFiles/CMakeError.log
-            build/CMakeFiles/CMakeOutput.log
-            build/vcpkg-manifest-install.log
-            build/vcpkg_installed/vcpkg/issue_body.md
-            build/vcpkg_installed/vcpkg/blds/**/*.log
+            ${{ env.BUILD_DIR }}/CMakeCache.txt
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeError.log
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeOutput.log
+            ${{ env.BUILD_DIR }}/vcpkg-manifest-install.log
+            ${{ env.BUILD_DIR }}/vcpkg_installed/vcpkg/issue_body.md
+            ${{ env.BUILD_DIR }}/vcpkg_installed/vcpkg/blds/**/*.log
 
       - name: Package
         id: package
@@ -333,8 +362,8 @@ jobs:
 
           if ($buildChannel -eq "stable") {
             $packageVersion = $env:STABLE_VERSION
-            if ([string]::IsNullOrWhiteSpace($packageVersion) -or $packageVersion -notmatch '^[0-9]+(\.[0-9]+){1,2}$') {
-              throw "Stable publishes require STABLE_VERSION like 0.5.2."
+            if ([string]::IsNullOrWhiteSpace($packageVersion) -or $packageVersion -notmatch '^[0-9]+(\.[0-9]+){1,3}$') {
+              throw "Stable publishes require STABLE_VERSION like 0.5.4.1."
             }
           } elseif ($buildChannel -eq "nightly") {
             $targetVersionFile = ".github/nightly-target-version.txt"
@@ -346,9 +375,9 @@ jobs:
               Where-Object { $_ -and -not $_.StartsWith("#") } |
               Select-Object -First 1
             if ([string]::IsNullOrWhiteSpace($nightlyTargetVersion) -or $nightlyTargetVersion -eq "SET_ME") {
-              throw "Set the target version in $targetVersionFile, for example 0.6 or 0.5.2."
+              throw "Set the target version in $targetVersionFile, for example 0.6 or 0.5.4.1."
             }
-            if ($nightlyTargetVersion -notmatch '^[0-9]+(\.[0-9]+){1,2}$') {
+            if ($nightlyTargetVersion -notmatch '^[0-9]+(\.[0-9]+){1,3}$') {
               throw "Invalid nightly target version '$nightlyTargetVersion' in $targetVersionFile."
             }
             $packageVersion = "$nightlyTargetVersion.dev$dateStamp+$shortSha"
@@ -357,7 +386,7 @@ jobs:
           }
 
           $packageName = "LichtFeld-Studio-windows-v$packageVersion.zip"
-          cmake --install build --prefix dist
+          cmake --install $env:BUILD_DIR --prefix dist
           Compress-Archive -Path dist\* -DestinationPath $packageName
           "build_channel=$buildChannel" >> $env:GITHUB_OUTPUT
           "package_name=$packageName" >> $env:GITHUB_OUTPUT

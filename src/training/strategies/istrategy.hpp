@@ -7,9 +7,11 @@
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "optimizer/render_output.hpp"
+#include <exception>
 #include <istream>
 #include <memory>
 #include <ostream>
+#include <utility>
 
 namespace lfs::io {
     class PipelinedImageLoader;
@@ -33,11 +35,17 @@ namespace lfs::training {
 
         virtual void pre_step(int /*iter*/, RenderOutput& /*render_output*/) {}
 
+        virtual void post_render(int /*iter*/, RenderOutput& /*render_output*/) {}
+
         virtual void post_backward(int iter, RenderOutput& render_output) = 0;
 
         virtual void step(int iter) = 0;
 
+        /// Permute row-indexed strategy aux tensors (vis counts, error maxima, free masks).
+        virtual void permute_gaussian_rows(const lfs::core::Tensor&) {}
+
         virtual bool is_refining(int iter) const = 0;
+        [[nodiscard]] virtual lfs::core::Tensor rendered_support_counts() const { return {}; }
 
         // Get the underlying Gaussian model (reference to Scene-owned data)
         virtual lfs::core::SplatData& get_model() = 0;
@@ -65,7 +73,36 @@ namespace lfs::training {
 
         // Optional hook for strategies that need the training dataset (e.g., for view-based scoring)
         virtual void set_training_dataset(std::shared_ptr<CameraDataset>) {}
+        virtual std::shared_ptr<CameraDataset> get_training_dataset() const { return {}; }
 
         virtual void set_image_loader(lfs::io::PipelinedImageLoader*) {}
+
+        // Optional FastGS edge-scoring contract. The main backward writes one
+        // view into a zeroed scratch vector. The completion callback runs only
+        // after a successful backward and lets the strategy normalize/mask the
+        // view before adding it to its refine window.
+        virtual lfs::core::Tensor edge_score_scratch(int /*iter*/) { return {}; }
+        virtual void on_edge_score_accumulated(int /*iter*/) {}
+
+        virtual std::pair<lfs::core::Tensor, lfs::core::Tensor> impact_scratch(int /*iter*/) {
+            return {};
+        }
+        virtual void on_impact_accumulated(int /*iter*/) {}
+    };
+
+    class ICheckpointStateAdopter {
+    public:
+        virtual ~ICheckpointStateAdopter() = default;
+        virtual bool has_checkpoint_runtime_state() const noexcept = 0;
+        virtual bool can_adopt_checkpoint_state(const IStrategy& source) const noexcept = 0;
+        virtual void adopt_checkpoint_state(IStrategy& source) noexcept = 0;
+
+    protected:
+        template <typename Strategy>
+        static Strategy& checked_checkpoint_source(IStrategy& source) noexcept {
+            if (auto* typed_source = dynamic_cast<Strategy*>(&source))
+                return *typed_source;
+            std::terminate();
+        }
     };
 } // namespace lfs::training

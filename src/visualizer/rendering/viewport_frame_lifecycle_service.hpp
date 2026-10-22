@@ -9,17 +9,29 @@
 #include "rendering_types.hpp"
 #include <atomic>
 #include <chrono>
-#include <utility>
 
 namespace lfs::vis {
 
     class ViewportArtifactService;
 
+    enum class ViewportResizeRenderPolicy {
+        InteractivePreview,
+        FullResolution,
+    };
+
     class LFS_VIS_API ViewportFrameLifecycleService {
     public:
+        enum class ModelSource {
+            Scene,
+            Training,
+        };
+
         struct ResizeResult {
             DirtyMask dirty = 0;
             bool completed = false;
+            bool render_resized_frame = false;
+            bool use_interactive_render_scale = false;
+            bool require_immediate_output_resize = false;
         };
 
         struct ModelChangeResult {
@@ -28,29 +40,46 @@ namespace lfs::vis {
         };
 
         [[nodiscard]] ResizeResult handleViewportResize(const glm::ivec2& current_size);
-        [[nodiscard]] ModelChangeResult handleModelChange(size_t model_ptr, ViewportArtifactService& viewport_artifacts);
+        [[nodiscard]] ModelChangeResult handleModelChange(size_t model_ptr, ViewportArtifactService& viewport_artifacts,
+                                                          ModelSource source = ModelSource::Scene);
+        // Refreshes the preview on the interval while training runs, and once more
+        // when it stops running so the final state is shown.
         [[nodiscard]] DirtyMask handleTrainingRefresh(bool is_training, float refresh_interval_sec);
+        [[nodiscard]] double secondsUntilTrainingRefresh(float refresh_interval_sec) const;
+        // A camera/rest render also satisfies the preview refresh. Schedule the
+        // next one from this actual submit, not an earlier deferred request.
+        void restartTrainingRefresh() { last_training_render_ = std::chrono::steady_clock::now(); }
         [[nodiscard]] DirtyMask requiredDirtyMask(bool has_viewport_output,
                                                   bool has_renderable_content,
                                                   SplitViewMode split_view_mode) const;
-        [[nodiscard]] DirtyMask setViewportResizeActive(bool active);
+        [[nodiscard]] DirtyMask setViewportResizeActive(
+            bool active,
+            ViewportResizeRenderPolicy render_policy = ViewportResizeRenderPolicy::InteractivePreview);
         [[nodiscard]] DirtyMask deferViewportRefresh();
+        [[nodiscard]] bool hasPendingResizeSettle() const;
+        [[nodiscard]] bool resizeSettleReady() const;
+        [[nodiscard]] double secondsUntilResizeSettleReady() const;
+        [[nodiscard]] bool resizeRecentlyChanged(std::chrono::steady_clock::duration max_age) const;
         [[nodiscard]] bool isResizeDeferring() const {
-            return resize_active_.load(std::memory_order_relaxed) || resize_debounce_ > 0;
+            return resize_active_.load(std::memory_order_relaxed) || resize_settle_pending_;
         }
-        bool consumeResizeCompleted() { return std::exchange(resize_completed_, false); }
-        void noteResizeCompleted() { resize_completed_ = true; }
-        void resetViewportSize() { last_viewport_size_ = glm::ivec2(0, 0); }
-        void resetModelTracking() { last_model_ptr_ = 0; }
+        void resetModelTracking() {
+            last_model_ptr_ = 0;
+            last_model_source_ = ModelSource::Scene;
+        }
         [[nodiscard]] glm::ivec2 lastViewportSize() const { return last_viewport_size_; }
 
     private:
         glm::ivec2 last_viewport_size_{0, 0};
         size_t last_model_ptr_ = 0;
+        ModelSource last_model_source_ = ModelSource::Scene;
         std::chrono::steady_clock::time_point last_training_render_{};
+        bool training_refreshing_ = false;
+        std::chrono::steady_clock::time_point last_resize_change_{};
         std::atomic<bool> resize_active_{false};
-        int resize_debounce_ = 0;
-        bool resize_completed_ = false;
+        std::atomic<ViewportResizeRenderPolicy> resize_render_policy_{
+            ViewportResizeRenderPolicy::InteractivePreview};
+        bool resize_settle_pending_ = false;
     };
 
 } // namespace lfs::vis

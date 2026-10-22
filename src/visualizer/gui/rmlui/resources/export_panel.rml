@@ -34,10 +34,14 @@
           <span class="ep-no-models" data-if="show_no_models">@tr:export_dialog.no_models</span>
           <div class="ep-model-row"
                data-for="model : models"
-               data-attr-data-node-name="model.name">
+               data-attr-data-node-name="model.name"
+               data-class-is-group="model.is_group"
+               data-style-padding-left="model.indent">
             <label class="setting-label">
               <input type="checkbox"
                      data-attr-data-node-name="model.name"
+                     data-attr-data-group-id="model.group_id"
+                     data-class-is-partial="model.partial"
                      data-attrif-checked="model.selected" />
               <span class="ep-model-name">{{ model.name }}</span>
             </label>
@@ -59,45 +63,82 @@
         </div>
       </div>
 
-      <!-- RAD Settings - only shown for RAD format -->
+      <!-- Provenance - hidden for COLMAP and SPZ v3 -->
+      <div class="ep-section" data-if="show_include_provenance">
+        <div class="setting-row setting-row--aligned" data-tooltip="export_dialog.include_provenance_hint">
+          <span class="setting-row__label-col">@tr:export_dialog.include_provenance</span>
+          <div class="setting-row__control-col">
+            <input type="checkbox" data-attrif-checked="include_provenance" data-event-change="toggle_include_provenance" />
+          </div>
+        </div>
+      </div>
+
+      <!-- SPZ version - only shown for SPZ format -->
+      <div class="ep-section" data-if="show_spz_version">
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.spz_version</span>
+          <div class="setting-row__control-col setting-row__control-col--fill">
+            <select data-value="spz_version">
+              <option value="4">@tr:export_dialog.spz_version_v4</option>
+              <option value="3">@tr:export_dialog.spz_version_v3</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- SSOG settings -->
+      <div class="ep-section" data-if="show_ssog_settings">
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.ssog_bundle</span>
+          <div class="setting-row__control-col"><input type="checkbox" data-attrif-checked="ssog_bundle" data-event-change="toggle_ssog_bundle" /></div>
+        </div>
+        <div class="setting-row setting-row--aligned" data-if="show_ssog_folder">
+          <span class="setting-row__label-col">@tr:export_dialog.folder_name</span>
+          <div class="setting-row__control-col setting-row__control-col--fill"><input type="text" data-value="ssog_folder_name" /></div>
+        </div>
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.lod_levels</span>
+          <div class="setting-row__control-col setting-row__control-col--fill"><input type="text" data-value="lod_levels" /></div>
+        </div>
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.lod_ratio</span>
+          <div class="setting-row__control-col setting-row__control-col--fill"><input type="text" data-value="lod_ratio" /></div>
+        </div>
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.chunk_count_k</span>
+          <div class="setting-row__control-col setting-row__control-col--fill"><input type="text" data-value="chunk_count_k" /></div>
+        </div>
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.chunk_extent</span>
+          <div class="setting-row__control-col setting-row__control-col--fill"><input type="text" data-value="chunk_extent" /></div>
+        </div>
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.chunk_min_k</span>
+          <div class="setting-row__control-col setting-row__control-col--fill"><input type="text" data-value="chunk_min_k" /></div>
+        </div>
+        <div class="setting-row setting-row--aligned">
+          <span class="setting-row__label-col">@tr:export_dialog.kmeans_iterations</span>
+          <div class="setting-row__control-col setting-row__control-col--fill"><input type="text" data-value="kmeans_iterations" /></div>
+        </div>
+      </div>
+
       <div data-if="show_rad_settings">
         <div class="separator"></div>
         <div class="ep-section">
+          <div class="setting-row setting-row--aligned">
+            <span class="setting-row__label-col">@tr:export_dialog.rad_export_mode</span>
+            <div class="setting-row__control-col setting-row__control-col--fill">
+              <select data-value="rad_export_mode">
+                <option value="stream">@tr:export_dialog.rad_streamable</option>
+                <option value="non_stream">@tr:export_dialog.rad_native</option>
+              </select>
+            </div>
+          </div>
           <!-- Y-flip checkbox -->
           <div class="setting-row setting-row--aligned">
             <span class="setting-row__label-col">@tr:export_dialog.rad_flip_y</span>
             <div class="setting-row__control-col">
               <input type="checkbox" data-attrif-checked="rad_flip_y" data-event-change="toggle_rad_flip_y" />
-            </div>
-          </div>
-          <div class="setting-row setting-row--aligned">
-            <span class="setting-row__label-col">@tr:export_dialog.rad_customize_lod</span>
-            <div class="setting-row__control-col">
-              <input type="checkbox" data-attrif-checked="rad_customize_lod" data-event-change="toggle_rad_customize_lod" />
-            </div>
-          </div>
-          <div data-if="rad_customize_lod">
-            <!-- Collapsible LOD Levels Section -->
-            <div class="section-header text-accent" id="hdr-rad-lod" data-event-click="toggle_section('rad_lod')">
-              <span class="section-arrow text-accent" id="arrow-rad-lod">&#x25B6;</span>
-              <span class="text-accent">@tr:export_dialog.rad_lod_levels</span>
-            </div>
-            <div class="section-content collapsed" id="sec-rad-lod">
-              <div data-for="lod : rad_lod_list">
-                <div class="setting-row" data-attr-data-lod-index="it_index">
-                  <input type="text" class="number-input" data-value="lod.value" data-event-change="update_lod_value" />
-                  <span class="text-default">%</span>
-                  <button class="btn btn--secondary" data-tooltip="export.tooltip.rad_lod_remove" data-event-click="remove_rad_lod(it_index)">@tr:common.remove</button>
-                </div>
-              </div>
-            </div>
-            <div class="separator"></div>
-            <!-- Add new LOD level -->
-            <div class="setting-row" data-tooltip="export.tooltip.rad_lod_input">
-              <input type="text" id="rad-new-lod" class="number-input" data-value="rad_new_lod_str" />
-              <button class="num-step-btn" data-event-mousedown="num_step_rad_lod(-1)">-</button>
-              <button class="num-step-btn" data-event-mousedown="num_step_rad_lod(1)">+</button>
-              <button class="btn btn--secondary" data-tooltip="export.tooltip.rad_lod_add" data-event-click="add_rad_lod">@tr:common.add</button>
             </div>
           </div>
         </div>
@@ -121,7 +162,7 @@
     <div class="ep-section">
       <span class="ep-section-title">{{progress_title}}</span>
     </div>
-    <div class="ep-progress-wrap">
+    <div class="ep-progress-wrap is-exporting">
       <progress id="export-progress" class="ep-progress" max="1" data-attr-value="progress_value" />
       <span class="progress__text">{{progress_pct}}</span>
     </div>

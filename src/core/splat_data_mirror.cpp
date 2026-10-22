@@ -3,9 +3,12 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/splat_data_mirror.hpp"
+#include "core/crash_handler.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/logger.hpp"
+#include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
+#include "splat_data_mirror_centroid.hpp"
 #include <mutex>
 
 namespace lfs::core {
@@ -47,6 +50,22 @@ namespace lfs::core {
         std::mutex g_cache_mutex;
         MirrorCache g_cache;
 
+        void clear_mirror_cache() noexcept {
+            // g_cache is a non-local static constructed before the
+            // CudaMemoryPool singleton. Free CUDA mult tensors while the pool
+            // is still alive so static destruction finds empty holders.
+            std::lock_guard lock(g_cache_mutex);
+            for (int a = 0; a < 3; ++a) {
+                g_cache.pos_mult[a] = {};
+                g_cache.quat_mult[a] = {};
+                for (int d = 0; d < 3; ++d) {
+                    g_cache.sh_mult[a][d] = {};
+                }
+            }
+            g_cache.valid = false;
+            g_cache.device = Device::CPU;
+        }
+
         void ensure_cache(const Device device) {
             std::lock_guard lock(g_cache_mutex);
 
@@ -72,6 +91,11 @@ namespace lfs::core {
             g_cache.valid = true;
         }
 
+        const bool g_mirror_cache_release_hook_registered = [] {
+            register_gpu_pre_shutdown_hook([]() noexcept { clear_mirror_cache(); });
+            return true;
+        }();
+
     } // namespace
 
     glm::vec3 compute_selection_center(const SplatData& splat_data, const Tensor& selection_mask) {
@@ -79,19 +103,31 @@ namespace lfs::core {
         if (!means.is_valid() || means.size(0) == 0)
             return glm::vec3(0.0f);
 
-        const auto selected = selection_mask.ne(0);
-        const int count = selected.sum_scalar();
+        const auto selected = selection_mask.ne(0)
+                                  .reshape(TensorShape{means.size(0)})
+                                  .to(means.device())
+                                  .contiguous();
+        if (means.device() == Device::CUDA)
+            return detail::selected_centroid_cuda(means.contiguous(), selected);
+
+        // Keep the centroid accurate enough that rounding a reflection does not
+        // repeatedly move its pivot. Divide in double before rounding once.
+        const auto positions = means.contiguous();
+        const auto* p = positions.ptr<float>();
+        const auto* mask = selected.ptr<bool>();
+        double sum[3]{};
+        size_t count = 0;
+        for (size_t i = 0; i < means.size(0); ++i) {
+            if (!mask[i])
+                continue;
+            ++count;
+            for (int axis = 0; axis < 3; ++axis)
+                sum[axis] += p[i * 3 + axis];
+        }
         if (count == 0)
             return glm::vec3(0.0f);
-
-        // Masked sum on GPU, only transfer 3 floats
-        const auto mask_f = selected.to(DataType::Float32).unsqueeze(1);
-        const auto masked = means * mask_f;
-        const auto sum = masked.sum({0}, false).to(Device::CPU).contiguous();
-        const auto* s = static_cast<const float*>(sum.data_ptr());
-        const float inv = 1.0f / static_cast<float>(count);
-
-        return {s[0] * inv, s[1] * inv, s[2] * inv};
+        return {static_cast<float>(sum[0] / count), static_cast<float>(sum[1] / count),
+                static_cast<float>(sum[2] / count)};
     }
 
     void mirror_gaussians(SplatData& splat_data,
@@ -132,30 +168,37 @@ namespace lfs::core {
             rot.index_copy_(0, indices, rot.index_select(0, indices) * g_cache.quat_mult[a]);
         }
 
-        // SH coefficients (degrees 1-3 only, shN excludes DC). Gather only selected
-        // rows to linear form, apply signs, then scatter back into swizzled storage.
+        // SH coefficients (degrees 1-3 only, shN excludes DC). Use
+        // shN_canonical() so q16-resident models dequant correctly (raw
+        // shN().ptr<float>() aborts on Float16 codes).
         const size_t layout_rest = splat_data.max_sh_coeffs_rest();
         if (splat_data.shN().is_valid() && splat_data.shN().numel() > 0 && layout_rest > 0) {
             const int degree = static_cast<int>(std::sqrt(layout_rest + 1)) - 1;
             if (degree >= 1 && degree <= 3) {
-                const auto layout_rest_u32 = static_cast<uint32_t>(layout_rest);
-                Tensor selected_shN = Tensor::empty(
-                    {static_cast<size_t>(indices.numel()), layout_rest, 3}, device);
-                shN_swizzled_gather_to_linear(
-                    splat_data.shN().ptr<float>(),
-                    indices.ptr<int>(),
-                    selected_shN.ptr<float>(),
-                    indices.numel(),
-                    layout_rest_u32,
-                    layout_rest_u32);
-                selected_shN = selected_shN * g_cache.sh_mult[a][degree - 1];
-                shN_swizzled_scatter_linear(
-                    splat_data.shN().ptr<float>(),
-                    indices.ptr<int>(),
-                    selected_shN.ptr<float>(),
-                    indices.numel(),
-                    layout_rest_u32,
-                    layout_rest_u32);
+                Tensor shN_canon = splat_data.shN_canonical();
+                if (shN_canon.device() != device)
+                    shN_canon = shN_canon.to(device);
+                const auto selected =
+                    shN_canon.index_select(0, indices) * g_cache.sh_mult[a][degree - 1];
+                shN_canon.index_copy_(0, indices, selected);
+                splat_data.shN_set_from_canonical(shN_canon, splat_data.means().capacity());
+                if (sh_value_quant::enabled()) {
+                    (void)splat_data.apply_shN_value_quant();
+                } else if (splat_data.has_tensor_allocator()) {
+                    auto& shN = splat_data.shN();
+                    if (shN.is_valid() && shN.dtype() == DataType::Float32) {
+                        const size_t n = splat_data.size();
+                        const size_t cap = std::max(n, splat_data.means().capacity());
+                        const auto rest = static_cast<uint32_t>(splat_data.max_sh_coeffs_rest());
+                        Tensor dest = splat_data.allocate_named_param(
+                            shN.shape(),
+                            sh_swizzled_float_count(cap, rest),
+                            DataType::Float32,
+                            "SplatData.shN");
+                        dest.copy_from(shN);
+                        shN = std::move(dest);
+                    }
+                }
             }
         }
     }

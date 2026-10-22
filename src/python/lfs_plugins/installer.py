@@ -1,30 +1,38 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Plugin dependency installer using uv."""
+from _lfs_path_io import native_path, open, executable_kwargs
 
+from collections import deque
 from dataclasses import asdict, dataclass
+import hashlib
+import hmac
+import io
 import json
 import logging
 import os
-from pathlib import Path
+import platform
+from _lfs_path_io import Path
 from pathlib import PurePosixPath
+import queue
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from typing import Optional, Callable, Tuple
-from urllib.parse import quote, urlparse
-import urllib.request
+from urllib.parse import urldefrag
 import zipfile
 
 logger = logging.getLogger(__name__)
 
 from .http import urlopen
 from .plugin import PluginInstance
-from .errors import PluginDependencyError, PluginError
+from .errors import PluginDependencyError, PluginError, PluginLoadCancelled
 try:
     import tomllib
 except ImportError:
@@ -34,6 +42,212 @@ except ImportError:
 PLUGIN_SOURCE_METADATA_NAME = ".lichtfeld-source.json"
 GITHUB_API_URL = "https://api.github.com/repos"
 HTTP_USER_AGENT = "LichtFeld-PluginInstaller/1.0"
+PROCESS_POLL_SECONDS = 0.05
+PROCESS_TERMINATE_GRACE_SECONDS = 0.5
+PROCESS_OUTPUT_TAIL_LINES = 100
+
+
+def __getattr__(name):
+    """Keep the historical lazy ``installer.urllib`` patch surface."""
+    if name == "urllib":
+        import urllib
+        import urllib.error
+        import urllib.request
+
+        return urllib
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _localized_progress(key: str, fallback: str, **values: object) -> str:
+    from .localization import safe_format
+
+    try:
+        import lichtfeld as lf
+
+        text = lf.ui.tr(key)
+        if text and text != key:
+            return safe_format(text, **values)
+    except Exception:
+        pass
+    return safe_format(fallback, **values)
+
+
+def _install_digest(url: str, sha256: Optional[str]) -> tuple[str, str]:
+    """Return a URL without its digest fragment and a normalized SHA-256."""
+    clean_url, fragment = urldefrag(str(url).strip())
+    fragment_digest = ""
+    if fragment.lower().startswith("sha256="):
+        fragment_digest = fragment.split("=", 1)[1].strip()
+    elif len(fragment) == 64:
+        fragment_digest = fragment
+
+    supplied = str(sha256 or "").strip()
+    if supplied.lower().startswith("sha256:") or supplied.lower().startswith("sha256="):
+        supplied = supplied[7:]
+    if fragment_digest and supplied and not hmac.compare_digest(fragment_digest.lower(), supplied.lower()):
+        message = _localized_progress(
+            "plugin_marketplace.error.digest_conflict",
+            "The URL digest and sha256 argument do not match.",
+        )
+        raise PluginError(message)
+    digest = supplied or fragment_digest
+    if digest and (len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest)):
+        message = _localized_progress(
+            "plugin_marketplace.error.invalid_digest",
+            "The SHA-256 digest must contain exactly 64 hexadecimal characters.",
+        )
+        raise PluginError(message)
+    return (clean_url if fragment_digest else str(url).strip()), digest.lower()
+
+
+def verify_archive_sha256(archive: Path | bytes, expected: str) -> None:
+    """Reject an archive whose bytes do not match the supplied SHA-256."""
+    archive_bytes = archive if isinstance(archive, bytes) else Path(archive).read_bytes()
+    if not hmac.compare_digest(hashlib.sha256(archive_bytes).hexdigest(), expected.lower()):
+        raise PluginError(_localized_progress(
+            "plugin_marketplace.error.checksum_mismatch",
+            "Plugin archive SHA-256 verification failed.",
+        ))
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _cancel_requested(should_cancel: Optional[Callable[[], bool]]) -> bool:
+    return bool(should_cancel and should_cancel())
+
+
+def _wait_for_process(proc: subprocess.Popen, timeout: float) -> bool:
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort termination of a process and descendants on supported hosts."""
+    if proc.poll() is not None:
+        return
+
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP gives uv its own console group. taskkill /T is
+        # the best portable stdlib-only tree termination available on Windows;
+        # a Job Object would provide stronger guarantees but is not used here.
+        try:
+            tree_kill = subprocess.Popen(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if not _wait_for_process(tree_kill, PROCESS_TERMINATE_GRACE_SECONDS):
+                tree_kill.kill()
+                _wait_for_process(tree_kill, PROCESS_TERMINATE_GRACE_SECONDS)
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            proc.terminate()
+
+    if _wait_for_process(proc, PROCESS_TERMINATE_GRACE_SECONDS):
+        return
+
+    if sys.platform == "win32":
+        proc.kill()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            proc.kill()
+    _wait_for_process(proc, PROCESS_TERMINATE_GRACE_SECONDS)
+
+
+def _process_group_popen_kwargs() -> dict:
+    if sys.platform == "win32":
+        return {
+            "creationflags": getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            )
+        }
+    return {"start_new_session": True}
+
+
+def _run_cancellable_process(
+    cmd: list[str],
+    *,
+    env: Optional[dict] = None,
+    on_output: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> subprocess.CompletedProcess:
+    """Run a child in its own process group while streaming bounded output."""
+    if _cancel_requested(should_cancel):
+        raise PluginLoadCancelled("Plugin loading cancelled before starting dependency process")
+
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1,
+        "env": env,
+    }
+    popen_kwargs.update(_process_group_popen_kwargs())
+    popen_kwargs.update(executable_kwargs(cmd))
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    output_queue: queue.Queue[Optional[str]] = queue.Queue()
+    output_tail: deque[str] = deque(maxlen=PROCESS_OUTPUT_TAIL_LINES)
+
+    def read_output() -> None:
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    output_queue.put(line.rstrip())
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=read_output, name="plugin-process-output", daemon=True)
+    reader.start()
+    output_finished = False
+
+    try:
+        while not output_finished or proc.poll() is None:
+            if _cancel_requested(should_cancel):
+                _terminate_process_tree(proc)
+                raise PluginLoadCancelled("Plugin dependency process cancelled")
+
+            try:
+                line = output_queue.get(timeout=PROCESS_POLL_SECONDS)
+            except queue.Empty:
+                continue
+
+            if line is None:
+                output_finished = True
+            else:
+                output_tail.append(line)
+                if line and on_output:
+                    on_output(line)
+
+        returncode = proc.wait()
+        if _cancel_requested(should_cancel):
+            raise PluginLoadCancelled("Plugin dependency process cancelled")
+        return subprocess.CompletedProcess(cmd, returncode, "\n".join(output_tail), "")
+    except BaseException:
+        if proc.poll() is None:
+            _terminate_process_tree(proc)
+        raise
+    finally:
+        reader.join(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+        if proc.stdout is not None:
+            proc.stdout.close()
 
 
 @dataclass(frozen=True)
@@ -108,7 +322,7 @@ def write_plugin_source_metadata(plugin_dir: Path, info: PluginSourceInfo) -> No
     """Persist install-source metadata next to an installed plugin."""
     path = plugin_source_metadata_path(plugin_dir)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(info.to_dict(), f, indent=2)
+        json.dump(info.to_dict(), f, indent=2, ensure_ascii=False)
 
 
 def is_git_available() -> bool:
@@ -123,6 +337,8 @@ def github_repo_url(owner: str, repo: str) -> str:
 
 def github_archive_url(owner: str, repo: str, ref: Optional[str] = None) -> str:
     """Return the GitHub API tarball URL for a repo/ref."""
+    from urllib.parse import quote
+
     base = f"{GITHUB_API_URL}/{owner}/{repo}/tarball"
     if ref:
         return f"{base}/{quote(ref, safe='')}"
@@ -134,25 +350,42 @@ def _download_url_to_temp(
     *,
     on_progress: Optional[Callable[[str], None]] = None,
     headers: Optional[dict] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Path:
     """Download a URL to a temporary file and return its path."""
+    import urllib.request
+
     req_headers = {"User-Agent": HTTP_USER_AGENT}
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, headers=req_headers)
 
     if on_progress:
-        on_progress(f"Downloading {url}...")
+        on_progress(_localized_progress("plugin_marketplace.progress.download_url", "Downloading {url}...", url=url))
 
-    with urlopen(req, timeout=60) as resp:
-        with tempfile.NamedTemporaryFile(suffix=".archive", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            try:
-                shutil.copyfileobj(resp, tmp)
-            except Exception:
-                tmp_path.unlink(missing_ok=True)
-                raise
-            return tmp_path
+    tmp_path: Optional[Path] = None
+    try:
+        if _cancel_requested(should_cancel):
+            raise PluginLoadCancelled("Plugin installation cancelled before download")
+        with urlopen(req, timeout=60) as resp:
+            with tempfile.NamedTemporaryFile(suffix=".archive", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+
+                class _CancellableResponse:
+                    def read(self, size=-1):
+                        if _cancel_requested(should_cancel):
+                            raise PluginLoadCancelled("Plugin installation cancelled during download")
+                        try:
+                            return resp.read(size)
+                        except TypeError:
+                            return resp.read()
+
+                shutil.copyfileobj(_CancellableResponse(), tmp, length=1024 * 1024)
+        return tmp_path
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _sanitize_archive_path(name: str) -> Optional[Path]:
@@ -179,8 +412,12 @@ def _strip_common_prefix(paths: list[Path]) -> Optional[str]:
     return None
 
 
-def _extract_zip_archive(src: Path, dest: Path) -> None:
-    with zipfile.ZipFile(src) as archive:
+def _extract_zip_archive(
+    src: Path | io.BytesIO,
+    dest: Path,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> None:
+    with zipfile.ZipFile(native_path(src)) as archive:
         members: list[tuple[zipfile.ZipInfo, Path]] = []
         for member in archive.infolist():
             rel_path = _sanitize_archive_path(member.filename)
@@ -190,6 +427,8 @@ def _extract_zip_archive(src: Path, dest: Path) -> None:
 
         prefix = _strip_common_prefix([path for _, path in members])
         for member, rel_path in members:
+            if _cancel_requested(should_cancel):
+                raise PluginLoadCancelled("Plugin installation cancelled during extraction")
             if prefix and rel_path.parts and rel_path.parts[0] == prefix:
                 rel_path = Path(*rel_path.parts[1:])
             if not rel_path.parts:
@@ -203,8 +442,16 @@ def _extract_zip_archive(src: Path, dest: Path) -> None:
                 shutil.copyfileobj(in_file, out_file)
 
 
-def _extract_tar_archive(src: Path, dest: Path) -> None:
-    with tarfile.open(src, "r:*") as archive:
+def _extract_tar_archive(
+    src: Path | io.BytesIO,
+    dest: Path,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> None:
+    if isinstance(src, io.BytesIO):
+        archive_file = tarfile.open(fileobj=src, mode="r:*")
+    else:
+        archive_file = tarfile.open(native_path(src), "r:*")
+    with archive_file as archive:
         members: list[tuple[tarfile.TarInfo, Path]] = []
         for member in archive.getmembers():
             rel_path = _sanitize_archive_path(member.name)
@@ -214,6 +461,8 @@ def _extract_tar_archive(src: Path, dest: Path) -> None:
 
         prefix = _strip_common_prefix([path for _, path in members])
         for member, rel_path in members:
+            if _cancel_requested(should_cancel):
+                raise PluginLoadCancelled("Plugin installation cancelled during extraction")
             if prefix and rel_path.parts and rel_path.parts[0] == prefix:
                 rel_path = Path(*rel_path.parts[1:])
             if not rel_path.parts:
@@ -234,15 +483,27 @@ def _extract_tar_archive(src: Path, dest: Path) -> None:
                 shutil.copyfileobj(extracted, out_file)
 
 
-def extract_archive(src: Path, dest: Path) -> None:
+def extract_archive(
+    src: Path | bytes,
+    dest: Path,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> None:
     """Extract a plugin archive into dest with path sanitization."""
-    if zipfile.is_zipfile(src):
-        _extract_zip_archive(src, dest)
+    if _cancel_requested(should_cancel):
+        raise PluginLoadCancelled("Plugin installation cancelled before extraction")
+    source = io.BytesIO(src) if isinstance(src, bytes) else src
+    if zipfile.is_zipfile(source):
+        if isinstance(source, io.BytesIO):
+            source.seek(0)
+        _extract_zip_archive(source, dest, should_cancel)
         return
-    if tarfile.is_tarfile(src):
-        _extract_tar_archive(src, dest)
+    try:
+        if isinstance(source, io.BytesIO):
+            source.seek(0)
+        _extract_tar_archive(source, dest, should_cancel)
         return
-    raise PluginError(f"Unsupported plugin archive format: {src}")
+    except tarfile.ReadError:
+        raise PluginError(f"Unsupported plugin archive format: {src}") from None
 
 
 def prepare_archive_from_download_url(
@@ -252,31 +513,42 @@ def prepare_archive_from_download_url(
     temp_prefix: str,
     on_progress: Optional[Callable[[str], None]] = None,
     request_headers: Optional[dict] = None,
-    archive_validator: Optional[Callable[[Path], None]] = None,
+    archive_validator: Optional[Callable[[bytes], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Path:
     """Download and extract an archive into a staging directory."""
-    archive_path = _download_url_to_temp(
-        download_url,
-        on_progress=on_progress,
-        headers=request_headers,
-    )
-    staging_dir = Path(tempfile.mkdtemp(prefix=temp_prefix, dir=staging_parent))
+    archive_path: Optional[Path] = None
+    staging_dir: Optional[Path] = None
     try:
+        archive_path = _download_url_to_temp(
+            download_url,
+            on_progress=on_progress,
+            headers=request_headers,
+            should_cancel=should_cancel,
+        )
+        if _cancel_requested(should_cancel):
+            raise PluginLoadCancelled("Plugin installation cancelled before staging")
+        staging_dir = Path(tempfile.mkdtemp(prefix=temp_prefix, dir=native_path(staging_parent)))
+        archive = archive_path.read_bytes()
         if archive_validator is not None:
-            archive_validator(archive_path)
-        extract_archive(archive_path, staging_dir)
+            archive_validator(archive)
+        extract_archive(archive, staging_dir, should_cancel)
         return staging_dir
-    except Exception:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+    except BaseException:
+        if staging_dir is not None:
+            shutil.rmtree(native_path(staging_dir, force_extended=True), ignore_errors=True)
         raise
     finally:
-        archive_path.unlink(missing_ok=True)
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
 
 
 def prepare_github_archive(
     url: str,
     staging_parent: Path,
     on_progress: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    archive_validator: Optional[Callable[[bytes], None]] = None,
 ) -> tuple[Path, PluginSourceInfo]:
     """Download a GitHub repository archive into a staging directory."""
     owner, repo, ref = parse_github_url(url)
@@ -284,13 +556,21 @@ def prepare_github_archive(
 
     if on_progress:
         ref_text = f"@{ref}" if ref else ""
-        on_progress(f"Downloading {owner}/{repo}{ref_text} archive...")
+        on_progress(_localized_progress(
+            "plugin_marketplace.progress.download_archive",
+            "Downloading {owner}/{repo}{ref} archive...",
+            owner=owner,
+            repo=repo,
+            ref=ref_text,
+        ))
 
     staging_dir = prepare_archive_from_download_url(
         archive_url,
         staging_parent,
         temp_prefix=f".{repo}-",
         request_headers={"Accept": "application/vnd.github+json"},
+        archive_validator=archive_validator,
+        should_cancel=should_cancel,
     )
     return staging_dir, PluginSourceInfo(
         transport="archive",
@@ -440,6 +720,8 @@ class PluginInstaller:
             normalize_str(bundled_python.parent.parent),
         }
 
+        config_matches = False
+        home_matches = False
         for line in cfg.splitlines():
             if "=" not in line:
                 continue
@@ -452,30 +734,158 @@ class PluginInstaller:
                 continue
             candidate_path = os.path.normcase(str(self._normalize_path(Path(candidate))))
             if candidate_path in expected:
-                return True
-        return False
+                config_matches = True
+                if key == "home":
+                    home_matches = True
+        if _is_windows():
+            return home_matches
+        if not config_matches:
+            return False
 
-    def ensure_venv(self) -> bool:
+        venv_python = venv_path / "bin" / "python"
+        if venv_python.is_symlink():
+            return normalize_str(venv_python) == normalize_str(bundled_python)
+        return True
+
+    @staticmethod
+    def _current_python_version() -> tuple[int, int]:
+        if platform.python_implementation() != "CPython":
+            raise RuntimeError("plugin venv repair requires CPython")
+        return sys.version_info.major, sys.version_info.minor
+
+    @staticmethod
+    def _venv_python_version(venv_path: Path) -> tuple[int, int]:
+        cfg_path = venv_path / "pyvenv.cfg"
+        cfg = cfg_path.read_text(encoding="utf-8")
+        versions: dict[str, str] = {}
+        for line in cfg.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().lower()
+            if key in {"version_info", "version"}:
+                versions[key] = value.strip()
+
+        version = versions.get("version_info", versions.get("version"))
+        if version is None:
+            raise ValueError("pyvenv.cfg has no version_info or version")
+
+        parts = version.split(".")
+        if len(parts) < 2:
+            raise ValueError(f"invalid pyvenv.cfg version: {version}")
+        try:
+            major_minor = int(parts[0]), int(parts[1])
+        except ValueError as exc:
+            raise ValueError(f"invalid pyvenv.cfg version: {version}") from exc
+        if major_minor[0] < 0 or major_minor[1] < 0:
+            raise ValueError(f"invalid pyvenv.cfg version: {version}")
+        return major_minor
+
+    def _repair_venv_interpreter(self, venv_path: Path, bundled_python: Path) -> None:
+        current_version = self._current_python_version()
+        venv_version = self._venv_python_version(venv_path)
+        if venv_version != current_version:
+            raise RuntimeError(
+                f"plugin venv Python {venv_version[0]}.{venv_version[1]} is incompatible with "
+                f"CPython {current_version[0]}.{current_version[1]}"
+            )
+
+        cfg_path = venv_path / "pyvenv.cfg"
+        cfg = cfg_path.read_text(encoding="utf-8")
+        bundled_python = self._normalize_path(bundled_python)
+        new_home = bundled_python.parent
+        old_home: Optional[str] = None
+        found_home = False
+        rewritten: list[str] = []
+        for line in cfg.splitlines():
+            if "=" not in line:
+                rewritten.append(line)
+                continue
+            key_text, value = line.split("=", 1)
+            key = key_text.strip().lower()
+            if key == "home":
+                if old_home is None:
+                    old_home = value.strip()
+                found_home = True
+                rewritten.append(f"{key_text.rstrip()} = {new_home}")
+            elif key in {"executable", "base-executable"}:
+                rewritten.append(f"{key_text.rstrip()} = {bundled_python}")
+            else:
+                rewritten.append(line)
+        if not found_home:
+            rewritten.append(f"home = {new_home}")
+
+        if not _is_windows():
+            bin_path = venv_path / "bin"
+            names = ("python", "python3", f"python{current_version[0]}.{current_version[1]}")
+            links = [bin_path / name for name in names if os.path.lexists(native_path(bin_path / name))]
+            if not links:
+                bin_path.mkdir(parents=True, exist_ok=True)
+                links = [bin_path / name for name in names]
+            for link in links:
+                if os.path.lexists(native_path(link)) and not link.is_symlink():
+                    raise RuntimeError(f"plugin venv interpreter is not a symlink: {link}")
+            for link in links:
+                if link.is_symlink():
+                    link.unlink()
+                link.symlink_to(bundled_python)
+
+        trailing_newline = "\n" if cfg.endswith("\n") else ""
+        cfg_path.write_text("\n".join(rewritten) + trailing_newline, encoding="utf-8")
+
+        if not self._get_venv_python().exists():
+            raise RuntimeError("repaired plugin venv has no Python interpreter")
+        if not self._venv_uses_bundled_python(venv_path, bundled_python):
+            raise RuntimeError("repaired plugin venv does not use bundled Python")
+
+        logger.info(
+            "Repaired plugin venv interpreter: %s -> %s",
+            old_home or "<missing>",
+            new_home,
+        )
+
+    def ensure_venv(
+        self,
+        on_progress: Optional[Callable[[str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         """Create plugin-specific venv using uv if needed."""
+        if _cancel_requested(should_cancel):
+            raise PluginLoadCancelled("Plugin loading cancelled before environment setup")
+
         venv_path = self.plugin.info.path / ".venv"
         self.plugin.venv_path = venv_path
         bundled_python = self._require_bundled_python()
 
         venv_python = self._get_venv_python()
-        if venv_python.exists():
-            if not self._venv_uses_bundled_python(venv_path, bundled_python):
+        venv_python_exists = venv_python.exists()
+        if venv_path.exists():
+            if venv_python_exists and self._venv_uses_bundled_python(
+                venv_path, bundled_python
+            ):
+                logger.info("Plugin venv ready: %s", venv_python)
+                return True
+
+            if _cancel_requested(should_cancel):
+                raise PluginLoadCancelled("Plugin loading cancelled before environment repair")
+
+            try:
+                if self._venv_python_version(venv_path) == self._current_python_version():
+                    self._repair_venv_interpreter(venv_path, bundled_python)
+                    logger.info("Plugin venv ready: %s", self._get_venv_python())
+                    return True
+            except Exception as exc:
+                logger.warning("Failed to repair plugin venv interpreter at %s: %s", venv_path, exc)
+
+            if venv_python_exists:
                 logger.warning(
                     "Existing plugin venv was not created from bundled Python, recreating: %s",
                     venv_path,
                 )
-                shutil.rmtree(venv_path, ignore_errors=True)
+                shutil.rmtree(native_path(venv_path, force_extended=True), ignore_errors=True)
             else:
-                logger.info("Plugin venv ready: %s", venv_python)
-                return True
-
-        if venv_path.exists():
-            logger.warning("Broken venv (missing python), removing: %s", venv_path)
-            shutil.rmtree(venv_path)
+                logger.warning("Broken venv (missing python), removing: %s", venv_path)
+                shutil.rmtree(native_path(venv_path, force_extended=True))
 
         uv = self._find_uv()
         if not uv:
@@ -495,21 +905,26 @@ class PluginInstaller:
                 "--no-python-downloads",
             ]
             logger.info("Creating venv (%s): %s", label, " ".join(cmd))
+            if on_progress:
+                on_progress(_localized_progress(
+                    "plugin_marketplace.progress.create_environment",
+                    "Creating plugin environment ({label})...",
+                    label=label,
+                ))
 
-            result = subprocess.run(
+            result = _run_cancellable_process(
                 cmd,
-                capture_output=True,
-                text=True,
                 env=env,
+                on_output=on_progress,
+                should_cancel=should_cancel,
             )
 
             if result.returncode == 0:
                 logger.info("Plugin venv created (%s): %s", label, venv_path)
                 return True
 
-            stderr = (result.stderr or "").strip()
             stdout = (result.stdout or "").strip()
-            detail = stderr or stdout or "no error output"
+            detail = stdout or "no error output"
             logger.warning("uv venv failed using %s (exit %d): %s", label, result.returncode, detail)
             failures.append(f"[{label}] {detail}")
 
@@ -545,9 +960,14 @@ class PluginInstaller:
         return True
 
     def install_dependencies(
-        self, on_progress: Optional[Callable[[str], None]] = None
+        self,
+        on_progress: Optional[Callable[[str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """Install plugin dependencies via uv sync."""
+        if _cancel_requested(should_cancel):
+            raise PluginLoadCancelled("Plugin loading cancelled before dependency installation")
+
         self._require_bundled_python()
 
         plugin_path = self.plugin.info.path
@@ -581,29 +1001,24 @@ class PluginInstaller:
         logger.info("uv sync command: %s", " ".join(cmd))
 
         if on_progress:
-            on_progress("Syncing dependencies with uv...")
+            on_progress(_localized_progress(
+                "plugin_marketplace.progress.sync_dependencies",
+                "Syncing dependencies with uv...",
+            ))
 
-        output_lines = []
-        with subprocess.Popen(
+        result = _run_cancellable_process(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
             env=self._uv_env(set_pythonhome=False),
-        ) as proc:
-            if proc.stdout is not None:
-                for line in iter(proc.stdout.readline, ""):
-                    line = line.rstrip()
-                    if line and on_progress:
-                        on_progress(line)
-                    output_lines.append(line)
-            proc.wait()
+            on_output=on_progress,
+            should_cancel=should_cancel,
+        )
 
-        if proc.returncode != 0:
-            tail = "\n".join(output_lines[-10:])
+        if result.returncode != 0:
+            tail = "\n".join((result.stdout or "").splitlines()[-10:])
             raise PluginDependencyError(f"uv sync failed:\n{tail}")
 
+        if _cancel_requested(should_cancel):
+            raise PluginLoadCancelled("Plugin loading cancelled after dependency installation")
         self._deps_stamp_path().touch()
         logger.info("Dependencies installed for %s", self.plugin.info.name)
         return True
@@ -625,14 +1040,9 @@ class PluginInstaller:
         assert self.plugin.venv_path is not None
         venv = self.plugin.venv_path
 
-        # Linux/macOS
-        python = venv / "bin" / "python"
-        if python.exists():
-            return python
-
-        # Windows
-        python = venv / "Scripts" / "python.exe"
-        return python
+        if _is_windows():
+            return venv / "Scripts" / "python.exe"
+        return venv / "bin" / "python"
 
 
 def parse_github_url(url: str) -> Tuple[str, str, Optional[str]]:
@@ -646,6 +1056,8 @@ def parse_github_url(url: str) -> Tuple[str, str, Optional[str]]:
         - github:owner/repo@branch
         - owner/repo (assumes GitHub)
     """
+    from urllib.parse import urlparse
+
     url = url.strip()
     branch = None
 
@@ -711,6 +1123,7 @@ def clone_from_url(
     url: str,
     plugins_dir: Path,
     on_progress: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Path:
     """Clone a plugin from GitHub URL.
 
@@ -725,57 +1138,64 @@ def clone_from_url(
     owner, repo, branch = parse_github_url(url)
     clone_url = f"https://github.com/{owner}/{repo}.git"
 
-    plugin_name = normalize_repo_name(repo)
-
+    if _cancel_requested(should_cancel):
+        raise PluginLoadCancelled("Plugin installation cancelled before git clone")
     plugins_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir = Path(tempfile.mkdtemp(prefix=f".{repo}-", dir=plugins_dir))
+    temp_dir = Path(tempfile.mkdtemp(prefix=f".{repo}-", dir=native_path(plugins_dir)))
+    keep_staging = False
+    try:
+        if on_progress:
+            on_progress(_localized_progress(
+                "plugin_marketplace.progress.cloning",
+                "Cloning {owner}/{repo}...",
+                owner=owner,
+                repo=repo,
+            ))
 
-    if on_progress:
-        on_progress(f"Cloning {owner}/{repo}...")
+        git = shutil.which("git")
+        if not git:
+            raise PluginError("git not found in PATH")
 
-    # Check if git is available
-    git = shutil.which("git")
-    if not git:
-        raise PluginError("git not found in PATH")
+        cmd = [git, "clone"]
+        if branch:
+            cmd.extend(["--branch", branch])
+        cmd.extend([clone_url, str(temp_dir)])
 
-    cmd = [git, "clone"]
-    if branch:
-        cmd.extend(["--branch", branch])
-    cmd.extend([clone_url, str(temp_dir)])
+        result = _run_cancellable_process(
+            cmd,
+            on_output=on_progress,
+            should_cancel=should_cancel,
+        )
+        if result.returncode != 0:
+            raise PluginError(f"Failed to clone repository: {result.stdout or 'no error output'}")
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+        manifest_path = temp_dir / "pyproject.toml"
+        if not manifest_path.exists():
+            raise PluginError("Repository is not a valid plugin (missing pyproject.toml)")
 
-    if result.returncode != 0:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise PluginError(f"Failed to clone repository: {result.stderr}")
+        with open(manifest_path, "rb") as f:
+            data = tomllib.load(f)
+        lf_section = data.get("tool", {}).get("lichtfeld", {})
+        if not lf_section:
+            raise PluginError("Repository is not a valid plugin (missing [tool.lichtfeld])")
+        manifest_name = str(data.get("project", {}).get("name", "")).strip()
+        if not manifest_name:
+            raise PluginError("Repository is not a valid plugin (missing project.name)")
+        target_dir = plugins_dir / manifest_name
+        if target_dir.exists():
+            raise PluginError(f"Plugin directory already exists: {target_dir}")
 
-    # Verify it's a valid plugin
-    manifest_path = temp_dir / "pyproject.toml"
-    if not manifest_path.exists():
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise PluginError(f"Repository is not a valid plugin (missing pyproject.toml)")
-
-    with open(manifest_path, "rb") as f:
-        data = tomllib.load(f)
-    lf_section = data.get("tool", {}).get("lichtfeld", {})
-    if not lf_section:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise PluginError("Repository is not a valid plugin (missing [tool.lichtfeld])")
-    manifest_name = str(data.get("project", {}).get("name", "")).strip()
-    final_name = manifest_name or plugin_name
-    target_dir = plugins_dir / final_name
-
-    if target_dir.exists():
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise PluginError(f"Plugin directory already exists: {target_dir}")
-
-    if temp_dir != target_dir:
-        temp_dir.replace(target_dir)
-
-    if on_progress:
-        on_progress(f"Cloned {final_name}")
-
-    return target_dir
+        if on_progress:
+            on_progress(_localized_progress(
+                "plugin_marketplace.progress.cloned",
+                "Cloned {name}",
+                name=manifest_name,
+            ))
+        keep_staging = True
+        return temp_dir
+    finally:
+        if not keep_staging:
+            shutil.rmtree(native_path(temp_dir, force_extended=True), ignore_errors=True)
 
 
 def update_plugin(
@@ -800,10 +1220,15 @@ def update_plugin(
         raise PluginError("git not found in PATH")
 
     if on_progress:
-        on_progress(f"Updating {plugin_dir.name}...")
+        on_progress(_localized_progress(
+            "plugin_marketplace.progress.updating",
+            "Updating {name}...",
+            name=plugin_dir.name,
+        ))
 
     result = subprocess.run(
         [git, "pull", "--ff-only"],
+        **executable_kwargs([git]),
         cwd=plugin_dir,
         capture_output=True,
         text=True,
@@ -813,7 +1238,11 @@ def update_plugin(
         raise PluginError(f"Failed to update plugin: {result.stderr}")
 
     if on_progress:
-        on_progress(f"Updated {plugin_dir.name}")
+        on_progress(_localized_progress(
+            "plugin_marketplace.progress.updated",
+            "Updated {name}",
+            name=plugin_dir.name,
+        ))
 
     return True
 
@@ -833,7 +1262,7 @@ def uninstall_plugin(plugin_dir: Path) -> bool:
     def _on_remove_error(func, path, exc):
         # Git marks object/pack files read-only; make writable and retry.
         if isinstance(exc, PermissionError):
-            os.chmod(path, stat.S_IWRITE)
+            os.chmod(native_path(path), stat.S_IWRITE)
             func(path)
             return
         raise exc
@@ -842,7 +1271,7 @@ def uninstall_plugin(plugin_dir: Path) -> bool:
     last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
-            shutil.rmtree(plugin_dir, onexc=_on_remove_error)
+            shutil.rmtree(native_path(plugin_dir, force_extended=True), onexc=_on_remove_error)
             return True
         except PermissionError as e:
             last_error = e

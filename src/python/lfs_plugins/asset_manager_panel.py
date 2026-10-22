@@ -1,3594 +1,5174 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Asset Manager panel for browsing and managing Gaussian Splatting assets."""
+"""Asset Manager panel for browsing UUID-identified .licht projects."""
 
+from __future__ import annotations
+
+import hashlib
+import json
 import logging
 import math
 import os
-import shutil
-import tempfile
+import subprocess
+import threading
 import time
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Any
+import uuid
+import queue
+from datetime import datetime
+from _lfs_path_io import Path
+from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import quote
 
 import lichtfeld as lf
 
+from .asset_gallery_ui import GalleryAssetMixin, GALLERY_SCOPES, SCOPE_PUBLISHED, SCOPE_ATTENTION
 from . import rml_widgets
-from .asset_manager_integration import (
-    clear_active_asset_manager_panel,
-    ensure_dataset_catalog_context,
-    set_active_asset_manager_panel,
+from .asset_layout import (
+    INSPECTOR_COLUMN_MIN,
+    breakpoint_metrics,
+    breakpoint_for_width,
+    card_geometry,
+    gallery_columns,
+    gallery_slot_width,
+    grid_columns,
+    grid_slot_width,
+    native_to_dp,
+    list_columns,
+    list_column_widths,
 )
-from .import_panels import open_url_import_panel, open_watch_dirs_dialog
+from .asset_format import format_size
+from .project_inspector import (
+    InspectionFactsPipeline,
+    dialog_model,
+    contents_rows,
+    pending_removals,
+    license_name,
+    license_value,
+    details_rows,
+    operation_actions,
+    thumbnail_source_options,
+)
+from .project_dialog import form_content
+from .project_thumbnail import active_project_path, has_renderable_project_viewport, is_active_project_path
+from .project_manager_preferences import (
+    read_preferences as read_project_manager_preferences,
+    read_state as read_project_manager_state,
+    set_state as set_project_manager_state,
+)
+from .asset_watch import (
+    AssetFolderScanProgress,
+    scan_all_asset_folders,
+    scan_asset_folder,
+    verify_catalog_projects,
+)
+from .localization import localized_count
+from .rml_keys import KI_DELETE, KI_DOWN, KI_ESCAPE, KI_LEFT, KI_RETURN, KI_RIGHT, KI_SPACE, KI_UP
 from .types import Panel
+from .panels import panel_class
 from .ui import RuntimeState
 
-_logger = logging.getLogger(__name__)
+_log = logging.getLogger(__name__)
 
 PRECISE_SCROLL_STEP = 32.0
-RML_PATH_SAFE_CHARS = "/:._-~"
+ASSET_LIST_ROW_HEIGHT_DP = 40.0
+ASSET_GALLERY_ROW_HEIGHT_DP = 230.0
+ASSET_CARD_PREFERRED_WIDTH_DP = 208.0
+# Match the inspector gutters in asset_manager.rcss.
+ASSET_INSPECTOR_GUTTER_DP = 12.0
+ASSET_INSPECTOR_SCROLLBAR_DP = 4.0
+ASSET_STACKED_THUMBNAIL_MAX_WIDTH_DP = 240.0
+ASSET_INFO_THUMBNAIL_DEFAULT_WIDTH_DP = 160.0
+ASSET_WINDOW_OVERSCAN_ROWS = 1
+ASSET_WINDOW_BATCH_ROWS = 1
+ASSET_LIST_FALLBACK_ROWS = 24
+ASSET_GALLERY_FALLBACK_ROWS = 8
+_RML_PATH_SAFE_CHARS = "/:._-~"
+_THUMBNAIL_FIT_ALIGN = "cover center"
+_SELECTION_UNCHANGED = object()
+SCOPE_ALL = "__all__"
+SCOPE_LOCAL = "__local__"
+SCOPE_RECENT = "__recent__"
+PROJECT_DRAG_PAYLOAD_TYPE = "application/x-lichtfeld-project"
+_folder_scan_completed_in_process = False
 
-# Import backend components (to be implemented)
+
+def _move_to_trash(path: str, *, platform: str = os.name, shell32=None) -> None:
+    """Move one project to the platform recycle bin without deleting it."""
+    if platform != "nt":
+        subprocess.run(["gio", "trash", path], check=True, capture_output=True)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", wintypes.WORD),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    FO_DELETE = 0x0003
+    FOF_SILENT = 0x0004
+    FOF_ALLOWUNDO = 0x0040
+    FOF_NOERRORUI = 0x0400
+    FOF_WANTNUKEWARNING = 0x4000
+
+    operation = SHFILEOPSTRUCTW()
+    operation.wFunc = FO_DELETE
+    operation.pFrom = str(Path(path).resolve()) + "\0\0"
+    # Keep the Shell's permanent-delete confirmation. If this path cannot be
+    # recycled, Windows must let the user cancel instead of deleting silently.
+    operation.fFlags = FOF_SILENT | FOF_ALLOWUNDO | FOF_NOERRORUI | FOF_WANTNUKEWARNING
+    shell32 = shell32 or ctypes.windll.shell32
+    result = shell32.SHFileOperationW(ctypes.byref(operation))
+    if result or operation.fAnyOperationsAborted:
+        raise OSError(result or 1, "The project was not moved to the Recycle Bin", path)
+
 try:
     from .asset_index import (
         AssetIndex,
-        Project,
-        Scene,
-        Asset,
+        display_name,
+        fix_action_for_health,
+        is_supported_asset_path,
+        resolve_default_asset_directory,
         resolve_asset_manager_storage_path,
+        read_catalog_preview,
     )
-    from .asset_scanner import AssetScanner
-    from .asset_thumbnails import AssetThumbnails
+    from .asset_index import LibraryService
 
     BACKEND_AVAILABLE = True
 except ImportError:
-    BACKEND_AVAILABLE = False
     AssetIndex = None
-    AssetScanner = None
-    AssetThumbnails = None
+    LibraryService = None
+    BACKEND_AVAILABLE = False
 
-def tr(key, **kwargs):
-    tr_func = getattr(getattr(lf, "ui", None), "tr", None)
+
+def tr(key: str, **kwargs: Any) -> str:
+    translate = getattr(getattr(lf, "ui", None), "tr", None)
     try:
-        result = tr_func(key) if callable(tr_func) else key
+        result = translate(key) if callable(translate) else key
     except Exception:
         result = key
     if kwargs:
-        try:
-            return result.format(**kwargs)
-        except Exception:
-            return result
+        from .localization import safe_format
+        return safe_format(result, **kwargs)
     return result
 
 
-def _encode_rml_image_path(path: str) -> str:
-    return quote(path, safe=RML_PATH_SAFE_CHARS)
+def _load_locale_measure_texts(directory: Path) -> tuple[list[str], list[str]]:
+    """Collect locale labels on a worker before any UI text measurement."""
+    gallery: list[str] = []
+    labels: list[str] = []
+
+    def visit(value: Any, prefix: str = "") -> None:
+        if not isinstance(value, dict):
+            return
+        for name, entry in value.items():
+            key = prefix + name
+            if isinstance(entry, dict):
+                visit(entry, key + ".")
+            elif isinstance(entry, str):
+                if key.startswith("projects.gallery.state.") and "{" not in entry.replace("{percent}", ""):
+                    gallery.append(entry.format(percent=100))
+                elif key.startswith("projects.property."):
+                    labels.append(entry)
+
+    for locale_file in sorted(directory.glob("*.json")):
+        visit(json.loads(locale_file.read_text(encoding="utf-8")))
+    return gallery, labels
+
 
 __lfs_panel_classes__ = ["AssetManagerPanel"]
 __lfs_panel_ids__ = ["lfs.asset_manager"]
 
 
-class AssetManagerPanel(Panel):
-    """Floating Asset Manager window for browsing splats and exports."""
+@panel_class("asset_manager")
+class AssetManagerPanel(GalleryAssetMixin, Panel):
+    """Dockable `.licht` project catalog."""
 
-    SORT_MODES = ("name", "size", "type")
-    LOADABLE_TYPES = {"ply_3dgs", "ply_pcl", "rad", "sog", "spz", "checkpoint", "dataset", "mesh", "usd"}
-
-    id = "lfs.asset_manager"
-    label = "Asset Manager"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 20
-    template = "rmlui/asset_manager.rml"
-    height_mode = lf.ui.PanelHeightMode.FILL
-    size = (980, 620)
-    update_policy = "dirty"
-
-    # Storage path for asset manager data
-    STORAGE_PATH = resolve_asset_manager_storage_path()
-
-    @staticmethod
-    def _dedupe_paths(paths: List[Path]) -> List[Path]:
-        seen: Set[str] = set()
-        result: List[Path] = []
-        for path in paths:
-            try:
-                key = str(path.expanduser().resolve())
-            except Exception:
-                key = str(path.expanduser())
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(path.expanduser())
-        return result
-
-    @classmethod
-    def _storage_candidates(cls) -> List[Path]:
-        candidates: List[Path] = []
-
-        for env_name in (
-            "LICHTFELD_ASSET_MANAGER_DIR",
-            "LFS_ASSET_MANAGER_DIR",
-        ):
-            env_value = os.environ.get(env_name, "").strip()
-            if env_value:
-                candidates.append(Path(env_value))
-
-        candidates.append(resolve_asset_manager_storage_path())
-
-        xdg_data_home = os.environ.get("XDG_DATA_HOME", "").strip()
-        if xdg_data_home:
-            candidates.append(Path(xdg_data_home) / "LichtFeldStudio" / "asset_manager")
-
-        appdata = os.environ.get("APPDATA", "").strip()
-        if appdata:
-            candidates.append(Path(appdata) / "LichtFeldStudio" / "asset_manager")
-
-        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_appdata:
-            candidates.append(Path(local_appdata) / "LichtFeldStudio" / "asset_manager")
-
-        home = Path.home()
-        candidates.append(home / ".local" / "share" / "LichtFeldStudio" / "asset_manager")
-
-        # Last resort keeps the panel usable in packaged environments where HOME
-        # resolves inside a read-only mount. It is less durable, so only use it
-        # when every platform data directory rejects writes.
-        candidates.append(Path(tempfile.gettempdir()) / "LichtFeldStudio" / "asset_manager")
-
-        return cls._dedupe_paths(candidates)
-
-    @staticmethod
-    def _path_accepts_writes(path: Path) -> bool:
-        probe_path: Optional[Path] = None
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                prefix=".lfs-write-test-",
-                dir=path,
-                delete=False,
-            ) as probe:
-                probe.write(b"ok")
-                probe_path = Path(probe.name)
-            probe_path.unlink(missing_ok=True)
-            return True
-        except OSError as exc:
-            _logger.debug("Asset Manager storage path is not writable: %s (%s)", path, exc)
-            if probe_path is not None:
-                try:
-                    probe_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            return False
-        except Exception as exc:
-            _logger.debug("Asset Manager storage path probe failed: %s (%s)", path, exc)
-            return False
-
-    @classmethod
-    def _resolve_writable_storage_path(cls) -> Path:
-        for candidate in cls._storage_candidates():
-            if cls._path_accepts_writes(candidate):
-                return candidate
-
-        # Let backend initialization report the concrete failure if even /tmp is
-        # unavailable.
-        return resolve_asset_manager_storage_path()
-
-    @staticmethod
-    def _copy_existing_catalog(source_dir: Path, target_dir: Path) -> None:
-        if source_dir == target_dir:
-            return
-
-        source_library = source_dir / "library.json"
-        target_library = target_dir / "library.json"
-        try:
-            if source_library.exists() and not target_library.exists():
-                target_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_library, target_library)
-                _logger.info(
-                    "Copied Asset Manager catalog from %s to writable storage %s",
-                    source_library,
-                    target_library,
-                )
-        except Exception as exc:
-            _logger.warning(
-                "Failed to copy Asset Manager catalog from %s to %s: %s",
-                source_library,
-                target_library,
-                exc,
-            )
-
-        source_thumbnails = source_dir / "thumbnails"
-        target_thumbnails = target_dir / "thumbnails"
-        try:
-            if source_thumbnails.exists() and not target_thumbnails.exists():
-                shutil.copytree(source_thumbnails, target_thumbnails)
-        except Exception as exc:
-            _logger.debug(
-                "Failed to copy Asset Manager thumbnails from %s to %s: %s",
-                source_thumbnails,
-                target_thumbnails,
-                exc,
-            )
-
-    def _publish_storage_path(self) -> None:
-        """Keep dialog/import helpers on the same writable catalog path."""
-        storage_path = self.STORAGE_PATH
-
-        try:
-            from . import asset_manager_integration as integration
-
-            integration.resolve_asset_manager_storage_path = lambda: storage_path
-        except Exception as exc:
-            _logger.debug("Failed to publish Asset Manager storage path: %s", exc)
-
-        try:
-            from . import import_panels
-
-            import_panels.resolve_asset_manager_storage_path = lambda: storage_path
-            if hasattr(import_panels, "URLImportPanel"):
-                import_panels.URLImportPanel.STORAGE_PATH = storage_path
-        except Exception as exc:
-            _logger.debug("Failed to publish Asset Manager dialog storage path: %s", exc)
-
-    def _configure_storage_path(self) -> None:
-        requested_path = resolve_asset_manager_storage_path()
-        writable_path = self._resolve_writable_storage_path()
-        self.STORAGE_PATH = writable_path
-        self.__class__.STORAGE_PATH = writable_path
-
-        if writable_path != requested_path:
-            self._copy_existing_catalog(requested_path, writable_path)
-            _logger.warning(
-                "Asset Manager catalog path %s is not writable; using %s",
-                requested_path,
-                writable_path,
-            )
-
-        self._publish_storage_path()
+    SORT_MODES = ("name", "size", "iteration", "saved", "opened", "published", "gallery", "folder")
+    FILTERS = {"all", "local", "published", "not_published", "attention", "missing", "checkpoint", "dataset", "gallery"}
+    STORAGE_PATH: Optional[Path] = None
 
     def __init__(self):
+        super().__init__()
         self._handle = None
-
-        # Backend components
+        self._doc = None
         self._asset_index: Optional[Any] = None
-        self._asset_scanner: Optional[Any] = None
-        self._asset_thumbnails: Optional[Any] = None
+        self._library_service: Optional[Any] = None
+        self._catalog_snapshot_epoch: Optional[int] = None
+        self._catalog_snapshot: Optional[Dict[str, Any]] = None
+        self._catalog_snapshot_refresh_active = False
+        self._title_cache_lock = threading.Lock()
+        self._title_cache_pending: Dict[str, str] = {}
+        self._title_cache_timer: Optional[threading.Timer] = None
+        self._catalog_preview: Optional[Dict[str, Any]] = None
+        self._prefetched_catalog_preview: Optional[Dict[str, Any]] = None
+        self._filtered_cache_key: Optional[tuple] = None
+        self._filtered_cache_rows: List[Dict[str, Any]] = []
+        self._filtered_cache_scope_count = 0
+        self._row_catalog_generation = 0
+        self._row_inspection_generation = 0
+        self._row_folder_generation = 0
+        self._row_language_generation = 0
+        self._row_language = None
 
-        # UI state
         self._selected_asset_ids: Set[str] = set()
-        self._selected_project_id: Optional[str] = None
-        self._selected_scene_id: Optional[str] = None
-        self._active_filters: Set[str] = set()  # Multi-select: empty = show all
-        self._view_mode: str = "list"  # gallery, list
-        self._sort_mode: str = "type"  # name, size, type
-        self._search_query: str = ""
-        self._pending_tag_name: str = ""
+        self._selection_cursor_id: Optional[str] = None
+        self._selection_anchor_id: Optional[str] = None
+        self._selected_folder_id: Optional[str] = SCOPE_ALL
+        self._pending_folder_id: Optional[str] = None
+        self._selection_type = "none"
+        self._view_mode = "list"
+        self._sort_mode = "name"
+        self._sort_descending = False
+        self._search_query = ""
+        self._active_filter = "all"
 
-        # Track which asset has its dropdown menu open
-        self._open_menu_asset_id: Optional[str] = None
-        self._load_menu_asset_id: Optional[str] = None
+        self._bottom_panel_height = 220.0
+        self._info_preferred_height = 220.0
+        self._text_column_metrics = None
+        self._text_measure_key = None
+        self._text_locales = None
+        self._text_locales_loading = False
+        self._inspector_label_width = 168.0
+        self._inspector_width = INSPECTOR_COLUMN_MIN
+        self._inspector_preferred_height = 1000.0
+        self._inspector_expanded = False
+        self._quick_look_visible = False
+        self._thumbnail_menu_visible = False
+        self._thumbnail_size = 168.0
+        self._layout_class = ""
+        self._content_width = 0.0
+        self._host_geometry = None
+        self._layout_recheck_pending = False
+        self._last_ui_scale = 0.0
+        self._list_column_overrides: Dict[str, float] = {}
+        self._layout_signature = None
+        self._main_min_height = 0.0
+        self._bottom_panel_dragging = False
+        self._resize_region = ""
+        self._resize_start_x = 0.0
+        self._resize_start_y = 0.0
+        self._resize_scale = 1.0
+        self._resize_inspector_height_max = 1000.0
+        self._resize_last_height = self._inspector_preferred_height
+        self._bottom_panel_drag_start_y = 0.0
+        self._bottom_panel_start_height = self._bottom_panel_height
 
-        # Track which project has its dropdown menu open
-        self._open_menu_project_id: Optional[str] = None
+        self._asset_card_slot_width = ASSET_CARD_PREFERRED_WIDTH_DP
+        self._asset_window_scroll_top = 0.0
+        self._asset_window_client_height = 0.0
+        self._asset_window_client_width = 0.0
+        self._responsive_width_signature = None
+        self._asset_list_top_spacer_height = 0.0
+        self._asset_list_bottom_spacer_height = 0.0
+        self._asset_gallery_top_spacer_height = 0.0
+        self._asset_gallery_bottom_spacer_height = 0.0
+        self._asset_window_refresh_pending = False
+        self._folder_records_refresh_pending = False
+        self._asset_scroll_event_suppressed = False
+        self._asset_scroll_suppressed_top = -1.0
+        self._last_asset_match_count = 0
+        self._last_asset_scope_count = 0
 
-        # Selection type for info panel display
-        self._selection_type: str = "none"  # none, asset, scene, project, multiple
+        self._panel_space = lf.ui.PanelSpace.LEFT_DOCK
+        self._is_floating = False
+        self._reactive_unsubscribers: list[Callable[[], None]] = []
 
-        # Import menu state
-        self._import_menu_open: bool = False
+        self._folder_scan_lock = threading.Lock()
+        self._folder_scan_active = False
+        self._folder_scan_refresh_pending = False
+        self._folder_scan_rerun_pending = False
+        self._folder_scan_rerun_target: Optional[tuple[str, str, bool]] = None
+        self._folder_scan_cancel: Optional[threading.Event] = None
+        self._folder_scan_thread: Optional[threading.Thread] = None
+        self._catalog_verify_active = False
+        self._catalog_verify_refresh_pending = False
+        self._catalog_verify_cancel: Optional[threading.Event] = None
+        self._catalog_verify_thread: Optional[threading.Thread] = None
+        self._catalog_epoch_seen: Optional[int] = None
+        self._catalog_unsubscribe: Optional[Callable[[], None]] = None
+        self._recent_scope_cache_signature: Optional[tuple[Any, ...]] = None
+        self._recent_scope_cache_rows: List[Dict[str, Any]] = []
+        self._recent_scope_cache_only_by_id: Dict[str, Dict[str, Any]] = {}
+        self._worker_notification_lock = threading.Lock()
+        self._worker_notification_pending = False
+        self._scan_progress = AssetFolderScanProgress()
+        self._scan_stop_requested = False
+        self._scan_stopped_visible = False
+        self._published_scan_active = False
+        self._published_scan_status = ""
+        # Keep direct programmatic refreshes usable before the first DOM mount;
+        # on_unmount flips this false and mount generations guard callbacks.
+        self._panel_mounted = True
+        self._mount_generation = 0
+        self._open_request = 0
+        self._backend_load_active = False
+        self._catalog_load_failed = False
+        self._catalog_notice = ""
+        self._folder_scan_error = False
+        self._folder_scan_unavailable = False
+        self._drag_payload_token: Optional[int] = None
+        self._gallery_drag = None
+        self._gallery_drop_element = None
+        self._last_project_write_generation: Optional[int] = None
+        self._project_write_was_running = False
+        self._last_project_write_path = ""
+        self._thumbnail_sources_by_asset: Dict[str, str] = {}
+        self._info_thumbnail_source = ""
+        self._last_default_folder_path = ""
+        self._inspection_pipeline: Optional[InspectionFactsPipeline] = None
+        self._inspection_by_asset: Dict[str, Dict[str, Any]] = {}
+        self._inspection_errors: Dict[str, str] = {}
+        self._project_operations: Dict[str, Dict[str, Any]] = {}
+        self._contents_feedback: Dict[str, Dict[str, Any]] = {}
+        self._ui_callbacks = queue.SimpleQueue()
+        self._dialog_kind = ""
+        self._dialog_asset_id = ""
+        self._dialog_data: Dict[str, Any] = {}
+        self._dialog_busy = False
+        self._dialog_serial = 0
+        self._dialog_key = ""
+        self._operations_expanded = None
+        self._inspector_sections = {"project": True, "file": True, "gallery": True}
+        self._info_thumbnail_geometry = None
+        self._verify_results: Dict[str, str] = {}
+        self._observed_outer_panel_width = None
+        self._outer_panel_width_save_deadline = 0.0
+        self._remembered_left_dock_width: Optional[float] = None
+        self._init_gallery()
+        self._restore_project_manager_preferences()
+        self._start_catalog_preview_prefetch()
 
-        self._library_mtime: float = 0.0
-        self._updating_selection_details: bool = False
-        self._pending_transform_applications: List[Dict[str, Any]] = []
-        self._reactive_unsubscribers = []
-        self._last_scene_generation: Optional[int] = None
-        self._last_language_generation: Optional[int] = None
+    def _start_catalog_preview_prefetch(self) -> None:
+        # Panel instances are registered at startup, before their RML document
+        # is mounted. Read the saved catalog then so opening can draw its rows.
+        if not callable(getattr(lf.ui, "get_panel_object", None)):
+            return
 
-        # New project menu state
-        self._new_project_menu_open: bool = False
+        def worker() -> None:
+            try:
+                preview = read_catalog_preview(resolve_asset_manager_storage_path() / "library.json")
+            except Exception:
+                _log.exception("Projects catalog preview prefetch failed")
+                return
+            if not preview:
+                return
+            self._prefetched_catalog_preview = preview
 
-        # Collapse state for sidebar sections
-        self._projects_collapsed: bool = True
-        self._filters_collapsed: bool = True
+            def publish() -> None:
+                if self._asset_index is not None or self._catalog_preview is preview:
+                    return
+                self._catalog_preview = preview
+                self._row_catalog_generation += 1
+                if self._doc is not None and self._panel_mounted:
+                    self._repair_selection()
+                    self._refresh_records(assets=True, folders=True)
+                    if self._handle:
+                        self._handle.dirty_all()
 
-        # Panel resize drag state
-        self._sidebar_dragging: bool = False
-        self._sidebar_drag_start_x: float = 0.0
-        self._sidebar_start_width: float = 176.0
-        self._sidebar_width: float = 176.0
-        self._right_panel_dragging: bool = False
-        self._right_panel_drag_start_x: float = 0.0
-        self._right_panel_start_width: float = 300.0
-        self._right_panel_width: float = 300.0
+            self._schedule_ui(publish)
 
-    # ── Initialization ────────────────────────────────────────
+        threading.Thread(target=worker, daemon=True, name="AssetManagerPreview").start()
 
-    def _initialize_backend(self):
-        """Initialize backend components."""
-        if not BACKEND_AVAILABLE:
-            return False
+    def capture_chrome(self) -> Dict[str, Any]:
+        folder_id = self._selected_folder_id
+        if folder_id not in {*self._asset_index_folders(), SCOPE_ALL}:
+            folder_id = SCOPE_ALL
+        return {
+            "view_mode": self._view_mode,
+            "bottom_panel_height": self._info_preferred_height,
+            "inspector_width": self._inspector_width,
+            "inspector_height": self._inspector_preferred_height,
+            "inspector_height_version": 3,
+            "thumbnail_size": self._thumbnail_size,
+            "list_column_overrides": dict(self._list_column_overrides),
+            "inspector_sections": dict(self._inspector_sections),
+            "operations_expanded": self._operations_expanded,
+            "sort_mode": self._sort_mode,
+            "sort_descending": self._sort_descending,
+            "selected_folder_id": folder_id,
+            "active_filter": self._active_filter,
+        }
+
+    def apply_chrome(self, payload: Any) -> None:
+        preferences = read_project_manager_preferences()
+        remembered = {}
+        if preferences["rememberState"]:
+            remembered = read_project_manager_state()
+            if remembered:
+                payload = remembered
+        self._apply_chrome_payload(payload, preferences, device_state=bool(remembered))
+
+    def _apply_chrome_payload(
+        self,
+        payload: Any,
+        preferences: Optional[Dict[str, Any]] = None,
+        *,
+        device_state: bool = False,
+    ) -> None:
+        preferences = preferences or read_project_manager_preferences()
+        if isinstance(payload, dict):
+            if device_state:
+                panel_width = payload.get("panel_width")
+                if (
+                    isinstance(panel_width, (int, float))
+                    and not isinstance(panel_width, bool)
+                    and math.isfinite(panel_width)
+                    and panel_width > 0.0
+                ):
+                    self._remembered_left_dock_width = float(panel_width)
+                    self._restore_remembered_left_dock_width()
+            view_mode = payload.get("view_mode")
+            if preferences["defaultView"] == "remember" and view_mode in {"gallery", "list"}:
+                self._view_mode = view_mode
+            if payload.get("sort_mode") in self.SORT_MODES:
+                self._sort_mode = payload["sort_mode"]
+                self._sort_descending = bool(payload.get("sort_descending", self._sort_mode != "name"))
+            sections = payload.get("inspector_sections", {})
+            if isinstance(sections, dict):
+                for section in self._inspector_sections:
+                    if isinstance(sections.get(section), bool):
+                        self._inspector_sections[section] = sections[section]
+            if isinstance(payload.get("operations_expanded"), bool):
+                self._operations_expanded = payload["operations_expanded"]
+            value = payload.get("bottom_panel_height")
+            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+                self._info_preferred_height = min(500.0, max(180.0, float(value)))
+                self._inspector_preferred_height = self._info_preferred_height
+            for key, low, high, default in (
+                ("inspector_width", INSPECTOR_COLUMN_MIN, 420.0, INSPECTOR_COLUMN_MIN),
+                ("inspector_height", 180.0, 1000.0, 1000.0),
+            ):
+                number = payload.get(key)
+                attribute = "_inspector_preferred_height" if key == "inspector_height" else "_" + key
+                if isinstance(number, (int, float)) and math.isfinite(number):
+                    setattr(self, attribute, min(high, max(low, float(number))))
+                elif not hasattr(self, attribute):
+                    setattr(self, attribute, default)
+            if payload.get("inspector_height_version") != 3:
+                # Version 3 makes the stacked Inspector fill up to half of the
+                # panel. Do not retain the former fixed-height preference.
+                self._inspector_preferred_height = 1000.0
+            number = payload.get("thumbnail_size")
+            if not isinstance(number, (int, float)):
+                # Migrate the former per-breakpoint preference deterministically.
+                sizes = payload.get("thumbnail_sizes")
+                number = sizes.get("wide") if isinstance(sizes, dict) else None
+            if isinstance(number, (int, float)) and math.isfinite(number):
+                self._thumbnail_size = min(320.0, max(112.0, float(number)))
+            overrides = payload.get("list_column_overrides")
+            if isinstance(overrides, dict):
+                self._list_column_overrides = {
+                    name: min(280.0, max(64.0, float(value)))
+                    for name, value in overrides.items()
+                    if name in {"name", "gallery", "size", "modified", "folder"}
+                    and isinstance(value, (int, float)) and math.isfinite(value)
+                }
+            folder_id = payload.get("selected_folder_id")
+            if not isinstance(folder_id, str):
+                folder_id = SCOPE_ALL
+            legacy_filters = {
+                SCOPE_LOCAL: "local", SCOPE_PUBLISHED: "published",
+                SCOPE_ATTENTION: "attention",
+            }
+            active_filter = payload.get("active_filter", payload.get("filter", "all"))
+            if not isinstance(active_filter, str) or active_filter not in self.FILTERS:
+                active_filter = "all"
+            self._pending_folder_id = None
+            if folder_id in legacy_filters:
+                self._selected_folder_id = SCOPE_ALL
+                self._active_filter = legacy_filters[folder_id] if active_filter == "all" else active_filter
+            elif folder_id in {*self._asset_index_folders(), SCOPE_ALL}:
+                self._selected_folder_id = str(folder_id)
+                self._active_filter = active_filter
+            else:
+                self._selected_folder_id = SCOPE_ALL
+                self._active_filter = active_filter
+                self._pending_folder_id = folder_id if isinstance(folder_id, str) and not folder_id.startswith("__") else None
+            # Old sidebar heights are superseded by content/viewport sizing.
+            self._layout_signature = None
+            self._sync_panel_layout()
+        if preferences["defaultView"] in {"gallery", "list"}:
+            self._view_mode = preferences["defaultView"]
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _restore_project_manager_preferences(self) -> None:
+        self._remembered_left_dock_width = None
+        preferences = read_project_manager_preferences()
+        payload = read_project_manager_state() if preferences["rememberState"] else {}
+        self._apply_chrome_payload(payload, preferences, device_state=bool(payload))
+
+    def _restore_remembered_left_dock_width(self, panel_space=None) -> None:
+        width = self._remembered_left_dock_width
+        if width is None:
+            return
+        if panel_space is None:
+            get_panel = getattr(lf.ui, "get_panel", None)
+            try:
+                info = get_panel(self.id) if callable(get_panel) else None
+            except Exception:
+                info = None
+            if info is None:
+                return
+            panel_space = getattr(info, "space", None)
+        if panel_space != lf.ui.PanelSpace.LEFT_DOCK:
+            return
+        set_left_dock_width = getattr(lf.ui, "set_left_dock_width", None)
+        if not callable(set_left_dock_width):
+            return
+        set_left_dock_width(width)
+        self._remembered_left_dock_width = None
+
+    def reload_project_manager_preferences(self) -> None:
+        self._restore_project_manager_preferences()
+        self._reset_scroll()
+        self._refresh_records(assets=True)
+        self._dirty_fields("is_gallery_view", "is_list_view", "thumbnail_size")
+        self._dirty_layout_fields()
+        self._request_model_update()
+
+    def _persist_project_manager_state(self) -> None:
+        try:
+            if not read_project_manager_preferences()["rememberState"]:
+                return
+            # Merge with the previous device state so a temporarily unavailable
+            # native geometry query cannot erase the last valid outer width.
+            state = read_project_manager_state()
+            state.update(self.capture_chrome())
+            # Selection belongs to the current catalog, not to device chrome.
+            state.pop("selected_folder_id", None)
+            # Startup visibility is an explicit preference, not transient panel
+            # registry state observed during application shutdown.
+            state.pop("panel_open", None)
+            if self._panel_space == lf.ui.PanelSpace.LEFT_DOCK:
+                panel_width = self._observed_outer_panel_width
+                get_left_dock_width = getattr(lf.ui, "get_left_dock_width", None)
+                if callable(get_left_dock_width):
+                    current_width = float(get_left_dock_width())
+                    if math.isfinite(current_width) and current_width > 0.0:
+                        panel_width = current_width
+                if (isinstance(panel_width, (int, float))
+                        and math.isfinite(panel_width) and panel_width > 0.0):
+                    state["panel_width"] = float(panel_width)
+            set_project_manager_state(state)
+        except (OSError, TypeError, ValueError, AttributeError) as exc:
+            self._log_warn("Failed to save Project Manager preferences: %s", exc)
+
+    def _start_backend_initialization(self) -> None:
+        if self._backend_load_active or not BACKEND_AVAILABLE:
+            if not BACKEND_AVAILABLE:
+                self._catalog_load_failed = True
+            return
+        self._backend_load_active = True
+        generation = self._mount_generation
+
+        def worker() -> None:
+            index = None
+            service = None
+            storage_path = None
+            default_path = ""
+            loaded = False
+            recovered_operations = {}
+            backend_error = None
+            detached_snapshot = None
+            try:
+                storage_path = resolve_asset_manager_storage_path()
+                storage_path.mkdir(parents=True, exist_ok=True)
+                cached_preview = self._prefetched_catalog_preview or read_catalog_preview(
+                    storage_path / "library.json"
+                )
+                if cached_preview:
+                    def show_cached() -> None:
+                        if generation != self._mount_generation or not self._panel_mounted:
+                            return
+                        if self._asset_index is not None:
+                            return
+                        if self._catalog_preview is cached_preview:
+                            return
+                        self._catalog_preview = cached_preview
+                        self._row_catalog_generation += 1
+                        self._repair_selection()
+                        self._refresh_records(assets=True, folders=True)
+                        if self._handle:
+                            self._handle.dirty_all()
+
+                    self._schedule_ui(show_cached)
+                try:
+                    index = AssetIndex(
+                        library_path=storage_path / "library.json",
+                        default_folder_path=resolve_default_asset_directory(),
+                    )
+                except TypeError:
+                    index = AssetIndex()
+                service = LibraryService(index)
+                index = service.index
+                loaded = service._call("load")
+                if loaded and callable(getattr(index, "snapshot", None)):
+                    detached_snapshot = service.snapshot()
+                default_path = str(resolve_default_asset_directory())
+                from .project_operations import ProjectOperations
+                recovered_operations = ProjectOperations(lf.io).recover()
+            except Exception as exc:
+                backend_error = exc
+                self._log_error("Failed to initialize Projects path=%s: %s", storage_path, exc)
+
+            def complete() -> None:
+                if generation != self._mount_generation or not self._panel_mounted:
+                    self._backend_load_active = False
+                    if service is not None:
+                        try:
+                            service.close()
+                        except Exception:
+                            _log.exception("Close stale Projects catalog service failed path=%s", storage_path)
+                    if self._panel_mounted and self._asset_index is None:
+                        self._start_backend_initialization()
+                    return
+                self._backend_load_active = False
+                self._catalog_load_failed = not loaded
+                self._project_operations.update(recovered_operations)
+                if backend_error is not None:
+                    self._set_catalog_notice(str(backend_error))
+                if index is not None and service is not None:
+                    self._asset_index = index
+                    self._library_service = service
+                    self._catalog_preview = None
+                    self._catalog_snapshot = detached_snapshot
+                    self._catalog_snapshot_epoch = (
+                        detached_snapshot.get("epoch") if detached_snapshot else None
+                    )
+                    self._row_catalog_generation += 1
+                    self.STORAGE_PATH = storage_path
+                    self.__class__.STORAGE_PATH = storage_path
+                    self._last_default_folder_path = default_path
+                    self._invalidate_recent_scope_cache()
+                    self._catalog_epoch_seen = self._catalog_epoch()
+                    self._subscribe_catalog()
+                    if self._pending_folder_id and self._pending_folder_id in self._asset_index_folders():
+                        self._selected_folder_id = self._pending_folder_id
+                    self._pending_folder_id = None
+                    self._repair_selection()
+                    if self._gallery_focus_path:
+                        self.focus_gallery(self._gallery_focus_path)
+                    self._refresh_records(assets=True, folders=True)
+                    if self._handle:
+                        self._handle.dirty_all()
+                    self._start_catalog_verify()
+                    self._scan_asset_folders()
+                self._request_model_update()
+
+            self._schedule_ui(complete)
 
         try:
-            self._configure_storage_path()
-
-            # Ensure storage directory exists
-            self.STORAGE_PATH.mkdir(parents=True, exist_ok=True)
-
-            # Initialize components
-            self._asset_thumbnails = AssetThumbnails(self.STORAGE_PATH / "thumbnails")
-            self._asset_scanner = AssetScanner()
-            self._asset_index = AssetIndex(
-                library_path=self.STORAGE_PATH / "library.json",
-            )
-            return True
-        except Exception as e:
-            _logger.warning(f"Failed to initialize asset manager backend: {e}")
-            return False
-
-    # ── Data model ────────────────────────────────────────────
+            threading.Thread(target=worker, daemon=True, name="AssetManagerCatalogLoad").start()
+        except Exception as exc:
+            self._backend_load_active = False
+            self._catalog_load_failed = True
+            _log.exception("Start Projects catalog worker failed path=%s", self.STORAGE_PATH)
+            self._set_catalog_notice(str(exc))
 
     def on_bind_model(self, ctx):
         model = ctx.create_data_model("asset_manager")
         if model is None:
             return
 
-        # Basic properties
+        self._bind_gallery_model(model)
         model.bind("search_query", self.get_search_query, self.set_search_query)
-
-        # View state
+        model.bind_func("search_is_empty", lambda: not self._search_query)
+        model.bind("selected_folder_id", lambda: self._selected_folder_id or SCOPE_ALL, self._set_scope_value)
+        model.bind_func("selected_drop_target", lambda: (
+            self._selected_folder_id if self._selected_folder_id in self._asset_index_folders()
+            else self._default_folder_id() or ""
+        ))
+        model.bind("active_filter", lambda: self._active_filter, self._set_filter)
+        model.bind("thumbnail_size", self.get_thumbnail_size, self.set_thumbnail_size)
+        model.bind_func("thumbnail_menu_visible", lambda: self._thumbnail_menu_visible)
+        model.bind_func("thumbnail_reset_label", lambda: tr("common.reset"))
         model.bind_func("is_gallery_view", lambda: self._view_mode == "gallery")
         model.bind_func("is_list_view", lambda: self._view_mode == "list")
         model.bind_func("sort_label", self.get_sort_label)
-
-        # Panel widths for resizable sidebar and info panel
-        model.bind_func("sidebar_width", lambda: f"{self._sidebar_width}dp")
-        model.bind_func("right_panel_width", lambda: f"{self._right_panel_width}dp")
-
-        # Active states
-        model.bind_func("active_filters", self.get_active_filters)
-        model.bind_func("selection_type", self.get_selection_type)
+        model.bind_func("sort_tooltip", self.get_sort_tooltip)
+        model.bind_func("filter_menu_label", lambda: tr("projects.toolbar.filter"))
+        model.bind_func("active_filter_label", self.get_filter_label)
+        model.bind_func("all_assets_selected", lambda: self._selected_folder_id == SCOPE_ALL)
+        model.bind_func("all_assets_count", self.get_all_assets_count)
+        model.bind_func("local_assets_count", self.get_local_assets_count)
+        model.bind_func("selected_asset_id", self.get_selected_asset_id)
+        model.bind_func("selected_count", self.get_selected_count)
+        model.bind_func("selected_count_text", self.get_selected_count_text)
         model.bind_func("show_selection_none", lambda: self._selection_type == "none")
         model.bind_func("show_selection_asset", lambda: self._selection_type == "asset")
-        model.bind_func("show_selection_scene", lambda: self._selection_type == "scene")
-        model.bind_func(
-            "show_selection_project", lambda: self._selection_type == "project"
-        )
+        model.bind_func("show_selection_folder", lambda: self._selection_type == "folder")
         model.bind_func(
             "show_selection_multiple", lambda: self._selection_type == "multiple"
         )
 
-        # Panel label for floating window template
-        model.bind_func("panel_label", lambda: tr("asset_manager.panel_title"))
-
-        # Import menu state
-        model.bind_func("import_menu_open", self.get_import_menu_open)
-
-        # Import from URL action
-        model.bind_func("import_from_url_label", lambda: tr("asset_manager.import_from_url"))
-        model.bind_event("on_import_from_url", self.on_import_from_url)
-
-
-        # New project menu state
-        model.bind_func("new_project_menu_open", self.get_new_project_menu_open)
-        model.bind_func("create_new_project_label", lambda: tr("asset_manager.action.create_new_project"))
-
-        # Move menu projects list (for hover submenu)
-        model.bind_record_list("move_menu_projects")
-
-        # Selected IDs for UI conditionals
-        model.bind_func("selected_project_id", self.get_selected_project_id)
-        model.bind_func("selected_scene_id", self.get_selected_scene_id)
-
-        # Selection count and state
-        model.bind_func("selected_count", self.get_selected_count)
-        model.bind_func("selected_count_text", self.get_selected_count_text)
-        model.bind_func("has_selection", self.get_has_selection)
-        model.bind_func("has_multi_selection", self.get_has_multi_selection)
-
-        # Selected asset properties (flattened bind_func pattern)
-        model.bind_func("selected_asset_name", self.get_selected_asset_name)
-        model.bind_func("selected_asset_type", self.get_selected_asset_type)
+        model.bind_func("asset_list_wide", lambda: self._list_columns()["modified"])
+        model.bind_func("asset_list_show_folder", lambda: self._list_columns()["folder"])
+        model.bind_func("asset_list_show_size", lambda: self._list_columns()["size"])
+        for column in ("name", "gallery", "size", "modified", "folder"):
+            model.bind_func(
+                f"asset_list_{column}_width",
+                lambda column=column: f"{self._list_column_width(column):.1f}dp",
+            )
+            label_binding = "col_" + column + "_label"
+            model.bind_func(label_binding, lambda column=column: self._list_header_label(column))
+        model.bind_func("asset_list_gallery_compact", lambda: self._list_columns()["gallery"] == 32)
         model.bind_func(
-            "selected_asset_project_name", self.get_selected_asset_project_name
+            "check_gallery_tooltip",
+            lambda: " · ".join(filter(None, (
+                self._gallery_check_label(), self._gallery_checked_label(), self._gallery_quota(),
+            ))),
         )
-        model.bind_func("selected_asset_scene_name", self.get_selected_asset_scene_name)
+        model.bind_func("is_compact", lambda: self._layout_class == "compact")
+        model.bind_func("is_narrow", lambda: self._layout_class == "narrow")
+        model.bind_func("is_medium", lambda: self._layout_class == "medium")
+        model.bind_func("is_wide", lambda: self._layout_class == "wide")
+        model.bind_func("gallery_review_open", self._gallery_review_open)
+        model.bind_func("inspector_width", lambda: f"{self._inspector_width:.1f}dp")
+        model.bind_func("inspector_style_width", self.get_inspector_style_width)
+        for section in self._inspector_sections:
+            model.bind_func("inspector_" + section + "_expanded",
+                            lambda section=section: self._inspector_sections[section])
+        model.bind_func("inspector_gallery_action_label", lambda: (
+            self._gallery_badge(self._get_selected_asset())["gallery_action_label"]
+            if self._get_selected_asset() else ""))
+        model.bind_func("inspector_gallery_action_enabled", lambda: (
+            self._gallery_badge(self._get_selected_asset())["gallery_action_enabled"] if self._get_selected_asset() else False))
+        model.bind_func("inspector_has_gallery_action", lambda: (
+            not self.get_selected_asset_can_locate()
+            and bool(self._selected_gallery_action())))
+        model.bind_func("open_button_label", lambda: tr(
+            "projects.action.locate" if self.get_selected_asset_can_locate() else
+            "projects.action.repair" if (self._get_selected_asset() or {}).get("status") == "REPAIR_ONLY" else
+            "projects.action.open"))
+        model.bind_func("inspector_gallery_action_tooltip", lambda: (
+            self._gallery_badge(self._get_selected_asset())["gallery_action_label"]
+            if self._get_selected_asset() else ""))
+        model.bind_func("inspector_gallery_title", lambda: self._gallery_details()["title"])
+        model.bind_func("inspector_gallery_description", lambda: self._gallery_details()["description"])
+        model.bind_func("inspector_can_edit_gallery_details", self._can_edit_gallery_details)
+        model.bind_func("inspector_more_label", lambda: tr("common.more"))
+        model.bind_func("inspector_training_tooltip", lambda: " · ".join(filter(None, (
+            self._selected_details_rows().get("iteration", ""), self._selected_details_rows().get("strategy", "")))))
+        model.bind_func("inspector_model_tooltip", lambda: " · ".join(filter(None, (
+            self._selected_details_rows().get("gaussians", ""),
+            "SH " + self._selected_details_rows()["sh_degree"] if self._selected_details_rows().get("sh_degree") else ""))))
+        model.bind_func("inspector_reclaimable_tooltip", lambda: "{} ({})".format(
+            self._selected_details_rows().get("dead_bytes", ""), self._selected_details_rows().get("reclaimable_percent", "")))
+        model.bind_func("inspector_height", lambda: f"{self._inspector_preferred_height:.1f}dp")
+        model.bind_func("inspector_style_height", self.get_inspector_style_height)
+        model.bind_func("contents_undo_label", lambda: tr("projects.contents.undo"))
+        model.bind_func("main_min_height", lambda: f"{self._main_min_height:.1f}dp")
+        model.bind_func(
+            "bottom_panel_height", lambda: f"{self._bottom_panel_height:.1f}dp"
+        )
+        model.bind_func(
+            "bottom_panel_resize_dragging", lambda: self._bottom_panel_dragging
+        )
+        model.bind_func(
+            "asset_card_slot_width", lambda: f"{self._asset_card_slot_width:.1f}dp"
+        )
+        model.bind_func(
+            "asset_card_thumbnail_height",
+            lambda: f"{card_geometry(max(1.0, self._asset_card_slot_width - 2.0))['thumbnail_height']:.1f}dp",
+        )
+        for field in (
+            "asset_list_top_spacer_height",
+            "asset_list_bottom_spacer_height",
+            "asset_gallery_top_spacer_height",
+            "asset_gallery_bottom_spacer_height",
+        ):
+            model.bind_func(
+                field,
+                lambda field=field: f"{getattr(self, '_' + field):.1f}dp",
+            )
+
+        model.bind_func("is_floating", lambda: self._is_floating)
+        model.bind_func("inspector_expanded", lambda: self._inspector_expanded)
+        model.bind_func(
+            "quick_look_visible",
+            lambda: self._quick_look_visible and bool(self.get_selected_asset_id()),
+        )
+        model.bind_func("quick_look_thumbnail", self.get_selected_asset_thumbnail_decorator)
+        model.bind_func(
+            "quick_look_has_thumbnail",
+            lambda: self.get_selected_asset_thumbnail_decorator() != "none",
+        )
+        model.bind_func("asset_results_summary_visible", lambda: True)
+        model.bind_func("asset_results_summary", self.get_asset_results_summary)
+        model.bind_func("asset_search_empty", self.get_asset_search_empty)
+        model.bind_func("can_clean_missing", self.get_can_clean_missing)
+        model.bind_func("catalog_notice", self.get_catalog_notice)
+        model.bind_func("has_catalog_notice", self.get_has_catalog_notice)
+        model.bind_func("catalog_loading", lambda: self._backend_load_active and not self._catalog_preview)
+        model.bind_func("scan_active", self.get_scan_active)
+        model.bind_func("scan_status", self.get_scan_status)
+        model.bind_func("has_scan_status", self.get_has_scan_status)
+        model.bind_func(
+            "no_folders",
+            lambda: not self._backend_load_active and not self._asset_index_folders(),
+        )
+        model.bind_func(
+            "empty_folder",
+            lambda: not self._backend_load_active
+            and bool(self._asset_index_folders())
+            and self._selected_folder_id in self._asset_index_folders()
+            and not self._filtered_assets(),
+        )
+        model.bind_func("refresh_action_tooltip", self.get_refresh_action_tooltip)
+        model.bind_func(
+            "stop_scan_label", lambda: tr("projects.action.stop_scan")
+        )
+
+        model.bind_func("selected_asset_name", self.get_selected_asset_name)
+        model.bind_func(
+            "selected_asset_folder_name", self.get_selected_asset_folder_name
+        )
+        model.bind_func(
+            "selected_asset_has_folder", self.get_selected_asset_has_folder
+        )
         model.bind_func("selected_asset_path", self.get_selected_asset_path)
         model.bind_func("selected_asset_size", self.get_selected_asset_size)
-        model.bind_func("selected_asset_role", self.get_selected_asset_role)
-        model.bind_func("selected_asset_points", self.get_selected_asset_points)
-        model.bind_func("selected_asset_resolution", self.get_selected_asset_resolution)
-        model.bind_func("selected_asset_duration", self.get_selected_asset_duration)
         model.bind_func("selected_asset_created", self.get_selected_asset_created)
         model.bind_func("selected_asset_modified", self.get_selected_asset_modified)
-        model.bind_func(
-            "selected_asset_has_geometry_metadata",
-            self.get_selected_asset_has_geometry_metadata,
-        )
-        model.bind_func(
-            "selected_asset_has_dataset_metadata",
-            self.get_selected_asset_has_dataset_metadata,
-        )
-        model.bind_func(
-            "selected_asset_dataset_image_count",
-            self.get_selected_asset_dataset_image_count,
-        )
-        model.bind_func(
-            "selected_asset_dataset_image_root",
-            self.get_selected_asset_dataset_image_root,
-        )
-        model.bind_func(
-            "selected_asset_dataset_masks",
-            self.get_selected_asset_dataset_masks,
-        )
-        model.bind_func(
-            "selected_asset_dataset_camera_count",
-            self.get_selected_asset_dataset_camera_count,
-        )
-        model.bind_func(
-            "selected_asset_dataset_initial_points",
-            self.get_selected_asset_dataset_initial_points,
-        )
-        model.bind_func(
-            "selected_asset_bounding_box", self.get_selected_asset_bounding_box
-        )
-        model.bind_func("selected_asset_center", self.get_selected_asset_center)
-        model.bind_func("selected_asset_scale", self.get_selected_asset_scale)
-        model.bind_func(
-            "selected_asset_has_transform_metadata",
-            self.get_selected_asset_has_transform_metadata,
-        )
-        model.bind_func(
-            "selected_asset_transform_translation", self.get_selected_asset_transform_translation
-        )
-        model.bind_func(
-            "selected_asset_transform_rotation", self.get_selected_asset_transform_rotation
-        )
-        model.bind_func(
-            "selected_asset_transform_scaling", self.get_selected_asset_transform_scaling
-        )
+        for field, getter in {
+            "inspector_saved": lambda: self._selected_details_rows().get("saved", ""),
+            "inspector_saved_at": lambda: self._selected_details_rows().get("saved_at", ""),
+            "inspector_opened": lambda: self._selected_details_rows().get("opened", ""),
+            "inspector_iteration": lambda: self._selected_details_rows().get("iteration", ""),
+            "inspector_training_summary": lambda: self._inspector_fact_summary("iteration", "strategy"),
+            "inspector_model_summary": lambda: self._inspector_fact_summary("gaussians", "sh_degree", "SH "),
+            "inspector_strategy": lambda: self._selected_details_rows().get("strategy", ""),
+            "inspector_resumable": lambda: bool(self._selected_details_rows().get("resumable")),
+            "inspector_gaussians": lambda: self._selected_details_rows().get("gaussians", ""),
+            "inspector_sh_degree": lambda: self._selected_details_rows().get("sh_degree", ""),
+            "inspector_dataset": lambda: self._selected_details_rows().get("dataset", ""),
+            "inspector_dataset_path": lambda: self._selected_details_rows().get("dataset_path", ""),
+            "inspector_dataset_reachable": lambda: bool(self._selected_details_rows().get("dataset_reachable")),
+            "inspector_embedded": lambda: bool(self._selected_details_rows().get("embedded")),
+            "inspector_has_metrics": lambda: bool(self._selected_details_rows().get("has_metrics")),
+            "inspector_metrics": lambda: self._selected_details_rows().get("metrics", ""),
+            "inspector_license": lambda: license_name(self._selected_details_rows().get("license_identifier", ""), tr),
+            "inspector_license_notice": lambda: self._selected_details_rows().get("license_notice", ""),
+            "selected_project_title": lambda: self._selected_details_rows().get("title", ""),
+            "inspector_physical_size": lambda: self._selected_details_rows().get("physical_size", ""),
+            "inspector_dead_bytes": lambda: self._selected_details_rows().get("dead_bytes", ""),
+            "inspector_reclaimable": lambda: self._selected_details_rows().get("reclaimable_percent", ""),
+            "inspector_saves": lambda: self._selected_details_rows().get("saves", ""),
+            "inspector_autosave_newer": lambda: bool(self._selected_details_rows().get("autosave_newer")),
+            "inspector_has_details": lambda: bool(self._selected_inspection().get("details")),
+            "inspector_card_diagnostic": lambda: str(getattr(self._selected_inspection().get("card"), "diagnostic", "") or ""),
+            "inspector_can_resume": lambda: self._project_available(self._get_selected_asset() or {}) and not self._selected_transfer_recovery() and bool(self._selected_details_rows().get("resumable")),
+            "inspector_operations_expanded": self.get_operations_expanded,
+            "contents_pending": self.get_contents_pending,
+            "contents_has_pending": lambda: bool(self.get_contents_pending()),
+            "inspector_has_saved": lambda: bool(self._selected_details_rows().get("saved")),
+            "inspector_has_saved_at": lambda: bool(self._selected_details_rows().get("saved_at")),
+            "inspector_has_opened": lambda: bool(self._selected_details_rows().get("opened")),
+            "inspector_has_iteration": lambda: bool(self._selected_details_rows().get("iteration")),
+            "inspector_has_strategy": lambda: bool(self._selected_details_rows().get("strategy")),
+            "inspector_has_gaussians": lambda: bool(self._selected_details_rows().get("gaussians")),
+            "inspector_has_sh_degree": lambda: bool(self._selected_details_rows().get("sh_degree")),
+            "inspector_has_dataset": lambda: bool(self._selected_details_rows().get("dataset")),
+            "inspector_has_license": lambda: bool(self._selected_details_rows().get("license_identifier")),
+            "inspector_has_title": lambda: bool(self._selected_details_rows().get("title")),
+            "inspector_has_physical_size": lambda: bool(self._selected_details_rows().get("physical_size")),
+            "inspector_has_dead_bytes": lambda: bool(self._selected_details_rows().get("dead_bytes")),
+            "inspector_has_saves": lambda: bool(self._selected_details_rows().get("saves")),
+            "inspector_autosave_newer_label": lambda: tr("projects.status.autosave_newer"),
+            "inspector_verify_result": lambda: self._verify_results.get(self.get_selected_asset_id(), ""),
+            "has_inspector_verify_result": lambda: bool(self._verify_results.get(self.get_selected_asset_id(), "")),
+            "inspector_verify_label": lambda: tr("projects.property.verify"),
+        }.items():
+            model.bind_func(field, getter)
+        model.bind_func("selected_health_state", self.get_selected_health_state)
+        model.bind_func("selected_health_label", self.get_selected_health_label)
+        model.bind_func("selected_has_problem", self.selected_has_problem)
+        model.bind_func("selected_fix_label", self.get_selected_fix_label)
+        model.bind_func("selected_fix_action", self.get_selected_fix_action)
         model.bind_func(
             "selected_asset_file_missing", self.get_selected_asset_file_missing
         )
         model.bind_func(
-            "selected_asset_expected_path", self.get_selected_asset_expected_path
-        )
-        model.bind_func("selected_asset_pill_class", self.get_selected_asset_pill_class)
-        model.bind_func("selected_asset_type_label", self.get_selected_asset_type_label)
-
-        # Selected scene properties (flattened)
-        model.bind_func("selected_scene_name", self.get_selected_scene_name)
-        model.bind_func(
-            "selected_scene_project_name", self.get_selected_scene_project_name
+            "selected_asset_can_locate", self.get_selected_asset_can_locate
         )
         model.bind_func(
-            "selected_scene_asset_count", self.get_selected_scene_asset_count
+            "selected_fix_requires_action",
+            lambda: self.selected_has_problem() and not self.get_selected_asset_can_locate(),
         )
-        model.bind_func("selected_scene_created", self.get_selected_scene_created)
-        model.bind_func("selected_scene_modified", self.get_selected_scene_modified)
+        model.bind_func("locate_section_title", self.get_locate_section_title)
+        model.bind_func(
+            "selected_asset_relocation_candidate",
+            self.get_selected_asset_relocation_candidate,
+        )
+        model.bind_func(
+            "selected_asset_has_relocation_candidate",
+            self.get_selected_asset_has_relocation_candidate,
+        )
+        model.bind_func(
+            "selected_asset_expected_path", self.get_selected_asset_path
+        )
+        model.bind_func("selected_folder_name", self.get_selected_folder_name)
+        model.bind_func("selected_folder_path", self.get_selected_folder_path)
+        model.bind_func(
+            "selected_folder_asset_count", self.get_selected_folder_asset_count
+        )
 
-        # Selected project properties (flattened)
-        model.bind_func("selected_project_name", self.get_selected_project_name)
-        model.bind_func("selected_project_created", self.get_selected_project_created)
-        model.bind_func("selected_project_modified", self.get_selected_project_modified)
+        model.bind_func("panel_label", lambda: tr("projects.panel_title"))
+        labels = {
+            "close_label": "common.close",
+            "import_project_label": "projects.action.add_existing",
+            "import_project_tooltip": "projects.tooltip.add_existing",
+            "no_search_results_label": "projects.status.no_search_results",
+            "clear_search_label": "projects.action.clear_search",
+            "clean_missing_label": "projects.action.clean_missing",
+            "search_placeholder": "projects.toolbar.search_icon",
+            "search_icon_label": "projects.toolbar.search_icon",
+            "info_tab_label": "projects.info_panel.info",
+            "select_item_hint": "projects.status.select_item",
+            "asset_details_title": "projects.info_panel.asset_details",
+            "folder_details_title": "projects.info_panel.folder_details",
+            "file_not_found_title": "projects.info_panel.file_not_found",
+            "found_at_label": "projects.info_panel.found_at",
+            "use_found_location_label": "projects.action.use_found_location",
+            "prop_folder_label": "projects.property.folder",
+            "prop_size_label": "projects.property.size",
+            "prop_path_label": "projects.property.path",
+            "prop_created_label": "projects.property.created",
+            "prop_modified_label": "projects.property.modified",
+            "prop_expected_path_label": "projects.property.expected_path",
+            "prop_assets_label": "projects.property.assets",
+            "locate_file_button_label": "projects.action.locate_file",
+            "load_button_label": "menu.file.open_project",
+            "inspector_title": "projects.inspector.title",
+            "problem_title": "projects.inspector.problem",
+            "project_section_title": "projects.inspector.project",
+            "gallery_section_title": "projects.inspector.gallery",
+            "file_section_title": "projects.inspector.file",
+            "operations_section_title": "projects.contents.title",
+            "resume_button_label": "projects.action.resume_training",
+            "scope_all_label": "projects.sidebar.all_projects",
+            "view_menu_label": "projects.toolbar.view",
+            "filter_label": "projects.toolbar.filter",
+            "no_folders_label": "projects.status.no_folders",
+            "empty_folder_label": "projects.status.empty_folder",
+            "thumbnail_size_label": "projects.toolbar.thumbnail_size",
+            "resize_inspector_label": "projects.accessibility.resize_inspector",
+            "resize_inspector_height_label": "projects.accessibility.resize_inspector_height",
+            "inspector_saved_label": "projects.property.saved",
+            "inspector_date_label": "projects.property.date",
+            "inspector_opened_label": "projects.property.opened",
+            "inspector_training_label": "projects.property.training",
+            "inspector_model_label": "projects.property.model",
+            "inspector_dataset_label": "projects.property.dataset",
+            "inspector_metrics_label": "projects.property.metrics",
+            "inspector_license_label": "projects.property.license",
+            "inspector_title_label": "projects.property.title",
+            "inspector_reclaimable_label": "projects.property.reclaimable",
+            "inspector_saves_label": "projects.property.saves",
+            "inspector_autosave_label": "projects.property.autosave",
+        }
+        for field, key in labels.items():
+            model.bind_func(field, lambda key=key: tr(key))
+        model.bind_func("check_gallery_label", self._gallery_check_label)
 
-        # UI Labels (for i18n)
-        model.bind_func("search_icon_label", lambda: tr("asset_manager.toolbar.search_icon"))
-        model.bind_func("search_placeholder", lambda: tr("asset_manager.toolbar.search_placeholder"))
-        model.bind_func("gallery_label", lambda: tr("asset_manager.toolbar.view_gallery"))
-        model.bind_func("list_label", lambda: tr("asset_manager.toolbar.view_list"))
-        model.bind_func("import_label", lambda: tr("asset_manager.toolbar.import"))
-        model.bind_func("import_splat_label", lambda: tr("asset_manager.import_menu.import_splat"))
-        model.bind_func("import_mesh_label", lambda: tr("asset_manager.import_menu.import_mesh"))
-        model.bind_func("import_dataset_label", lambda: tr("asset_manager.import_menu.import_dataset"))
-        model.bind_func("import_checkpoint_label", lambda: tr("asset_manager.import_menu.import_checkpoint"))
-
-        model.bind_func("projects_title", lambda: tr("asset_manager.sidebar.projects"))
-        model.bind_func("scenes_title", lambda: tr("asset_manager.sidebar.scenes"))
-        model.bind_func("filters_title", lambda: tr("asset_manager.sidebar.filters"))
-        model.bind_func("gallery_title", lambda: tr("asset_manager.toolbar.view_gallery"))
-        model.bind_func("list_title", lambda: tr("asset_manager.toolbar.view_list"))
-        model.bind_func("edit_watch_dirs_label", lambda: tr("asset_manager.action.edit_watch_dirs"))
-        model.bind_func("rename_project_label", lambda: tr("asset_manager.action.rename_project"))
-        model.bind_func("delete_project_label", lambda: tr("asset_manager.action.delete_project"))
-        model.bind_func("load_button_label", lambda: tr("asset_manager.action.load"))
-        model.bind_func("load_new_label", lambda: tr("asset_manager.action.load_new"))
-        model.bind_func("add_to_scene_label", lambda: tr("asset_manager.action.add_to_scene"))
-        model.bind_func("rename_label", lambda: tr("asset_manager.action.rename"))
-        model.bind_func("move_to_project_label", lambda: tr("asset_manager.action.move_to_project"))
-        model.bind_func("new_project_label", lambda: tr("asset_manager.action.new_project"))
-        model.bind_func("show_in_folder_label", lambda: tr("asset_manager.action.show_in_folder"))
-        model.bind_func("update_thumbnail_label", lambda: tr("asset_manager.action.update_thumbnail"))
-        model.bind_func("remove_label", lambda: tr("asset_manager.action.remove"))
-        model.bind_func("refresh_label", lambda: tr("asset_manager.action.refresh"))
-        model.bind_func("clean_missing_label", lambda: tr("asset_manager.action.clean_missing"))
-        model.bind_func("refresh_tooltip", lambda: tr("asset_manager.tooltip.refresh"))
-        model.bind_func("clean_missing_tooltip", lambda: tr("asset_manager.tooltip.clean_missing"))
-        model.bind_func("col_name_label", lambda: tr("asset_manager.property.name"))
-        model.bind_func("col_type_label", lambda: tr("asset_manager.property.type"))
-        model.bind_func("col_project_label", lambda: tr("asset_manager.property.project"))
-        model.bind_func("col_size_label", lambda: tr("asset_manager.property.size"))
-        model.bind_func("col_modified_label", lambda: tr("asset_manager.property.modified"))
-        model.bind_func("info_tab_label", lambda: tr("asset_manager.info_panel.info"))
-        model.bind_func("select_item_hint", lambda: tr("asset_manager.status.select_item"))
-        model.bind_func("asset_details_title", lambda: tr("asset_manager.info_panel.asset_details"))
-        model.bind_func("prop_project_label", lambda: tr("asset_manager.property.project"))
-        model.bind_func("prop_scene_label", lambda: tr("asset_manager.property.scene"))
-        model.bind_func("prop_role_label", lambda: tr("asset_manager.property.role"))
-        model.bind_func("prop_points_label", lambda: tr("asset_manager.property.points"))
-
-        model.bind_func("prop_size_label", lambda: tr("asset_manager.property.size"))
-        model.bind_func("prop_path_label", lambda: tr("asset_manager.property.path"))
-        model.bind_func("prop_created_label", lambda: tr("asset_manager.property.created"))
-        model.bind_func("prop_modified_label", lambda: tr("asset_manager.property.modified"))
-        model.bind_func("prop_resolution_label", lambda: tr("asset_manager.property.resolution"))
-        model.bind_func("prop_duration_label", lambda: tr("asset_manager.property.duration"))
-        model.bind_func("dataset_details_title", lambda: tr("asset_manager.info_panel.dataset_details"))
-        model.bind_func("prop_images_label", lambda: tr("asset_manager.property.images"))
-        model.bind_func("prop_image_root_label", lambda: tr("asset_manager.property.image_root"))
-        model.bind_func("prop_masks_label", lambda: tr("asset_manager.property.masks"))
-        model.bind_func("prop_sparse_model_label", lambda: tr("asset_manager.property.sparse_model"))
-        model.bind_func("prop_cameras_label", lambda: tr("asset_manager.property.cameras"))
-        model.bind_func("prop_initial_points_label", lambda: tr("asset_manager.property.initial_points"))
-        model.bind_func("tags_title", lambda: tr("asset_manager.sidebar.tags"))
-        model.bind_func("remove_tag_label", lambda: tr("asset_manager.action.remove"))
-        model.bind_func("add_tag_placeholder", lambda: tr("asset_manager.action.add_tag"))
-        model.bind_func("add_tag_button_label", lambda: tr("asset_manager.action.add_tag"))
-        model.bind_func("geometry_metadata_title", lambda: tr("asset_manager.info_panel.geometry_metadata"))
-        model.bind_func("prop_bounding_box_label", lambda: tr("asset_manager.geometry.bounding_box"))
-        model.bind_func("prop_center_label", lambda: tr("asset_manager.geometry.center"))
-        model.bind_func("prop_scale_label", lambda: tr("asset_manager.geometry.scale"))
-        model.bind_func("transform_info_title", lambda: tr("asset_manager.info_panel.transform_information"))
-        model.bind_func("prop_translation_label", lambda: tr("asset_manager.property.translation"))
-        model.bind_func("prop_rotation_label", lambda: tr("asset_manager.property.rotation"))
-        model.bind_func("prop_scaling_label", lambda: tr("asset_manager.property.scaling"))
-        model.bind_func("file_not_found_title", lambda: tr("asset_manager.info_panel.file_not_found"))
-        model.bind_func("prop_expected_path_label", lambda: tr("asset_manager.property.expected_path"))
-        model.bind_func("locate_file_button_label", lambda: tr("asset_manager.action.locate_file"))
-        model.bind_func("scene_pill_label", lambda: tr("asset_manager.type.scene"))
-        model.bind_func("scene_details_title", lambda: tr("asset_manager.info_panel.scene_details"))
-        model.bind_func("prop_assets_label", lambda: tr("asset_manager.property.assets"))
-        model.bind_func("scene_assets_title", lambda: tr("asset_manager.info_panel.scenes"))
-        model.bind_func("project_pill_label", lambda: tr("asset_manager.type.project"))
-        model.bind_func("project_details_title", lambda: tr("asset_manager.info_panel.project_details"))
-        model.bind_func("prop_scenes_label", lambda: tr("asset_manager.property.scenes"))
-        model.bind_func("scenes_list_title", lambda: tr("asset_manager.sidebar.scenes"))
-
-        # Record lists for data-for loops (main lists)
-        model.bind_record_list("projects")
-        model.bind_record_list("scenes")
-        model.bind_record_list("filters")
+        model.bind_record_list("folders")
         model.bind_record_list("assets")
-        model.bind_record_list("selected_asset_tags")
-
-        # Record lists for nested struct lists
-        model.bind_record_list("selected_scene_assets")
-
+        model.bind_record_list("contents_rows")
+        for event, handler in (
+            ("on_import_project", self.on_import_project),
+            ("on_load_asset", self.on_load_asset),
+            ("set_view_mode", self.set_view_mode),
+            ("cycle_sort_mode", self.cycle_sort_mode),
+            ("open_sort_menu", self.open_sort_menu),
+            ("sort_list_column", self.sort_list_column),
+            ("close_quick_look", self.close_quick_look),
+            ("open_view_menu", self.open_view_menu),
+            ("close_thumbnail_menu", self.close_thumbnail_menu),
+            ("reset_thumbnail_size", self.reset_thumbnail_size),
+            ("toggle_inspector", self.toggle_inspector),
+            ("toggle_inspector_section", self.toggle_inspector_section),
+            ("open_inspector_menu", self.open_inspector_menu),
+            ("refresh_catalog", self.refresh_catalog),
+            ("on_locate_file", self.on_locate_file),
+            ("on_use_found_location", self.on_use_found_location),
+            ("on_selected_fix", self.on_selected_fix),
+            ("open_project_operation", self.open_project_operation),
+            ("open_gallery_details", self.open_gallery_details),
+            ("contents_action", self.on_contents_action),
+            ("toggle_operations", self.toggle_operations),
+            ("on_bottom_panel_resize_start", self.on_bottom_panel_resize_start),
+            ("close_panel", self._on_close_panel),
+            ("clear_search", lambda *_args: self.set_search_query("")),
+            ("clean_missing", self.on_clean_missing),
+        ):
+            model.bind_event(event, handler)
         self._handle = model.get_handle()
-
-        # Initialize record lists
-        self._update_all_record_lists()
-
-        # Event handlers
-        model.bind_event("toggle_filter", self.toggle_filter)
-        model.bind_event("set_view_mode", self.set_view_mode)
-        model.bind_event("cycle_sort_mode", self.cycle_sort_mode)
-        model.bind_event("toggle_asset_selection", self.toggle_asset_selection)
-        model.bind_event("on_search", self.on_search)
-        model.bind_event("on_import_splat", self.on_import_splat)
-        model.bind_event("on_import_mesh", self.on_import_mesh)
-        model.bind_event("on_import_dataset", self.on_import_dataset)
-        model.bind_event("on_load_selected", self.on_load_selected)
-        model.bind_event("on_remove_from_catalog", self.on_remove_from_catalog)
-        model.bind_event("select_project", self.select_project)
-        model.bind_event("select_scene", self.select_scene)
-        model.bind_event("toggle_import_menu", self.toggle_import_menu)
-        model.bind_event("on_import_checkpoint", self.on_import_checkpoint)
-        model.bind_event("on_locate_file", self.on_locate_file)
-        model.bind_event("select_asset", self.select_asset_by_id)
-        model.bind_event("on_load_asset", self.on_load_asset)
-        model.bind_event("on_remove_asset", self.on_remove_asset)
-        model.bind_event("on_update_thumbnail", self.on_update_thumbnail)
-        model.bind_event("on_pending_tag_change", self.on_pending_tag_change)
-        model.bind_event("on_add_tag", self.on_add_tag)
-        model.bind_event("on_remove_tag", self.on_remove_tag)
-
-        # Panel resize event handlers
-        model.bind_event("on_sidebar_resize_start", self.on_sidebar_resize_start)
-        model.bind_event("on_right_panel_resize_start", self.on_right_panel_resize_start)
-
-        # New project event handlers
-        model.bind_event("toggle_new_project_menu", self.toggle_new_project_menu)
-        model.bind_event("on_create_project_dialog", self.on_create_project_dialog)
-        model.bind_event("refresh_catalog", self.refresh_catalog_scan)
-        model.bind_event("clean_missing", self.clean_missing)
-
-        # Collapse state bindings
-        model.bind_func("projects_collapsed", self.get_projects_collapsed)
-        model.bind_func("filters_collapsed", self.get_filters_collapsed)
-        model.bind_func("projects_expanded", self.get_projects_expanded)
-        model.bind_func("filters_expanded", self.get_filters_expanded)
-        model.bind_event("toggle_projects_collapsed", self.toggle_projects_collapsed)
-        model.bind_event("toggle_filters_collapsed", self.toggle_filters_collapsed)
-
-    # ── Data Retrieval Methods ─────────────────────────────────
+        self._handle.update_record_list("contents_rows", self.get_contents_rows())
 
     def get_search_query(self) -> str:
         return self._search_query
 
+    def _set_scope_value(self, value: Any) -> None:
+        self._select_folder_id(str(value or SCOPE_ALL))
+
+    def select_projects_scope(self) -> None:
+        if self._selected_folder_id == SCOPE_ALL and self._active_filter == "published":
+            self._set_filter("all")
+
+    def get_thumbnail_size(self) -> float:
+        return self._thumbnail_size
+
+    def get_inspector_style_width(self) -> str:
+        if self._layout_class in ("compact", "narrow"):
+            return "auto"
+        return f"{self._inspector_width:.1f}dp"
+
+    def get_inspector_style_height(self) -> str:
+        if self._layout_class in ("medium", "wide"):
+            return "auto"
+        return f"{self._inspector_band_height():.1f}dp"
+
+    def _inspector_band_height(self) -> float:
+        height = self._host_geometry[1] if self._host_geometry else 700.0
+        metrics = breakpoint_metrics(self._content_width or 600.0)
+        maximum = min(metrics["inspector_max"], max(metrics["inspector_min"], height * 0.5))
+        return min(self._inspector_preferred_height, maximum)
+
+    def _dirty_layout_fields(self) -> None:
+        self._dirty_fields(
+            "is_compact", "is_narrow", "is_medium", "is_wide",
+            "is_floating",
+            "inspector_width", "inspector_style_width", "inspector_height",
+            "inspector_style_height", "thumbnail_size", "asset_card_slot_width",
+            "asset_card_thumbnail_height", "bottom_panel_height",
+            "main_min_height",
+        )
+
+    def _dirty_list_layout_fields(self) -> None:
+        self._responsive_width_signature = None
+        self._dirty_fields(
+            "asset_list_wide", "asset_list_show_size", "asset_list_show_folder",
+            "asset_list_gallery_compact",
+            *(f"asset_list_{name}_width" for name in ("name", "gallery", "size", "modified", "folder")),
+        )
+
+    def _dirty_inspector_layout(self) -> None:
+        self._asset_window_refresh_pending = True
+        self._dirty_fields("inspector_expanded")
+        self._dirty_list_layout_fields()
+        self._request_model_update()
+
+    def set_thumbnail_size(self, value: Any) -> None:
+        try:
+            number = min(320.0, max(112.0, float(value)))
+        except (TypeError, ValueError):
+            return
+        if abs(self._thumbnail_size - number) < 0.1:
+            return
+        self._thumbnail_size = number
+        self._reset_scroll()
+        self._refresh_records(assets=True)
+        self._dirty_fields("thumbnail_size")
+        self._persist_project_manager_state()
+
     def set_search_query(self, value: str) -> None:
-        self._search_query = value
-        # Trigger asset list refresh when search query changes
-        self._dirty_model("search_query", "assets")
+        self._search_query = str(value or "")
+        self._dirty_fields("search_is_empty")
+        visible_ids = {
+            str(asset.get("id") or asset.get("project_uuid") or "")
+            for asset in self._filtered_assets()
+        }
+        selected = self._selected_asset_ids.intersection(visible_ids)
+        cursor = self._selection_cursor_id if self._selection_cursor_id in visible_ids else next(iter(selected), None)
+        self._set_asset_selection(selected, cursor=cursor)
+        self._reset_scroll()
+        self._refresh_records(assets=True, folders=True)
+        self._dirty_selection()
 
     def get_sort_label(self) -> str:
-        labels = {
-            "name": tr("asset_manager.toolbar.sort_by_name"),
-            "size": tr("asset_manager.toolbar.sort_by_size"),
-            "type": tr("asset_manager.toolbar.sort_by_type"),
-        }
-        return labels.get(self._sort_mode, tr("asset_manager.toolbar.sort_by_name"))
+        return tr("projects.toolbar.sort")
 
-    def get_active_filters(self) -> Set[str]:
-        return self._active_filters
+    def _sort_field_label(self, field: str) -> str:
+        return tr({
+            "name": "projects.property.name", "saved": "projects.property.saved",
+            "opened": "projects.property.opened", "size": "projects.property.size",
+            "iteration": "projects.sort.iteration", "published": "projects.filter.published",
+            "gallery": "projects.gallery.sidebar.title", "folder": "projects.property.folder",
+        }[field])
 
-    def get_selection_type(self) -> str:
-        return self._selection_type
+    def get_sort_tooltip(self) -> str:
+        direction = tr("projects.sort.descending" if self._sort_descending else "projects.sort.ascending")
+        return f"{self._sort_field_label(self._sort_mode)} · {direction}"
 
-    def get_import_menu_open(self) -> bool:
-        return self._import_menu_open
+    def _sort_menu_items(self) -> List[Dict[str, Any]]:
+        fields = ["name", "saved", "opened", "size"]
+        if any(self._cached_iteration(asset) is not None for asset in self._asset_index_assets().values()):
+            fields.append("iteration")
+        fields.extend(("published", "gallery", "folder"))
+        items = [{"label": self._sort_field_label(field), "action": "sort:" + field,
+                  "is_active": self._sort_mode == field} for field in fields]
+        items.extend([
+            {"label": tr("projects.sort.ascending"), "action": "order:ascending", "separator_before": True,
+             "is_active": not self._sort_descending},
+            {"label": tr("projects.sort.descending"), "action": "order:descending", "is_active": self._sort_descending},
+        ])
+        return items
 
-    def get_new_project_menu_open(self) -> bool:
-        return self._new_project_menu_open
+    def _choose_sort(self, action: str) -> None:
+        kind, _, value = action.partition(":")
+        if kind == "sort" and value in self.SORT_MODES:
+            self._sort_mode = value
+            self._sort_descending = value not in ("name", "gallery", "folder")
+        elif kind == "order" and value in ("ascending", "descending"):
+            self._sort_descending = value == "descending"
+        else:
+            return
+        self._reset_scroll()
+        self._refresh_records(assets=True)
+        self._dirty_fields("sort_label", "sort_tooltip")
+        self._persist_project_manager_state()
 
-    def get_projects_collapsed(self) -> bool:
-        return self._projects_collapsed
+    def open_sort_menu(self, _handle=None, _event=None, _args=None) -> None:
+        self._show_shared_context_menu(self._sort_menu_items(), self._choose_sort)
 
-    def get_filters_collapsed(self) -> bool:
-        return self._filters_collapsed
+    def _list_header_label(self, column: str) -> str:
+        field = "saved" if column == "modified" else column
+        label = self._sort_field_label(field)
+        if self._sort_mode == field:
+            arrow = "↓" if self._sort_descending else "↑"
+            return f"{arrow} {label}" if column == "size" else f"{label} {arrow}"
+        return label
 
-    def get_projects_expanded(self) -> bool:
-        return not self._projects_collapsed
+    def sort_list_column(self, _handle=None, _event=None, args=None) -> None:
+        column = str((args or [""])[0])
+        field = "saved" if column == "modified" else column
+        if field == self._sort_mode:
+            self._choose_sort("order:" + ("ascending" if self._sort_descending else "descending"))
+        else:
+            self._choose_sort("sort:" + field)
 
-    def get_filters_expanded(self) -> bool:
-        return not self._filters_collapsed
+    def get_filter_label(self) -> str:
+        return tr({
+            "all": "projects.filter.clear",
+            "local": "projects.filter.local",
+            "attention": "projects.filter.attention",
+            "not_published": "projects.filter.not_published",
+            "published": "projects.filter.published",
+            "missing": "projects.filter.missing",
+            "checkpoint": "projects.filter.checkpoint",
+            "dataset": "projects.filter.dataset",
+            "gallery": "projects.filter.gallery",
+        }.get(self._active_filter, "projects.toolbar.filter"))
 
-    def toggle_projects_collapsed(self, _handle=None, _ev=None, _args=None):
-        self._projects_collapsed = not self._projects_collapsed
-        self._dirty_model("projects_collapsed")
-        self._dirty_model("projects_expanded")
+    def open_filter_menu(self, _handle=None, _ev=None, _args=None):
+        filters = [
+            ("projects.filter.clear", "all"),
+            ("projects.filter.local", "local"),
+            ("projects.filter.published", "published"),
+            ("projects.filter.not_published", "not_published"),
+            ("projects.filter.attention", "attention"),
+            ("projects.filter.missing", "missing"),
+            ("projects.filter.checkpoint", "checkpoint"),
+            ("projects.filter.dataset", "dataset"),
+            ("projects.filter.gallery", "gallery"),
+        ]
 
-    def toggle_filters_collapsed(self, _handle=None, _ev=None, _args=None):
-        self._filters_collapsed = not self._filters_collapsed
-        self._dirty_model("filters_collapsed")
-        self._dirty_model("filters_expanded")
+        def choose(action: str) -> None:
+            self._set_filter(action)
 
-    def get_move_menu_projects(self) -> List[Dict[str, str]]:
-        """Get projects for the currently open move menu."""
-        if not self._open_menu_asset_id or not self._asset_index:
-            return []
+        self._show_shared_context_menu(
+            [{"label": tr(label), "action": action} for label, action in filters], choose
+        )
 
-        asset = self._asset_index.assets.get(self._open_menu_asset_id)
-        if not asset:
-            return []
+    def _set_filter(self, value: str) -> None:
+        if value not in self.FILTERS:
+            return
+        self._active_filter = value
+        self._reset_scroll()
+        self._refresh_records(assets=True, folders=True)
+        self._dirty_selection()
+        self._dirty_fields("active_filter_label")
+        self._persist_project_manager_state()
 
-        return self._get_available_projects_for_asset(asset)
-
-    def get_selected_project_id(self) -> Optional[str]:
-        return self._selected_project_id
-
-    def get_selected_scene_id(self) -> Optional[str]:
-        return self._selected_scene_id
+    def get_selected_asset_id(self) -> str:
+        return next(iter(self._selected_asset_ids)) if len(self._selected_asset_ids) == 1 else ""
 
     def get_selected_count(self) -> int:
-        """Return the number of selected assets."""
         return len(self._selected_asset_ids)
 
     def get_selected_count_text(self) -> str:
-        """Return formatted text showing selected count."""
         count = len(self._selected_asset_ids)
         if count == 0:
-            return tr("asset_manager.status.select_item")
+            return tr("projects.status.select_item")
         if count == 1:
-            return tr("asset_manager.status.one_item_selected")
-        return tr("asset_manager.status.multi_items_selected", count=count)
-
-    def get_has_selection(self) -> bool:
-        """Return True if any assets are selected."""
-        return len(self._selected_asset_ids) > 0
-
-    def get_has_multi_selection(self) -> bool:
-        """Return True if multiple assets are selected."""
-        return len(self._selected_asset_ids) > 1
-
-    def _coerce_nonnegative_int(self, value: Any, default: int = 0) -> int:
-        if value is None:
-            return default
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return default
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return default
-        if not math.isfinite(number):
-            return default
-        return max(0, int(number))
-
-    def _coerce_optional_nonnegative_int(self, value: Any) -> Optional[int]:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return None
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(number):
-            return None
-        return max(0, int(number))
-
-    def _format_size(self, file_size_bytes: Any) -> str:
-        file_size_bytes = self._coerce_nonnegative_int(file_size_bytes)
-        if file_size_bytes >= 1024**3:
-            return f"{file_size_bytes / (1024**3):.2f} {tr('asset_manager.unit.gb')}"
-        if file_size_bytes >= 1024**2:
-            return f"{file_size_bytes / (1024**2):.1f} {tr('asset_manager.unit.mb')}"
-        if file_size_bytes >= 1024:
-            return f"{file_size_bytes / 1024:.1f} {tr('asset_manager.unit.kb')}"
-        return f"{file_size_bytes} {tr('asset_manager.unit.b')}"
-
-    def _ellipsize_path(self, path: str, max_chars: int = 56) -> str:
-        if not path or len(path) <= max_chars:
-            return path
-        keep = max(8, (max_chars - 3) // 2)
-        return f"{path[:keep]}...{path[-keep:]}"
-
-    def _reconcile_selection(self) -> None:
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            self._selected_asset_ids.clear()
-            self._selected_project_id = None
-            self._selected_scene_id = None
-            self._update_selection_type()
-            return
-        if (
-            self._selected_project_id
-            and self._selected_project_id
-            not in getattr(self._asset_index, "projects", {})
-        ):
-            self._selected_project_id = None
-        if (
-            self._selected_scene_id
-            and self._selected_scene_id not in getattr(self._asset_index, "scenes", {})
-        ):
-            self._selected_scene_id = None
-        valid_ids = set(self._asset_index.assets.keys())
-        if not self._selected_asset_ids.issubset(valid_ids):
-            self._selected_asset_ids.intersection_update(valid_ids)
-            self._update_selection_type()
-        if not self._selected_asset_ids:
-            if self._selection_type == "scene" and not self._selected_scene_id:
-                self._selection_type = "none"
-            elif self._selection_type == "project" and not self._selected_project_id:
-                self._selection_type = "none"
+            return tr("projects.status.one_item_selected")
+        return tr("projects.status.multi_items_selected", count=count)
 
     @staticmethod
-    def _asset_file_exists(asset: Dict[str, Any]) -> bool:
-        """Single source of truth for asset presence, shared by the list and
-        every count surface so sidebar badges never disagree with what renders."""
-        file_path = asset.get("absolute_path") or asset.get("path")
-        return bool(file_path) and os.path.exists(file_path)
+    def _sort_text(value: Any) -> str:
+        return str(value or "").casefold()
 
-    def _scene_asset_count(self, scene_id: str) -> int:
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return 0
-        return sum(
-            1
-            for asset in self._asset_index.assets.values()
-            if asset.get("scene_id") == scene_id and self._asset_file_exists(asset)
-        )
+    @staticmethod
+    def _format_size(value: Any) -> str:
+        return format_size(value)
 
-    def _project_asset_count(self, project_id: str) -> int:
-        """Count assets in a project whose backing file is present on disk."""
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return 0
-        return sum(
-            1
-            for asset in self._asset_index.assets.values()
-            if asset.get("project_id") == project_id and self._asset_file_exists(asset)
-        )
-
-    def _ensure_default_project(self) -> None:
-        """Ensure a 'Default' project always exists."""
-        if not self._asset_index or not hasattr(self._asset_index, "projects"):
-            return
-
-        # Check if Default project exists
-        default_project_name = tr("asset_manager.default_project_name")
-        has_default = any(
-            proj.get("name") == default_project_name
-            for proj in self._asset_index.projects.values()
-        )
-
-        if not has_default:
-            if not hasattr(self._asset_index, "create_project"):
-                return
-            try:
-                self._asset_index.create_project(name=default_project_name)
-                self._log_info(tr("asset_manager.msg.created_default"))
-            except Exception as e:
-                self._log_error(
-                    tr("asset_manager.msg.failed_create_default", error=e)
-                )
-
-    def _format_display_name(self, name: str, max_length: int = 15) -> str:
-        """Format a name for display, truncating with ... if too long."""
-        if not name:
-            return name
-        if len(name) > max_length:
-            return name[:max_length] + "..."
-        return name
-
-    def _get_asset_relationship_names(self, asset: Dict[str, Any]):
-        project_name = ""
-        scene_name = ""
-
-        if self._asset_index and hasattr(self._asset_index, "projects"):
-            project_name = self._asset_index.projects.get(
-                asset.get("project_id"), {}
-            ).get("name", "")
-        if self._asset_index and hasattr(self._asset_index, "scenes"):
-            scene_name = self._asset_index.scenes.get(asset.get("scene_id"), {}).get(
-                "name", ""
+    @staticmethod
+    def _format_unix_ns(value: Any) -> str:
+        try:
+            nanoseconds = int(value)
+            if nanoseconds <= 0:
+                return ""
+            return datetime.fromtimestamp(nanoseconds / 1_000_000_000).strftime(
+                "%Y-%m-%d %H:%M"
             )
+        except (OSError, OverflowError, TypeError, ValueError):
+            return ""
 
-        return project_name, scene_name
-
-    def _asset_display_title(self, asset: Dict[str, Any]) -> str:
-        # Prioritize custom name if set by user
-        custom_name = asset.get("name", "").strip()
-        if custom_name:
-            return custom_name
-
-        # Fall back to filename from path
-        file_path = asset.get("absolute_path") or asset.get("path") or ""
-        if file_path:
-            try:
-                leaf = Path(os.path.normpath(file_path)).name
-                if leaf:
-                    return leaf
-            except Exception:
-                pass
-
-        return tr("asset_manager.unnamed")
-
-    def _get_asset_display_fields(
-        self,
-        asset: Dict[str, Any],
-        project_name: str,
-        scene_name: str,
-    ) -> Dict[str, str]:
-        asset_name = asset.get("name", "Unnamed")
-        role_label = asset.get("role", "").replace("_", " ").title()
-        display_name = self._asset_display_title(asset)
-
-        if scene_name and scene_name != display_name:
-            display_subtitle = scene_name
-        elif project_name:
-            display_subtitle = project_name
-        elif asset_name and asset_name != display_name:
-            display_subtitle = asset_name
+    def _asset_index_assets(self) -> Dict[str, Dict[str, Any]]:
+        if self._library_service is not None:
+            assets = self._library_snapshot().get("projects", {})
+        elif self._catalog_preview is not None:
+            assets = self._catalog_preview.get("projects", {})
         else:
-            display_subtitle = role_label
+            assets = getattr(self._asset_index, "assets", {}) if self._asset_index else {}
+        return assets if isinstance(assets, dict) else {}
 
-        context_parts = []
-        if project_name and project_name != display_subtitle:
-            context_parts.append(project_name)
+    def _asset_dict(self, asset_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        if asset_id and asset_id.startswith("recent:"):
+            if self._selected_folder_id != SCOPE_RECENT:
+                return None
+            return self._recent_only_assets().get(asset_id)
+        if asset_id and asset_id.startswith("remote:"):
+            return self._gallery_remote_assets().get(asset_id)
+        if not asset_id:
+            return None
+        if self._asset_index is None:
+            asset = (self._catalog_preview or {}).get("projects", {}).get(asset_id)
+            return dict(asset) if isinstance(asset, dict) else None
+        if self._library_service is not None:
+            asset = self._library_snapshot().get("projects", {}).get(asset_id)
+            return dict(asset) if isinstance(asset, dict) else asset
+        getter = getattr(self._asset_index, "get_asset_dict", None)
+        if callable(getter):
+            return getter(asset_id)
+        return self._asset_index_assets().get(asset_id)
 
-        context_label = " / ".join(context_parts)
-        if role_label:
-            context_label = (
-                f"{context_label} - {role_label}" if context_label else role_label
-            )
+    def catalog_entry_for_path(self, path: str) -> Optional[Dict[str, Any]]:
+        find_by_path = getattr(self._asset_index, "find_asset_by_path", None)
+        project = find_by_path(path) if path and callable(find_by_path) else None
+        return self._asset_dict(project.id) if project is not None else None
 
-        return {
-            "display_name": display_name,
-            "display_subtitle": display_subtitle,
-            "context_label": context_label,
-        }
+    @staticmethod
+    def _project_path_key(path: Any) -> str:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        try:
+            expanded = os.path.expanduser(text)
+            normalized = os.path.realpath(os.path.abspath(expanded))
+            return os.path.normcase(normalized)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return os.path.normcase(os.path.abspath(text))
 
-    # Missing-asset entries are pruned from the index once their catalog metadata
-    # has had time to be touched without the file reappearing — distinguishes a
-    # transient unmount from genuine cleanup.
-    _STALE_ASSET_GRACE_DAYS = 7
-
-    def get_filtered_assets(self) -> List[Dict[str, Any]]:
-        """Return assets filtered by search query, active filter, and selections."""
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
+    def _recent_paths(self) -> List[str]:
+        recent_files = getattr(lf, "project_recent_files", None)
+        if not callable(recent_files):
             return []
+        try:
+            paths = list(recent_files() or [])
+        except Exception:
+            return []
+        return [str(path).strip() for path in paths if path is not None and str(path).strip()]
 
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        stale_cutoff = timedelta(days=self._STALE_ASSET_GRACE_DAYS)
-        prune_ids: List[str] = []
+    def _invalidate_recent_scope_cache(self) -> None:
+        self._recent_scope_cache_signature = None
+        self._recent_scope_cache_rows = []
+        self._recent_scope_cache_only_by_id = {}
 
-        assets = []
-        for asset_id, asset in self._asset_index.assets.items():
-            if not self._asset_file_exists(asset):
-                modified_at = asset.get("modified_at", "")
+    def _recent_scope_assets(self) -> List[Dict[str, Any]]:
+        """Project the MRU list into catalog assets or temporary, open-only rows."""
+        paths = self._recent_paths()
+        observations = []
+        for path in paths:
+            try:
+                candidate = Path(path)
+                stat = candidate.stat()
+                exists = candidate.is_file()
+                observations.append((
+                    path,
+                    exists,
+                    int(stat.st_size),
+                    int(stat.st_mtime_ns),
+                    int(stat.st_dev),
+                    int(stat.st_ino),
+                ))
+            except OSError:
+                observations.append((path, False, 0, 0, 0, 0))
+        signature = (self._catalog_epoch(), tuple(observations))
+        if signature == self._recent_scope_cache_signature:
+            return self._recent_scope_cache_rows
+
+        assets_by_path = {}
+        for asset in self._asset_index_assets().values():
+            key = self._project_path_key(asset.get("path"))
+            if key:
+                assets_by_path.setdefault(key, asset)
+
+        rows = []
+        seen_paths = set()
+        for path, exists, size, mtime_ns, st_dev, st_ino in observations:
+            path_key = self._project_path_key(path)
+            if not path_key or path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            asset = assets_by_path.get(path_key)
+            if asset is None:
+                asset_id = "recent:" + hashlib.sha256(path_key.encode("utf-8")).hexdigest()
+                asset = {
+                    "id": asset_id,
+                    "name": Path(path).stem,
+                    "name_origin": "stem",
+                    "display_name": Path(path).stem,
+                    "path": path,
+                    "folder_id": "",
+                    "exists": exists,
+                    "available": exists,
+                    "status": "",
+                    "has_preview": False,
+                    "file_size_bytes": size,
+                    "saved_at_unix_ns": mtime_ns,
+                    "stat_identity": {
+                        "size": size,
+                        "mtime_ns": mtime_ns,
+                        "st_dev": st_dev,
+                        "st_ino": st_ino,
+                    },
+                    "recent_only": True,
+                }
+            rows.append(asset)
+            if len(rows) >= 10:
+                break
+        self._recent_scope_cache_signature = signature
+        self._recent_scope_cache_rows = rows
+        self._recent_scope_cache_only_by_id = {
+            str(asset["id"]): asset for asset in rows if asset.get("recent_only")
+        }
+        return self._recent_scope_cache_rows
+
+    def _recent_only_assets(self) -> Dict[str, Dict[str, Any]]:
+        self._recent_scope_assets()
+        return self._recent_scope_cache_only_by_id
+
+    def _asset_index_folders(self) -> Dict[str, Dict[str, Any]]:
+        if self._library_service is not None:
+            folders = self._library_snapshot().get("folders", {})
+        elif self._catalog_preview is not None:
+            folders = self._catalog_preview.get("folders", {})
+        else:
+            folders = getattr(self._asset_index, "folders", {}) if self._asset_index else {}
+        return folders if isinstance(folders, dict) else {}
+
+    def _library_snapshot(self) -> Dict[str, Any]:
+        """Reuse the detached catalog snapshot until its epoch changes."""
+        epoch = self._catalog_epoch()
+        if self._catalog_snapshot is not None and self._catalog_snapshot_epoch == epoch:
+            return self._catalog_snapshot
+        if self._catalog_snapshot is not None and self._handle is not None:
+            self._refresh_catalog_snapshot_async()
+            return self._catalog_snapshot
+        snapshot = self._library_service.snapshot()
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        self._catalog_snapshot = snapshot
+        self._catalog_snapshot_epoch = snapshot.get("epoch", epoch)
+        self._row_catalog_generation += 1
+        return snapshot
+
+    def _refresh_catalog_snapshot_async(self) -> None:
+        if self._catalog_snapshot_refresh_active or self._library_service is None:
+            return
+        self._catalog_snapshot_refresh_active = True
+        service = self._library_service
+        generation = self._mount_generation
+
+        def worker() -> None:
+            try:
+                # Coalesce a burst of file verification updates before copying
+                # the catalog for the next visible card update.
+                time.sleep(0.05)
+                snapshot = service.snapshot()
+            except Exception:
+                _log.exception("Projects catalog snapshot refresh failed")
+                snapshot = None
+
+            def complete() -> None:
+                self._catalog_snapshot_refresh_active = False
+                if generation != self._mount_generation or not self._panel_mounted:
+                    return
+                if isinstance(snapshot, dict):
+                    self._catalog_snapshot = snapshot
+                    self._catalog_snapshot_epoch = snapshot.get("epoch")
+                    self._catalog_epoch_seen = self._catalog_snapshot_epoch
+                    self._row_catalog_generation += 1
+                    self._invalidate_recent_scope_cache()
+                    self._repair_selection()
+                    self._asset_window_refresh_pending = True
+                    self._folder_records_refresh_pending = True
+                    self._request_model_update()
+                    self._dirty_selection()
+                    self._start_inspection_refresh()
+                if self._catalog_snapshot_epoch != self._catalog_epoch():
+                    self._refresh_catalog_snapshot_async()
+
+            self._schedule_ui(complete)
+
+        threading.Thread(target=worker, daemon=True, name="AssetManagerSnapshot").start()
+
+    def _library_command(self, command: str, *args: Any, **kwargs: Any) -> Any:
+        if self._library_service is not None:
+            result = self._library_service._call(command, *args, **kwargs)
+        else:
+            result = getattr(self._asset_index, command)(*args, **kwargs)
+        self._row_catalog_generation += 1
+        reason = getattr(self._asset_index, "last_error", "")
+        if reason:
+            self._set_catalog_notice(reason)
+        return result
+
+    @staticmethod
+    def _native_io_call(name: str, *args: Any, **kwargs: Any) -> Any:
+        io = getattr(lf, "io", None)
+        function = getattr(io, name, None) if io is not None else None
+        if not callable(function):
+            raise RuntimeError(f"Project operation is unavailable: {name}")
+        return function(*args, **kwargs)
+
+    @staticmethod
+    def _active_project_path() -> str:
+        return active_project_path()
+
+    @staticmethod
+    def _thumbnail_source_availability(path: str) -> tuple[bool, bool]:
+        """Decode-probe image sources only while opening or confirming the dialog."""
+        try:
+            available = AssetManagerPanel._native_io_call(
+                "inspect_project_thumbnail_sources", path
+            )
+            return (
+                bool(getattr(available, "first_dataset_image", False)),
+                bool(getattr(available, "first_embedded_image", False)),
+            )
+        except Exception:
+            _log.debug("Could not inspect project thumbnail sources path=%s", path, exc_info=True)
+            return False, False
+
+    @staticmethod
+    def _is_active_project_path(path: str) -> bool:
+        return is_active_project_path(path)
+
+    @staticmethod
+    def _has_renderable_project_viewport(path: str) -> bool:
+        return has_renderable_project_viewport(path)
+
+    def _ensure_inspection_pipeline(self) -> InspectionFactsPipeline:
+        if self._inspection_pipeline is None:
+            scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+            self._inspection_pipeline = InspectionFactsPipeline(
+                lambda path: self._native_io_call("inspect_project_card", path),
+                self._inspect_contents,
+                self._on_inspection_result,
+                scheduler=scheduler if callable(scheduler) else None,
+            )
+        return self._inspection_pipeline
+
+    def _inspect_contents(self, path):
+        details = self._native_io_call("inspect_project_details", path)
+        plan = self._native_io_call("plan_reduce_size", path)
+        return {"details": details, "plan": plan, "card": getattr(details, "card", None)}
+
+    def _start_inspection_refresh(self) -> None:
+        if not self._asset_index or not self._panel_mounted or not self._handle:
+            return
+        entries = self._window_assets(self._filtered_assets())
+        selected = self.get_selected_asset_id()
+        self._ensure_inspection_pipeline().refresh(entries, selected)
+
+    def _on_inspection_result(self, asset_id: str, kind: str, result: Any, error: Optional[Exception]) -> None:
+        if not self._panel_mounted:
+            return
+        if self._contents_busy(asset_id):
+            return
+        if error is not None:
+            self._inspection_errors[asset_id] = str(error)
+            self._row_inspection_generation += 1
+            self._schedule_visible_records_refresh()
+            self._dirty_fields(
+                "selected_has_problem", "selected_health_label",
+                "catalog_notice", "has_catalog_notice",
+            )
+            return
+        cleared_error = self._inspection_errors.pop(asset_id, None)
+        if cleared_error is not None:
+            self._dirty_fields(
+                "selected_has_problem", "selected_health_label",
+                "catalog_notice", "has_catalog_notice",
+            )
+        if kind == "details" and isinstance(result, dict) and "details" in result:
+            self._inspection_by_asset.setdefault(asset_id, {})["plan"] = result["plan"]
+            result = result["details"]
+        self._inspection_by_asset.setdefault(asset_id, {})[kind] = result
+        self._row_inspection_generation += 1
+        if kind == "details":
+            iteration = self._details_iteration(result)
+            if iteration is not None:
+                self._cache_iteration(asset_id, iteration)
+            title = str(getattr(getattr(result, "card", None), "title", "") or "").strip()
+            if title:
+                self._queue_cached_title(asset_id, title)
+        self._schedule_visible_records_refresh()
+        self._dirty_selection()
+
+    def _queue_cached_title(self, asset_id: str, title: str) -> None:
+        current = self._asset_index_assets().get(asset_id, {})
+        if current.get("display_name") == title or self._library_service is None:
+            return
+        with self._title_cache_lock:
+            self._title_cache_pending[asset_id] = title
+            if self._title_cache_timer is not None:
+                return
+            timer = threading.Timer(0.4, self._flush_cached_titles)
+            timer.daemon = True
+            self._title_cache_timer = timer
+            timer.start()
+
+    def _flush_cached_titles(self) -> None:
+        with self._title_cache_lock:
+            titles = self._title_cache_pending
+            self._title_cache_pending = {}
+            self._title_cache_timer = None
+        if titles and self._library_service is not None:
+            try:
+                self._library_service._call("cache_display_names", titles)
+            except Exception:
+                _log.exception("Projects title cache update failed")
+
+    def _schedule_visible_records_refresh(self) -> None:
+        if callable(getattr(lf.ui, "schedule", None)):
+            if not self._asset_window_refresh_pending:
+                self._asset_window_refresh_pending = True
+                self._request_model_update()
+        else:
+            self._refresh_records(assets=True)
+
+    @staticmethod
+    def _details_iteration(details: Any) -> Optional[int]:
+        card = getattr(details, "card", None)
+        iteration = getattr(card, "iteration", None)
+        if iteration is not None:
+            try:
+                return int(iteration)
+            except (TypeError, ValueError):
+                pass
+        checkpoints = list(getattr(details, "retained_checkpoints", []) or [])
+        values = [getattr(item, "iteration", None) for item in checkpoints]
+        values = [int(item) for item in values if item is not None]
+        if values:
+            return max(values)
+        saves = list(getattr(details, "save_history", []) or [])
+        values = [getattr(item, "checkpoint_iteration", None) for item in saves]
+        values = [int(item) for item in values if item is not None]
+        return max(values) if values else None
+
+    def _cache_iteration(self, asset_id: str, iteration: int) -> None:
+        self._inspection_by_asset.setdefault(asset_id, {})["iteration"] = int(iteration)
+        self._row_inspection_generation += 1
+
+    def _cached_iteration(self, asset: Dict[str, Any]) -> Optional[int]:
+        cached = self._inspection_by_asset.get(asset.get("id"), {})
+        value = cached.get("iteration", asset.get("iteration"))
+        return int(value) if value is not None else None
+
+    def _selected_inspection(self) -> Dict[str, Any]:
+        return self._inspection_by_asset.get(self.get_selected_asset_id(), {})
+
+    def _selected_details_rows(self) -> Dict[str, Any]:
+        details = self._selected_inspection().get("details")
+        if details is None:
+            return {}
+        return details_rows(
+            self._get_selected_asset() or {},
+            details,
+            format_size=self._format_size,
+            format_time=self._format_unix_ns,
+        )
+
+    def get_operations_expanded(self) -> bool:
+        return self._operations_expanded is not False
+
+    def _contents_busy(self, asset_id):
+        return any(row.get("asset_id") == asset_id and row.get("status") == "running"
+                   for row in self._project_operations.values())
+
+    def get_contents_rows(self):
+        facts = self._selected_inspection()
+        rows = contents_rows(self._get_selected_asset() or {}, facts.get("details"), facts.get("plan"),
+                             tr=tr, format_size=self._format_size, format_time=self._format_contents_time,
+                             busy=self._contents_busy(self.get_selected_asset_id()))
+        feedback = self._contents_feedback.get(self.get_selected_asset_id(), {})
+        for row in rows:
+            if row["id"] == feedback.get("row_id"):
+                if feedback.get("status") == "running":
+                    row["pending"] = True
+                    if feedback.get("operation_kind") == "remove":
+                        row["detail"] = tr("projects.contents.removing").format(part=row["label"])
+                elif feedback.get("status") == "failed":
+                    row["error"] = feedback.get("reason", "")
+            row["has_detail"] = bool(row["detail"])
+            row["has_error"] = bool(row["error"])
+        return rows
+
+    @staticmethod
+    def _format_contents_time(value):
+        try:
+            if int(value) <= 0:
+                return ""
+            date = datetime.fromtimestamp(int(value) / 1_000_000_000)
+            return tr("projects.contents.date").format(day=date.day, month=tr(f"projects.contents.month.{date.month}"),
+                                                       year=date.year, time=date.strftime("%H:%M"))
+        except (OSError, OverflowError, TypeError, ValueError):
+            return ""
+
+    def get_contents_pending(self):
+        rows = pending_removals(self._selected_inspection().get("details"))
+        if not rows:
+            return ""
+        return tr("projects.contents.pending_total").format(size=self._format_size(sum(int(row.get("bytes", 0)) for row in rows)))
+
+    def _embed_contents_dataset(self, path, progress, cancel):
+        details = self._native_io_call("inspect_project_details", path)
+        legacy = next((ref for ref in details.references if ref.key == "training_parameters"), None)
+        if legacy is not None:
+            self._native_io_call("set_dataset_reference", path, str(legacy.path))
+        return self._native_io_call("embed_dataset_file", path, progress, cancel)
+
+    def on_contents_action(self, _handle=None, _event=None, args=None):
+        if not args or len(args) < 2:
+            return
+        row_id, action = str(args[0]), str(args[1])
+        row = next((row for row in self.get_contents_rows() if row["id"] == row_id), None)
+        asset = self._get_selected_asset()
+        if not asset or not row or row["disabled"]:
+            return
+        self._dialog_asset_id = asset["id"]
+        path = str(asset["path"])
+        if action == "remove":
+            if not row["removable"] or row["remove_disabled"]:
+                return
+            subject = row["label"]
+            message = tr("projects.contents.confirm_remove").format(part=subject, size=row["size"] or self._format_size(0))
+            if row.get("bound"):
+                message += "\n" + tr("projects.contents.keep_model")
+            self._set_dialog("remove_content", {"row": row, "message": message})
+        elif action == "clean":
+            self.open_project_operation(None, None, ["clean"])
+        elif action == "compact":
+            self._set_dialog("compact_content", {"message": tr("projects.contents.confirm_compact")})
+        elif action == "restore":
+            self._start_project_operation(asset["id"], tr("projects.contents.restore"),
+                lambda _progress, _cancel: self._native_io_call("restore_save", path, row["generation"], path),
+                content_row=row, operation_kind="restore")
+        elif action == "undo_remove":
+            self._start_project_operation(asset["id"], tr("projects.contents.undo"),
+                lambda _progress, _cancel: self._native_io_call("undo_contents_removal", path, row["removal_id"]),
+                content_row=row, operation_kind="undo")
+        elif action == "resume":
+            if row.get("bound"):
+                self._load_asset(asset["id"])
+            else:
+                self._start_project_operation(asset["id"], tr("projects.action.resume_training"),
+                    lambda _progress, _cancel: self._native_io_call("rebind_checkpoint", path, row["checkpoint_uuid"]),
+                    after=lambda: self._load_asset(asset["id"]))
+        elif action == "embed" and not row["action_disabled"]:
+            self._start_project_operation(asset["id"], tr("projects.action.embed_dataset"),
+                lambda progress, cancel: self._embed_contents_dataset(path, progress, cancel))
+        elif action == "locate":
+            directory = lf.ui.open_folder_dialog(tr("projects.dialog.select_dataset"), str(Path(path).parent))
+            if directory:
+                self._start_project_operation(asset["id"], tr("projects.action.locate_dataset"),
+                    lambda _progress, _cancel: self._native_io_call("set_dataset_reference", path, directory))
+        elif action in {"thumbnail", "license"}:
+            self.open_project_operation(None, None, ["update_thumbnail" if action == "thumbnail" else "license"])
+
+    def toggle_operations(self, _handle=None, _ev=None, _args=None) -> None:
+        self._operations_expanded = not self.get_operations_expanded()
+        self._dirty_fields("inspector_operations_expanded")
+        self._persist_project_manager_state()
+
+    def toggle_inspector_section(self, _handle=None, _ev=None, args=None) -> None:
+        section = str(args[0]) if args else ""
+        if section in self._inspector_sections:
+            self._inspector_sections[section] = not self._inspector_sections[section]
+            self._dirty_fields("inspector_" + section + "_expanded")
+            self._persist_project_manager_state()
+
+    def open_inspector_menu(self, _handle=None, _ev=None, _args=None) -> None:
+        asset_id = self.get_selected_asset_id()
+        if asset_id:
+            self._show_asset_context_menu(asset_id)
+
+    def _inspector_fact_summary(self, primary, secondary, prefix="") -> str:
+        facts = self._selected_details_rows()
+        parts = [str(facts.get(primary, ""))]
+        if facts.get(secondary) not in (None, ""):
+            parts.append(prefix + str(facts[secondary]))
+        return " · ".join(part for part in parts if part)
+
+    def _schedule_ui(self, callback: Callable[[], None]) -> None:
+        scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+        if callable(scheduler):
+            try:
+                scheduler(callback)
+            except Exception:
+                _log.exception("Schedule Projects callback failed path=%s", self.STORAGE_PATH)
+                self._ui_callbacks.put(callback)
                 try:
-                    ts = datetime.fromisoformat(modified_at.replace("Z", "+00:00")).replace(tzinfo=None)
-                    if now - ts > stale_cutoff:
-                        prune_ids.append(asset_id)
-                except (ValueError, AttributeError):
-                    prune_ids.append(asset_id)
-                continue
+                    self._request_model_update()
+                except Exception:
+                    _log.exception("Wake Projects UI failed path=%s", self.STORAGE_PATH)
+        else:
+            callback()
 
-            if (
-                self._selected_project_id
-                and asset.get("project_id") != self._selected_project_id
-            ):
-                continue
-            if (
-                self._selected_scene_id
-                and asset.get("scene_id") != self._selected_scene_id
-            ):
-                continue
+    def _drain_ui_callbacks(self):
+        while not self._ui_callbacks.empty():
+            callback = self._ui_callbacks.get_nowait()
+            try:
+                callback()
+            except Exception as exc:
+                _log.exception("Projects callback failed path=%s", self.STORAGE_PATH)
+                self._set_catalog_notice(str(exc))
 
-            # Multi-select filter logic: if any filters selected, asset must match at least one
-            if self._active_filters:
-                matches_filter = False
-
-                # Splat filter: 3DGS PLY files, SOG files, and legacy PLY (Gaussian splats)
-                if "splat" in self._active_filters:
-                    if asset.get("type") in ("ply_3dgs", "sog", "ply"):
-                        matches_filter = True
-
-                # PCL filter: Regular point cloud PLY files
-                if "pcl" in self._active_filters:
-                    if asset.get("type") == "ply_pcl":
-                        matches_filter = True
-
-                # Dataset filter: source datasets
-                if "dataset" in self._active_filters:
-                    if asset.get("type") == "dataset" or asset.get("role") == "source_dataset":
-                        matches_filter = True
-
-                # Checkpoint filter: training checkpoints
-                if "checkpoint" in self._active_filters:
-                    if asset.get("type") == "checkpoint":
-                        matches_filter = True
-
-                if not matches_filter:
-                    continue
-
-            # Check search query - simple string match
-            if self._search_query and not self._asset_matches_query(
-                asset, self._search_query
-            ):
-                continue
-
-            assets.append(self._format_asset_for_ui(asset))
-
-        if prune_ids and hasattr(self._asset_index, "delete_asset"):
-            for pid in prune_ids:
-                self._asset_index.delete_asset(pid)
-            if hasattr(self._asset_index, "save"):
-                self._asset_index.save()
-
-        return self._sort_assets(assets)
+    def _default_folder_id(self) -> Optional[str]:
+        folders = self._asset_index_folders()
+        if "default" in folders:
+            return "default"
+        return min(folders, key=lambda folder_id: self._sort_text(folders[folder_id].get("name"))) if folders else None
 
     def _asset_matches_query(self, asset: Dict[str, Any], query: str) -> bool:
-        """Fuzzy search by asset name only.
-
-        Matches if all characters in query appear in the asset name in order.
-        Example: 'pt' matches 'points3D', 'tester', 'point_cloud'
-        """
-        query_l = query.strip().lower()
-        if not query_l:
+        if not query:
             return True
-
-        asset_name = asset.get("name", "").lower()
-        if not asset_name:
-            return False
-
-        # Fuzzy match: each query char must appear in name in order
-        query_idx = 0
-        name_idx = 0
-        query_len = len(query_l)
-        name_len = len(asset_name)
-
-        while query_idx < query_len and name_idx < name_len:
-            if query_l[query_idx] == asset_name[name_idx]:
-                query_idx += 1
-            name_idx += 1
-
-        # Match if we found all query characters in order
-        return query_idx == query_len
-
-    def _sort_assets(self, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Sort assets based on current sort mode."""
-        if self._sort_mode == "name":
-            return sorted(assets, key=lambda a: a.get("name", "").lower())
-        if self._sort_mode == "size":
-            return sorted(
-                assets, key=lambda a: a.get("file_size_bytes", 0), reverse=True
+        haystack = " ".join(
+            str(value)
+            for value in (
+                asset.get("name"),
+                self._get_asset_display_name(asset),
+                asset.get("path"),
+                asset.get("type"),
+                asset.get("project_uuid"),
+                self._folder_name(asset.get("folder_id")),
+                "licht project",
             )
-        if self._sort_mode == "type":
-            return sorted(assets, key=lambda a: a.get("type", "").lower())
-        return sorted(assets, key=lambda a: a.get("name", "").lower())
+        ).casefold()
+        return query in haystack
 
-    def _thumbnail_decorator(self, asset: Dict[str, Any]) -> str:
-        thumbnail_path = asset.get("thumbnail_path") or ""
-        if not thumbnail_path:
+    def _asset_matches_filter(self, asset: Dict[str, Any]) -> bool:
+        active = self._active_filter
+        if active == "all":
+            return True
+        if active == "local":
+            return not bool(asset.get("remote_only")) and bool(asset.get("exists", True))
+        facts = self._gallery_facts(asset)
+        scene = self._gallery_scene(asset)
+        if active == "attention":
+            return bool(facts.get("attention"))
+        if active == "not_published":
+            return scene is None and not asset.get("remote_only")
+        if active == "published":
+            return scene is not None
+        if active == "missing":
+            return not asset.get("remote_only") and (
+                not bool(asset.get("exists", True))
+                or str(asset.get("status") or "") == "MISSING"
+            )
+        if active == "checkpoint":
+            return bool((asset.get("inspection") or {}).get("has_checkpoint"))
+        if active == "dataset":
+            return bool((asset.get("inspection") or {}).get("has_dataset"))
+        if active == "gallery":
+            return bool(asset.get("remote_only"))
+        return True
+
+    def _repair_selection(self) -> None:
+        assets = self._all_display_assets()
+        if self._selected_folder_id == SCOPE_RECENT:
+            assets.update(self._recent_only_assets())
+        folders = self._asset_index_folders()
+        selected = self._selected_asset_ids.intersection(assets)
+        cursor = self._selection_cursor_id
+        if cursor not in assets:
+            cursor = next(iter(selected), None)
+        self._set_asset_selection(selected, cursor=cursor)
+        if self._selected_folder_id not in {*folders, SCOPE_ALL, SCOPE_LOCAL, SCOPE_RECENT, *GALLERY_SCOPES}:
+            self._selected_folder_id = SCOPE_ALL
+        self._update_selection_type()
+
+    def _set_asset_selection(
+        self,
+        asset_ids,
+        *,
+        cursor=_SELECTION_UNCHANGED,
+        anchor=_SELECTION_UNCHANGED,
+    ) -> bool:
+        """Apply selection changes while keeping open previews attached to the cursor."""
+        selected = set(asset_ids)
+        changed = selected != self._selected_asset_ids
+        self._selected_asset_ids = selected
+        if cursor is not _SELECTION_UNCHANGED:
+            self._selection_cursor_id = cursor
+        elif self._selection_cursor_id not in selected:
+            self._selection_cursor_id = next(iter(selected), None)
+        if anchor is not _SELECTION_UNCHANGED:
+            self._selection_anchor_id = anchor
+        elif self._selection_anchor_id not in selected:
+            self._selection_anchor_id = self._selection_cursor_id
+        if changed and self._inspector_expanded and not selected:
+            self._inspector_expanded = False
+            self._dirty_inspector_layout()
+        self._update_selection_type()
+        return changed
+
+    def _update_selection_type(self) -> None:
+        if len(self._selected_asset_ids) > 1:
+            self._selection_type = "multiple"
+        elif len(self._selected_asset_ids) == 1:
+            self._selection_type = "asset"
+        elif self._selected_folder_id in self._asset_index_folders():
+            self._selection_type = "folder"
+        else:
+            self._selection_type = "none"
+
+    def _folder_name(self, folder_id: Any) -> str:
+        folder = self._asset_index_folders().get(str(folder_id), {})
+        return str(folder.get("name") or "")
+
+    def _project_available(self, asset: Dict[str, Any]) -> bool:
+        if "available" in asset:
+            return bool(asset.get("available"))
+        return bool(asset.get("exists", True))
+
+    def _project_status_label(self, asset: Dict[str, Any]) -> str:
+        status = str(asset.get("status") or "UNVERIFIED")
+        key = {
+            "AVAILABLE": "projects.status.available",
+            "MISSING": "projects.status.missing",
+            "UNREADABLE": "projects.status.unreadable",
+            "UNSUPPORTED": "projects.status.unreadable",
+            "IDENTITY_MISMATCH": "projects.status.identity_mismatch",
+            "REPAIR_ONLY": "projects.status.needs_repair",
+            "UNSUPPORTED_NEWER": "projects.status.newer_version",
+        }.get(status, "projects.status.unverified")
+        return tr(key)
+
+    def _get_asset_display_name(self, asset: Dict[str, Any]) -> str:
+        asset_id = str(asset.get("id") or asset.get("project_uuid") or "")
+        details = self._inspection_by_asset.get(asset_id, {}).get("details")
+        title = str(getattr(getattr(details, "card", None), "title", "") or "")
+        if title.strip():
+            return title.strip()
+        if "display_name" in asset and asset.get("display_name"):
+            return str(asset["display_name"])
+        if callable(globals().get("display_name")):
+            value = display_name(asset)
+            if value:
+                return value
+        path = str(asset.get("path") or "")
+        path_stem = Path(path).stem if path else ""
+        return str(asset.get("name") or path_stem or tr("projects.unnamed"))
+
+    @staticmethod
+    def _thumbnail_image_decorator(source: str) -> str:
+        assert " " not in source
+        return f"image({source} {_THUMBNAIL_FIT_ALIGN})"
+
+    @staticmethod
+    def _thumbnail_source_from_decorator(decorator: str) -> str:
+        if not decorator.startswith("image(") or not decorator.endswith(")"):
+            return ""
+        inner = decorator[len("image(") : -1]
+        suffix = f" {_THUMBNAIL_FIT_ALIGN}"
+        if inner.endswith(suffix):
+            inner = inner[: -len(suffix)]
+        return inner
+
+    @staticmethod
+    def _thumbnail_decorator(asset: Dict[str, Any]) -> str:
+        poster = asset.get("poster_path")
+        if poster and (asset.get("prefer_poster") or not ((asset.get("has_preview") and asset.get("exists")) or asset.get("fallback_preview_path"))):
+            return AssetManagerPanel._thumbnail_decorator({"fallback_preview_path": poster})
+        if asset.get("has_preview") and asset.get("exists"):
+            path = quote(str(asset.get("path") or ""), safe=_RML_PATH_SAFE_CHARS)
+            revision_value = asset.get("commit_uuid") or "-".join(
+                str(asset.get(field) or 0)
+                for field in ("generation", "saved_at_unix_ns", "file_size_bytes")
+            )
+            revision = quote(str(revision_value), safe="-._~")
+            dimensions = ""
+            preview_width = int(asset.get("preview_width") or 0)
+            preview_height = int(asset.get("preview_height") or 0)
+            if preview_width > 0 and preview_height > 0:
+                dimensions = f"&w={preview_width}&h={preview_height}"
+            return AssetManagerPanel._thumbnail_image_decorator(
+                f"preview://kind=licht&thumb=256&rev={revision}{dimensions}&path={path}"
+            )
+        fallback = str(asset.get("fallback_preview_path") or "")
+        if not fallback:
             return "none"
+        fallback_path = Path(fallback)
         try:
-            path = Path(str(thumbnail_path)).expanduser()
-            if not path.exists():
+            if not fallback_path.is_file():
                 return "none"
-            return f"image({_encode_rml_image_path(path.as_posix())})"
-        except Exception:
+            stat = fallback_path.stat()
+        except OSError:
             return "none"
+        revision = quote(f"{stat.st_size}-{stat.st_mtime_ns}", safe="-._~")
+        encoded = quote(fallback, safe=_RML_PATH_SAFE_CHARS)
+        dimensions = ""
+        preview_width = int(asset.get("preview_width") or 0)
+        preview_height = int(asset.get("preview_height") or 0)
+        if preview_width > 0 and preview_height > 0:
+            dimensions = f"&w={preview_width}&h={preview_height}"
+        return AssetManagerPanel._thumbnail_image_decorator(
+            f"preview://kind=image&thumb=256&rev={revision}{dimensions}&path={encoded}"
+        )
+
+    def _sync_info_thumbnail(self, doc):
+        query = getattr(doc, "query_selector", None)
+        header = query(".asset-info-header") if callable(query) else None
+        if header is None:
+            return False
+        element = doc.get_element_by_id("asset-info-thumbnail")
+        asset = self._get_selected_asset() or {}
+        decorator = self._thumbnail_decorator(self._asset_with_poster(asset)) if asset else "none"
+        source = self._thumbnail_source_from_decorator(decorator)
+        created = element is None
+        if element is None:
+            layout = query(".asset-info-asset-layout") if callable(query) else None
+            details = query(".asset-info-details") if callable(query) else None
+            if layout is not None and layout is not header and details is not None and details is not header:
+                element = layout.insert_before("div", details)
+            else:
+                element = header.parent().insert_before("div", header)
+            element.set_id("asset-info-thumbnail")
+        placeholder = element.query_selector(".asset-thumbnail-placeholder")
+        if placeholder is None:
+            placeholder = element.append_child("span")
+            placeholder.set_class_names("asset-thumbnail-placeholder asset-info-thumbnail-placeholder")
+            placeholder.set_attribute("aria-hidden", "true")
+            image = placeholder.append_child("img")
+            image.set_attribute("src", "../icon/lichtfeld.png")
+            image.set_attribute("alt", "")
+        placeholder_title = self._get_asset_display_name(asset) if asset else ""
+        placeholder_title_changed = placeholder.get_attribute("title", "") != placeholder_title
+        if placeholder_title_changed:
+            placeholder.set_attribute("title", placeholder_title)
+        # Leave 12 dp gutters and 4 dp for the side inspector's scrollbar.
+        # Side inspectors use their content width. The stacked inspector caps
+        # its poster so opening it never consumes the whole results viewport.
+        gutters = 2.0 * ASSET_INSPECTOR_GUTTER_DP
+        width = (max(0.0, self._inspector_width - gutters - ASSET_INSPECTOR_SCROLLBAR_DP)
+                 if self._layout_class in ("wide", "medium")
+                 else min(ASSET_STACKED_THUMBNAIL_MAX_WIDTH_DP, max(0.0, self._content_width - gutters))
+                 if self._layout_class in ("compact", "narrow") else ASSET_INFO_THUMBNAIL_DEFAULT_WIDTH_DP)
+        geometry = (width, width * 10.0 / 16.0)
+        geometry_changed = geometry != self._info_thumbnail_geometry
+        if created or geometry_changed:
+            self._info_thumbnail_geometry = geometry
+            element.set_property("width", f"{geometry[0]:.2f}dp")
+            element.set_property("height", f"{geometry[1]:.2f}dp")
+            # Every responsive layout stacks the preview above the details, so
+            # the flex main axis is vertical. Keep the basis equal to the 16:10
+            # preview height; using its width in the medium breakpoint expands
+            # the element to a square while the Contents inspector is visible.
+            element.set_property("flex-basis", f"{geometry[1]:.2f}dp")
+        changed = source != self._info_thumbnail_source
+        if changed:
+            release = getattr(lf.ui, "release_rml_texture", None)
+            if self._info_thumbnail_source and callable(release):
+                release(self._info_thumbnail_source)
+            self._info_thumbnail_source = source
+            element.set_property("decorator", decorator)
+        placeholder_display = "none" if source else "flex"
+        placeholder_display_changed = placeholder.get_property("display") != placeholder_display
+        if placeholder_display_changed:
+            placeholder.set_property("display", placeholder_display)
+        element_display = "flex" if asset else "none"
+        visibility_changed = element.get_property("display") != element_display
+        if visibility_changed:
+            element.set_property("display", element_display)
+        return (changed or created or geometry_changed or placeholder_title_changed or
+                placeholder_display_changed or visibility_changed)
+
+    def _asset_with_inspection(self, asset: Dict[str, Any]) -> Dict[str, Any]:
+        asset_id = str(asset.get("id") or asset.get("project_uuid") or "")
+        inspected = self._inspection_by_asset.get(asset_id, {})
+        details = inspected.get("details")
+        card = getattr(details, "card", None) or inspected.get("card")
+        result = dict(asset)
+        if card is not None:
+            # Native values are fresher than catalog or temporary Recent rows.
+            result.update({
+                "has_preview": bool(getattr(card, "has_preview", result.get("has_preview"))),
+                "preview_width": int(getattr(card, "preview_width", result.get("preview_width", 0)) or 0),
+                "preview_height": int(getattr(card, "preview_height", result.get("preview_height", 0)) or 0),
+                "file_size_bytes": int(getattr(card, "physical_file_size", result.get("file_size_bytes", 0)) or 0),
+                "saved_at_unix_ns": int(getattr(card, "saved_at_unix_ns", result.get("saved_at_unix_ns", 0)) or 0),
+                "commit_uuid": str(getattr(card, "commit_uuid", result.get("commit_uuid", "")) or result.get("commit_uuid", "")),
+                "native_project_uuid": str(getattr(card, "project_uuid", "") or ""),
+            })
+        if result.get("recent_only") and asset_id in self._inspection_errors:
+            result["status"] = "UNREADABLE"
+            result["inspection_error"] = self._inspection_errors[asset_id]
+        return result
 
     def _format_asset_for_ui(self, asset: Dict[str, Any]) -> Dict[str, Any]:
-        """Format asset data for UI display."""
-        asset_id = asset.get("id", "")
-        asset_type = asset.get("type", "")
-        file_size_bytes = self._coerce_nonnegative_int(
-            asset.get("file_size_bytes", 0)
-        )
-
-        # Format size string
-        size_str = self._format_size(file_size_bytes)
-
-        # Get geometry metadata
-        geom = asset.get("geometry_metadata", {}) or {}
-        gaussian_count = self._coerce_nonnegative_int(
-            geom.get("gaussian_count", 0)
-        )
-        dataset_meta = asset.get("dataset_metadata", {}) or {}
-
-        # Format gaussian count
-        if asset_type == "dataset":
-            image_count = self._coerce_nonnegative_int(
-                dataset_meta.get("image_count", 0)
-            )
-            if image_count >= 1_000_000:
-                points_str = f"{image_count / 1_000_000:.2f}M images"
-            elif image_count >= 1_000:
-                points_str = f"{image_count / 1_000:.1f}K images"
-            else:
-                points_str = f"{image_count} images" if image_count else ""
-        elif gaussian_count >= 1_000_000:
-            points_str = f"{gaussian_count / 1_000_000:.2f}M Gaussians"
-        elif gaussian_count >= 1_000:
-            points_str = f"{gaussian_count / 1_000:.1f}K Gaussians"
+        asset = self._asset_with_inspection(asset)
+        asset_id = str(asset.get("id") or asset.get("project_uuid") or "")
+        folder_name = self._folder_name(asset.get("folder_id"))
+        thumbnail_decorator = self._thumbnail_decorator(self._asset_with_poster(asset))
+        thumbnail_source = self._thumbnail_source_from_decorator(thumbnail_decorator)
+        previous_source = self._thumbnail_sources_by_asset.get(asset_id, "")
+        if previous_source and previous_source != thumbnail_source:
+            release_texture = getattr(lf.ui, "release_rml_texture", None)
+            if callable(release_texture):
+                release_texture(previous_source)
+        if thumbnail_source:
+            self._thumbnail_sources_by_asset[asset_id] = thumbnail_source
         else:
-            points_str = f"{gaussian_count} Gaussians" if gaussian_count else ""
-
-        # Determine thumbnail class based on type
-        thumb_classes = {
-            "ply_3dgs": "asset-thumb-splat",
-            "ply_pcl": "asset-thumb-splat",
-            "ply": "asset-thumb-splat",
-            "rad": "asset-thumb-splat",
-            "sog": "asset-thumb-splat",
-            "spz": "asset-thumb-splat",
-            "checkpoint": "asset-thumb-checkpoint",
-            "dataset": "asset-thumb-dataset",
-        }
-        thumb_class = thumb_classes.get(asset_type, "asset-thumb-default")
-
-        project_name, scene_name = self._get_asset_relationship_names(asset)
-        display_fields = self._get_asset_display_fields(
-            asset, project_name, scene_name
-        )
-
-        # Format type label for display
-        type_labels = {
-            "ply_3dgs": tr("asset_manager.type.splat"),
-            "ply_pcl": tr("asset_manager.type.pcl"),
-            "ply": tr("asset_manager.type.splat"),  # Legacy PLY type
-            "rad": tr("asset_manager.type.rad"),
-            "sog": tr("asset_manager.type.sog"),
-            "spz": tr("asset_manager.type.spz"),
-            "checkpoint": tr("asset_manager.type.checkpoint"),
-            "dataset": tr("asset_manager.type.dataset"),
-            "mesh": tr("asset_manager.type.mesh"),
-            "usd": tr("asset_manager.type.usd"),
-        }
-        type_label = type_labels.get(asset_type, asset_type.upper() if asset_type else "")
-
+            self._thumbnail_sources_by_asset.pop(asset_id, None)
+        display_name = self._get_asset_display_name(asset)
         return {
+            **asset,
+            **self._gallery_badge(asset),
+            "display_name": display_name,
             "id": asset_id,
-            "name": asset.get("name", "Unnamed"),
-            "display_name": display_fields["display_name"],
-            "display_subtitle": display_fields["display_subtitle"],
-            "context_label": display_fields["context_label"],
-            "type": asset_type,
-            "role": asset.get("role", ""),
-            "type_label": type_label,
-            "role_label": asset.get("role", "").replace("_", " ").title(),
-            "size_label": size_str,
-            "file_size_bytes": file_size_bytes,
-            "points_label": points_str,
-            "gaussian_count": gaussian_count,
-            # Record-list rows only support scalar fields in the current RML bridge.
-            "tags_label": ", ".join(asset.get("tags", [])) if asset.get("tags") else "",
-            "thumb_class": thumb_class,
-            "thumb_label": asset_type.upper() if asset_type else tr("asset_manager.type.asset"),
-            "thumbnail_decorator": self._thumbnail_decorator(asset),
-            "pill_class": f"asset-pill-{asset_type}" if asset_type else "",
-            "is_selected": asset_id in self._selected_asset_ids,
-            "exists": asset.get("exists", True),
-            "status_label": tr("asset_manager.status.missing") if not asset.get("exists", True) else tr("asset_manager.status.available"),
-            "can_load": asset_type in self.LOADABLE_TYPES and asset.get("exists", True),
-            "project_id": asset.get("project_id"),
-            "scene_id": asset.get("scene_id"),
-            "project_name": project_name,
-            "scene_name": scene_name,
-            "modified_at": asset.get("modified_at", ""),
-            "modified_label": self._format_timestamp(asset.get("modified_at", "")),
-            "thumbnail_path": asset.get("thumbnail_path"),
-            "menu_open": asset_id == self._open_menu_asset_id,
-            "load_menu_open": asset_id == self._load_menu_asset_id,
+            "folder_name": folder_name,
+            "size_label": self._format_size(asset.get("file_size_bytes", 0)),
+            "saved_label": self._format_unix_ns(asset.get("saved_at_unix_ns", 0)),
+            "status_label": self._project_status_label(asset),
+            "health_label": self._project_status_label(asset),
+            "has_problem": str(asset.get("status") or "") not in ("", "AVAILABLE", "READING"),
+            "is_selected": str(asset.get("id") or asset.get("project_uuid"))
+            in self._selected_asset_ids,
+            "has_preview": bool(asset.get("has_preview")),
+            "shows_placeholder": thumbnail_decorator == "none",
+            "can_load": self._project_available(asset) and not asset.get("recent_only"),
+            "thumbnail_decorator": thumbnail_decorator,
         }
 
-    def get_project_list(self) -> List[Dict[str, Any]]:
-        """Return list of projects with asset counts for UI."""
-        if not self._asset_index or not hasattr(self._asset_index, "projects"):
-            return []
+    def _release_obsolete_thumbnail_sources(self) -> None:
+        live_ids = set(self._asset_index_assets())
+        live_ids.update(self._gallery_remote_assets())
+        live_ids.update(self._recent_only_assets())
+        stale_ids = set(self._thumbnail_sources_by_asset).difference(live_ids)
+        release_texture = getattr(lf.ui, "release_rml_texture", None)
+        for asset_id in stale_ids:
+            source = self._thumbnail_sources_by_asset.pop(asset_id)
+            if callable(release_texture):
+                release_texture(source)
 
-        # Ensure Default project always exists
-        self._ensure_default_project()
+    def _release_thumbnails_outside_window(self) -> None:
+        visible = {
+            str(asset.get("id") or asset.get("project_uuid") or "")
+            for asset in self._window_assets(self._filtered_assets())
+        }
+        release_texture = getattr(lf.ui, "release_rml_texture", None)
+        for asset_id in set(self._thumbnail_sources_by_asset).difference(visible):
+            source = self._thumbnail_sources_by_asset.pop(asset_id)
+            if callable(release_texture):
+                release_texture(source)
 
-        projects = []
-        for project_id, project in self._asset_index.projects.items():
-            # Show all projects, even empty ones (user must manually delete)
-            asset_count = self._project_asset_count(project_id)
-            display_name = self._format_display_name(project.get("name", tr("asset_manager.unnamed_project")))
-            projects.append(
-                {
-                    "id": project_id,
-                    "name": display_name,
-                    "full_name": project.get("name", tr("asset_manager.unnamed_project")),
-                    "description": project.get("description", ""),
-                    "scene_count": asset_count,  # Now shows asset count instead of scene count
-                    "is_selected": project_id == self._selected_project_id,
-                    "thumbnail_asset_id": project.get("thumbnail_asset_id"),
-                    "menu_open": project_id == self._open_menu_project_id,
-                }
-            )
-
-        return sorted(projects, key=lambda p: p["name"].lower())
-
-    def get_scene_list(self) -> List[Dict[str, Any]]:
-        """Return list of scenes for selected project."""
-        if not self._asset_index or not hasattr(self._asset_index, "scenes"):
-            return []
-
-        if not self._selected_project_id:
-            return []
-
-        scenes = []
-        for scene_id, scene in self._asset_index.scenes.items():
-            if scene.get("project_id") != self._selected_project_id:
+    def _filtered_assets(self, folder_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        folder_id = self._selected_folder_id if folder_id is None else folder_id
+        query = self._search_query.strip().casefold()
+        cacheable = (folder_id == SCOPE_ALL or folder_id in self._asset_index_folders()) and self._sort_mode != "opened"
+        epoch = (self._catalog_snapshot_epoch if self._library_service is not None
+                 else self._catalog_epoch())
+        language = lf.ui.get_current_language()
+        if language != self._row_language:
+            self._row_language = language
+            self._row_language_generation += 1
+        cache_key = (
+            self._row_catalog_generation, epoch,
+            folder_id, query, self._active_filter, self._sort_mode,
+            self._sort_descending, self._gallery_rows_generation,
+            self._row_inspection_generation, self._row_folder_generation,
+            self._row_language_generation,
+        ) if cacheable and (epoch is not None or self._catalog_preview is not None) else None
+        if cache_key is not None and cache_key == self._filtered_cache_key:
+            self._last_asset_match_count = len(self._filtered_cache_rows)
+            self._last_asset_scope_count = self._filtered_cache_scope_count
+            return self._filtered_cache_rows
+        rows: List[Dict[str, Any]] = []
+        scope_count = 0
+        if folder_id == SCOPE_RECENT:
+            source = self._recent_scope_assets()
+        elif folder_id in GALLERY_SCOPES:
+            source = self._gallery_rows(folder_id == SCOPE_ATTENTION)
+        elif folder_id == SCOPE_ALL:
+            source = self._all_display_assets().values()
+        else:
+            source = self._asset_index_assets().values()
+        for asset in source:
+            if folder_id not in (None, SCOPE_ALL, SCOPE_LOCAL, SCOPE_RECENT, *GALLERY_SCOPES) and asset.get("folder_id") != folder_id:
                 continue
-            # Show all scenes, even empty ones (user must manually delete)
-            asset_count = self._scene_asset_count(scene_id)
-            scenes.append(
-                {
-                    "id": scene_id,
-                    "name": scene.get("name", tr("asset_manager.unnamed_scene")),
-                    "description": scene.get("description", ""),
-                    "asset_count": asset_count,
-                    "is_selected": scene_id == self._selected_scene_id,
-                    "thumbnail_asset_id": scene.get("thumbnail_asset_id"),
-                }
-            )
+            if not self._asset_matches_query(asset, query):
+                continue
+            scope_count += 1
+            if not self._asset_matches_filter(asset):
+                continue
+            rows.append(asset)
+        if folder_id != SCOPE_RECENT:
+            recent = {str(Path(path)): -rank for rank, path in enumerate(
+                getattr(lf, "project_recent_files", lambda: [])())} if self._sort_mode == "opened" else {}
+            links = self._gallery_state.get("links", {})
+            def sort_value(asset):
+                name = self._sort_text(self._get_asset_display_name(asset))
+                if self._sort_mode == "name":
+                    value = name
+                elif self._sort_mode == "saved":
+                    value = int(asset.get("saved_at_unix_ns") or asset.get("mtime_ns") or 0)
+                elif self._sort_mode == "size":
+                    value = int(asset.get("file_size_bytes") or 0)
+                elif self._sort_mode == "iteration":
+                    value = self._cached_iteration(asset) or 0
+                elif self._sort_mode == "opened":
+                    value = recent.get(str(Path(asset.get("path") or "")), -len(recent) - 1)
+                elif self._sort_mode == "published":
+                    value = float(links.get(asset.get("id"), {}).get("exchangedAt") or 0)
+                elif self._sort_mode == "gallery":
+                    value = self._sort_text(self._gallery_badge(asset)["gallery_label"])
+                else:
+                    value = self._sort_text(self._folder_name(asset.get("folder_id")))
+                return value, name
+            rows.sort(key=sort_value, reverse=self._sort_descending)
+        self._last_asset_match_count = len(rows)
+        self._last_asset_scope_count = scope_count
+        if cache_key is not None:
+            self._filtered_cache_key = cache_key
+            self._filtered_cache_rows = rows
+            self._filtered_cache_scope_count = scope_count
+        return rows
 
-        return sorted(scenes, key=lambda s: s["name"].lower())
+    def _gallery_window_metrics(self, client_width: float) -> tuple[int, float, float]:
+        if self._layout_class:
+            columns = grid_columns(client_width, self.get_thumbnail_size())
+            slot_width = grid_slot_width(client_width, self.get_thumbnail_size())
+            row_height = card_geometry(max(1.0, slot_width - 2.0))["height"] + 14.0
+        else:
+            columns = gallery_columns(client_width)
+            slot_width = gallery_slot_width(client_width)
+            row_height = ASSET_GALLERY_ROW_HEIGHT_DP
+        return columns, slot_width, row_height
 
-    def get_filter_list(self) -> List[Dict[str, Any]]:
-        """Return list of filter categories with counts (multi-select checkboxes)."""
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return self._get_default_filters()
+    def _update_gallery_window_geometry(self, total: int) -> tuple[int, int]:
+        columns, slot_width, row_height = self._gallery_window_metrics(
+            self._asset_window_client_width
+        )
+        self._asset_card_slot_width = slot_width
+        scroll_top = self._asset_window_scroll_top
+        client_height = self._asset_window_client_height
+        first_row = max(0, int(scroll_top // row_height) - ASSET_WINDOW_OVERSCAN_ROWS)
+        start_row = first_row // ASSET_WINDOW_BATCH_ROWS * ASSET_WINDOW_BATCH_ROWS
+        visible_rows = (
+            math.ceil(client_height / row_height)
+            if client_height > 0
+            else ASSET_GALLERY_FALLBACK_ROWS
+        ) + ASSET_WINDOW_OVERSCAN_ROWS * 2 + ASSET_WINDOW_BATCH_ROWS - 1
+        start = min(total, start_row * columns)
+        end = min(total, (start_row + visible_rows) * columns)
+        total_rows = math.ceil(total / columns) if total else 0
+        end_row = math.ceil(end / columns) if end else 0
+        self._asset_gallery_top_spacer_height = start_row * row_height
+        self._asset_gallery_bottom_spacer_height = max(0, total_rows - end_row) * row_height
+        self._asset_list_top_spacer_height = 0.0
+        self._asset_list_bottom_spacer_height = 0.0
+        return start, end
 
-        assets = [
-            a
-            for a in self._asset_index.assets.values()
-            if self._asset_file_exists(a)
+    def _window_assets(self, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        total = len(assets)
+        scroll_top = self._asset_window_scroll_top
+        client_height = self._asset_window_client_height
+        if self._view_mode == "gallery":
+            start, end = self._update_gallery_window_geometry(total)
+        else:
+            row_height = ASSET_LIST_ROW_HEIGHT_DP
+            first = max(0, int(scroll_top // row_height) - ASSET_WINDOW_OVERSCAN_ROWS)
+            start = first // ASSET_WINDOW_BATCH_ROWS * ASSET_WINDOW_BATCH_ROWS
+            visible = (
+                math.ceil(client_height / row_height)
+                if client_height > 0
+                else ASSET_LIST_FALLBACK_ROWS
+            ) + ASSET_WINDOW_OVERSCAN_ROWS * 2 + ASSET_WINDOW_BATCH_ROWS - 1
+            end = min(total, start + visible)
+            self._asset_list_top_spacer_height = start * row_height
+            self._asset_list_bottom_spacer_height = max(0, total - end) * row_height
+            self._asset_gallery_top_spacer_height = 0.0
+            self._asset_gallery_bottom_spacer_height = 0.0
+        return assets[start:end]
+
+    def get_filtered_assets(self) -> List[Dict[str, Any]]:
+        return [self._format_asset_for_ui(asset) for asset in self._window_assets(self._filtered_assets())]
+
+    def get_folder_list(self) -> List[Dict[str, Any]]:
+        counts: Dict[str, int] = {}
+        query = self._search_query.strip().casefold()
+        matching_assets = [
+            asset
+            for asset in self._asset_index_assets().values()
+            if self._asset_matches_query(asset, query)
         ]
+        for asset in matching_assets:
+            folder_id = str(asset.get("folder_id") or "default")
+            counts[folder_id] = counts.get(folder_id, 0) + 1
+        folder_rows = [
+            {
+                "id": folder_id,
+                "name": str(folder.get("name") or tr("projects.unnamed_folder")),
+                "project_count": counts.get(folder_id, 0),
+                "can_manage": True,
+            }
+            for folder_id, folder in self._asset_index_folders().items()
+        ]
+        rows = sorted(folder_rows, key=lambda row: self._sort_text(row["name"]))
+        rows.sort(key=lambda row: row["id"] != "default")
+        for row in rows:
+            row["scope_name"] = tr(
+                "projects.scope.default_folder" if row["id"] == "default" else "projects.scope.folder",
+                name=row["name"],
+            )
+        return rows
 
-        # Count by filter (Splat, PCL, Dataset, Checkpoint)
-        # Splat: 3DGS PLY files (ply_3dgs), SOG files, and legacy PLY
-        splat_count = sum(1 for a in assets if a.get("type") in ("ply_3dgs", "sog", "ply"))
-        # PCL: Regular point cloud PLY files (ply_pcl)
-        pcl_count = sum(1 for a in assets if a.get("type") == "ply_pcl")
-        checkpoint_count = sum(1 for a in assets if a.get("type") == "checkpoint")
-        dataset_count = sum(
-            1
-            for a in assets
-            if a.get("type") == "dataset" or a.get("role") == "source_dataset"
+    def get_all_assets_count(self) -> int:
+        query = self._search_query.strip().casefold()
+        if not query:
+            if self._catalog_snapshot is not None or self._catalog_preview is not None:
+                local_count = len(self._asset_index_assets())
+            else:
+                count = getattr(self._asset_index, "count", None)
+                local_count = int(count()) if callable(count) else len(self._asset_index_assets())
+            return local_count + len(self._gallery_remote_assets())
+        return sum(
+            self._asset_matches_query(asset, query)
+            for asset in self._all_display_assets().values()
         )
 
-        filters = [
-            {
-                "id": "splat",
-                "label": tr("asset_manager.filter.splat"),
-                "count": splat_count,
-                "is_selected": "splat" in self._active_filters,
-            },
-            {
-                "id": "pcl",
-                "label": tr("asset_manager.filter.pcl"),
-                "count": pcl_count,
-                "is_selected": "pcl" in self._active_filters,
-            },
-            {
-                "id": "dataset",
-                "label": tr("asset_manager.filter.dataset"),
-                "count": dataset_count,
-                "is_selected": "dataset" in self._active_filters,
-            },
-            {
-                "id": "checkpoint",
-                "label": tr("asset_manager.filter.checkpoints"),
-                "count": checkpoint_count,
-                "is_selected": "checkpoint" in self._active_filters,
-            },
-        ]
+    def get_local_assets_count(self) -> int:
+        query = self._search_query.strip().casefold()
+        if not query:
+            if self._catalog_snapshot is not None or self._catalog_preview is not None:
+                return len(self._asset_index_assets())
+            count = getattr(self._asset_index, "count", None)
+            if callable(count):
+                return int(count())
+        return sum(
+            self._asset_matches_query(asset, query)
+            for asset in self._asset_index_assets().values()
+        )
 
-        return filters
+    def get_asset_results_summary(self) -> str:
+        try:
+            if self._active_filter != "all":
+                return localized_count(
+                    "projects.status.showing_filtered_projects",
+                    self._last_asset_match_count,
+                    total=self._last_asset_scope_count,
+                    plural_count=self._last_asset_scope_count,
+                )
+            return localized_count(
+                "projects.status.showing_projects", self._last_asset_match_count
+            )
+        except Exception:
+            return f"{self._last_asset_match_count:,}"
 
-    def _get_default_filters(self) -> List[Dict[str, Any]]:
-        """Return default filter list when backend unavailable."""
-        return [
-            {"id": "splat", "label": tr("asset_manager.filter.splat"), "count": 0, "is_selected": False},
-            {"id": "pcl", "label": tr("asset_manager.filter.pcl"), "count": 0, "is_selected": False},
-            {"id": "dataset", "label": tr("asset_manager.filter.dataset"), "count": 0, "is_selected": False},
-            {"id": "checkpoint", "label": tr("asset_manager.filter.checkpoints"), "count": 0, "is_selected": False},
-        ]
+    def get_asset_search_empty(self) -> bool:
+        return bool(self._search_query.strip()) and not self._filtered_assets()
 
-    # ── Flattened Selected Asset Getters ─────────────────────
+    def _shown_missing_asset_ids(self) -> List[str]:
+        catalog = self._asset_index_assets()
+        return [row["id"] for row in self._filtered_assets()
+                if row.get("id") in catalog
+                and (not row.get("exists", True) or str(row.get("status") or "") == "MISSING")]
+
+    def get_can_clean_missing(self) -> bool:
+        return self._active_filter == "missing" and bool(self._shown_missing_asset_ids())
+
+    def on_clean_missing(self, _handle=None, _ev=None, _args=None) -> None:
+        missing = self._shown_missing_asset_ids()
+        removed = self._library_command("delete_assets", missing) if missing else 0
+        self._catalog_notice = tr("projects.status.cleaned_missing", count=int(removed or 0))
+        self.refresh_catalog(scan_folders=False)
+
+    def get_catalog_notice(self) -> str:
+        if self._asset_index and getattr(self._asset_index, "last_error", ""):
+            return self._asset_index.last_error
+        selected_id = self.get_selected_asset_id()
+        if selected_id.startswith("recent:") and selected_id in self._inspection_errors:
+            return self._inspection_errors[selected_id]
+        if self._catalog_notice:
+            return self._catalog_notice
+        if self._catalog_load_failed:
+            return tr("projects.status.load_failed")
+        issues = getattr(self._asset_index, "load_issues", None) if self._asset_index else None
+        if issues:
+            return tr("projects.status.skipped_entries", count=len(issues))
+        return ""
+
+    def _set_catalog_notice(self, message: str) -> None:
+        self._catalog_notice = str(message or "")
+        self._dirty_fields("catalog_notice", "has_catalog_notice")
+
+    def get_has_catalog_notice(self) -> bool:
+        return bool(self.get_catalog_notice())
+
+    def get_scan_active(self) -> bool:
+        with self._folder_scan_lock:
+            return bool(self._folder_scan_active or self._catalog_verify_active)
+
+    def get_scan_status(self) -> str:
+        with self._folder_scan_lock:
+            active = self._folder_scan_active
+            stopped = self._scan_stopped_visible
+            progress = self._scan_progress
+        if active:
+            directories, projects, root = progress.snapshot()
+            name = Path(root).name or root
+            return tr(
+                "projects.status.scanning",
+                name=name,
+                folders=directories,
+                projects=projects,
+            )
+        if self._catalog_verify_active:
+            return tr(
+                "projects.status.verifying",
+                count=len(self._window_assets(self._filtered_assets())),
+            )
+        if stopped:
+            return tr("projects.status.scan_stopped")
+        return ""
+
+    def get_has_scan_status(self) -> bool:
+        return bool(self.get_scan_status())
+
+    def get_refresh_action_tooltip(self) -> str:
+        if self.get_scan_active():
+            return "projects.action.stop_scan"
+        return "projects.tooltip.refresh"
 
     def _get_selected_asset(self) -> Optional[Dict[str, Any]]:
-        """Get the currently selected single asset, if any."""
-        if not self._selected_asset_ids or len(self._selected_asset_ids) != 1:
-            return None
-        asset_id = list(self._selected_asset_ids)[0]
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return None
-        return self._asset_index.assets.get(asset_id)
+        asset_id = self.get_selected_asset_id()
+        asset = self._asset_dict(asset_id)
+        return self._asset_with_inspection(asset) if asset else None
 
     def get_selected_asset_name(self) -> str:
         asset = self._get_selected_asset()
-        return self._asset_display_title(asset) if asset else ""
+        return self._get_asset_display_name(asset) if asset else ""
 
-    def get_selected_asset_type(self) -> str:
+    def get_selected_asset_folder_name(self) -> str:
         asset = self._get_selected_asset()
-        asset_type = asset.get("type", "") if asset else ""
-        return asset_type.upper() if asset_type else ""
+        return self._folder_name(asset.get("folder_id")) if asset else ""
 
-    def get_selected_asset_project_name(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        project_name, _scene_name = self._get_asset_relationship_names(asset)
-        return self._format_display_name(project_name)
-
-    def get_selected_asset_scene_name(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        _project_name, scene_name = self._get_asset_relationship_names(asset)
-        return scene_name
+    def get_selected_asset_has_folder(self) -> bool:
+        return bool(self.get_selected_asset_folder_name())
 
     def get_selected_asset_path(self) -> str:
         asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        path = asset.get("absolute_path") or asset.get("path", "")
-        return self._ellipsize_path(path)
+        return str(asset.get("path") or "") if asset else ""
 
     def get_selected_asset_size(self) -> str:
+        if size := self._selected_details_rows().get("physical_size"):
+            return size
         asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        return self._format_size(asset.get("file_size_bytes", 0))
-
-    def get_selected_asset_role(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        role = asset.get("role", "")
-        return role.replace("_", " ").title() if role else ""
-
-    def get_selected_asset_resolution(self) -> str:
-        return ""
-
-    def get_selected_asset_duration(self) -> str:
-        return ""
+        return self._format_size(asset.get("file_size_bytes", 0)) if asset else ""
 
     def get_selected_asset_created(self) -> str:
         asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        created_at = asset.get("created_at", "")
-        return self._format_timestamp(created_at) if created_at else ""
+        return self._format_unix_ns(asset.get("created_at_unix_ns", 0)) if asset else ""
 
     def get_selected_asset_modified(self) -> str:
+        if saved := self._selected_details_rows().get("saved_at"):
+            return saved
+        asset = self._get_selected_asset()
+        return self._format_unix_ns(asset.get("saved_at_unix_ns", 0)) if asset else ""
+
+    def get_selected_health_state(self) -> str:
         asset = self._get_selected_asset()
         if not asset:
             return ""
-        modified_at = asset.get("modified_at", "")
-        return self._format_timestamp(modified_at) if modified_at else ""
+        return str(asset.get("status") or "READING")
 
-    def get_selected_asset_has_geometry_metadata(self) -> bool:
+    def get_selected_health_label(self) -> str:
         asset = self._get_selected_asset()
-        if not asset:
-            return False
-        geom = asset.get("geometry_metadata", {}) or {}
-        return bool(geom)
+        return self._project_status_label(asset) if asset else ""
 
-    def get_selected_asset_has_dataset_metadata(self) -> bool:
-        asset = self._get_selected_asset()
-        if not asset:
-            return False
-        dataset_meta = asset.get("dataset_metadata", {}) or {}
-        return asset.get("type") == "dataset" or bool(dataset_meta)
+    def selected_has_problem(self) -> bool:
+        return self.get_selected_health_state() not in ("", "AVAILABLE", "READING")
 
-    def get_selected_asset_dataset_image_count(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        dataset_meta = asset.get("dataset_metadata", {}) or {}
-        image_count = self._coerce_nonnegative_int(
-            dataset_meta.get("image_count", 0)
-        )
-        if image_count or asset.get("type") == "dataset":
-            return str(image_count)
-        return ""
+    def get_selected_fix_action(self) -> str:
+        return fix_action_for_health(self.get_selected_health_state()) if self.get_selected_health_state() else ""
 
-    def get_selected_asset_dataset_image_root(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        dataset_meta = asset.get("dataset_metadata", {}) or {}
-        image_root = dataset_meta.get("image_root", "")
-        return image_root or "."
-
-    def get_selected_asset_dataset_masks(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        dataset_meta = asset.get("dataset_metadata", {}) or {}
-        mask_count = self._coerce_nonnegative_int(
-            dataset_meta.get("mask_count", 0)
-        )
-        return str(mask_count)
-
-    def get_selected_asset_dataset_camera_count(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        dataset_meta = asset.get("dataset_metadata", {}) or {}
-        camera_count = dataset_meta.get("camera_count")
-        if camera_count is None:
-            return "--"
-        return str(camera_count)
-
-    def get_selected_asset_dataset_initial_points(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        dataset_meta = asset.get("dataset_metadata", {}) or {}
-        initial_points = self._coerce_optional_nonnegative_int(
-            dataset_meta.get("initial_points")
-        )
-        if initial_points is None:
-            return ""
-        if initial_points >= 1_000_000:
-            return f"{initial_points / 1_000_000:.2f}M"
-        elif initial_points >= 1_000:
-            return f"{initial_points / 1_000:.1f}K"
-        return str(initial_points)
-
-    def get_selected_asset_points(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        asset_type = asset.get("type", "")
-        # For datasets, show initial points from COLMAP
-        if asset_type == "dataset":
-            dataset_meta = asset.get("dataset_metadata", {}) or {}
-            points = self._coerce_optional_nonnegative_int(
-                dataset_meta.get("initial_points")
-            )
-            if points is None:
-                return ""
-            if points >= 1_000_000:
-                return f"{points / 1_000_000:.2f}M"
-            elif points >= 1_000:
-                return f"{points / 1_000:.1f}K"
-            return str(points)
-        # For geometry files (PLY, SOG, etc.), show gaussian count
-        geom = asset.get("geometry_metadata", {}) or {}
-        gaussian_count = self._coerce_nonnegative_int(geom.get("gaussian_count"))
-        if gaussian_count >= 1_000_000:
-            return f"{gaussian_count / 1_000_000:.2f}M"
-        elif gaussian_count >= 1_000:
-            return f"{gaussian_count / 1_000:.1f}K"
-        return str(gaussian_count) if gaussian_count > 0 else ""
-
-    def get_selected_asset_bounding_box(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        geom = asset.get("geometry_metadata", {}) or {}
-        bbox = geom.get("bounding_box", {})
-        if bbox:
-            min_val = bbox.get("min", [0, 0, 0])
-            max_val = bbox.get("max", [0, 0, 0])
-            return f"[{min_val}, {max_val}]"
-        return ""
-
-    def get_selected_asset_center(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        geom = asset.get("geometry_metadata", {}) or {}
-        center = geom.get("center", [0, 0, 0])
-        if center:
-            return f"{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}"
-        return ""
-
-    def get_selected_asset_scale(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        geom = asset.get("geometry_metadata", {}) or {}
-        scale = geom.get("scale", 1.0)
-        return f"{scale:.2f}" if scale else "1.0"
-
-    def get_selected_asset_has_transform_metadata(self) -> bool:
-        asset = self._get_selected_asset()
-        if not asset:
-            return False
-        transform_meta = asset.get("transform_metadata", {}) or {}
-        return bool(transform_meta)
-
-    def get_selected_asset_transform_translation(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        transform_meta = asset.get("transform_metadata", {}) or {}
-        translation = transform_meta.get("translation", [0.0, 0.0, 0.0])
-        if translation and len(translation) >= 3:
-            return f"{translation[0]:.3f}, {translation[1]:.3f}, {translation[2]:.3f}"
-        return "0.000, 0.000, 0.000"
-
-    def get_selected_asset_transform_rotation(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        transform_meta = asset.get("transform_metadata", {}) or {}
-        # Prefer euler degrees if available
-        euler_deg = transform_meta.get("rotation_euler_deg", [0.0, 0.0, 0.0])
-        if euler_deg and len(euler_deg) >= 3:
-            return f"{euler_deg[0]:.2f}°, {euler_deg[1]:.2f}°, {euler_deg[2]:.2f}°"
-        # Fallback to quaternion
-        quat = transform_meta.get("rotation_quat", [0.0, 0.0, 0.0, 1.0])
-        if quat and len(quat) >= 4:
-            return f"quat({quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f})"
-        return "0.00°, 0.00°, 0.00°"
-
-    def get_selected_asset_transform_scaling(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        transform_meta = asset.get("transform_metadata", {}) or {}
-        scale = transform_meta.get("scale", [1.0, 1.0, 1.0])
-        if scale and len(scale) >= 3:
-            return f"{scale[0]:.3f}, {scale[1]:.3f}, {scale[2]:.3f}"
-        return "1.000, 1.000, 1.000"
+    def get_selected_fix_label(self) -> str:
+        action = self.get_selected_fix_action()
+        return tr({
+            "locate": "projects.action.locate",
+            "verify": "projects.action.verify",
+            "repair": "projects.action.repair",
+            "update": "projects.action.update_version",
+        }.get(action, "")) if action else ""
 
     def get_selected_asset_file_missing(self) -> bool:
         asset = self._get_selected_asset()
-        if not asset:
-            return False
-        return not asset.get("exists", True)
+        return bool(asset) and not bool(asset.get("exists", False))
 
-    def get_selected_asset_expected_path(self) -> str:
+    def get_selected_asset_can_locate(self) -> bool:
         asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        file_exists = asset.get("exists", True)
-        if file_exists:
-            return ""
-        return asset.get("absolute_path") or asset.get("path", "")
-
-    def get_selected_asset_pill_class(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        asset_type = asset.get("type", "")
-        return f"asset-pill-{asset_type.replace('_', '-')}" if asset_type else ""
-
-    def get_selected_asset_type_label(self) -> str:
-        asset = self._get_selected_asset()
-        if not asset:
-            return ""
-        asset_type = asset.get("type", "")
-        type_labels = {
-            "ply_3dgs": tr("asset_manager.type.splat"),
-            "ply_pcl": tr("asset_manager.type.pcl"),
-            "ply": tr("asset_manager.type.splat"),  # Legacy PLY type
-            "rad": tr("asset_manager.type.rad"),
-            "sog": tr("asset_manager.type.sog"),
-            "spz": tr("asset_manager.type.spz"),
-            "checkpoint": tr("asset_manager.type.checkpoint"),
-            "dataset": tr("asset_manager.type.dataset"),
-            "mesh": tr("asset_manager.type.mesh"),
-            "usd": tr("asset_manager.type.usd"),
+        return bool(asset) and str(asset.get("status") or "") in {
+            "MISSING",
+            "IDENTITY_MISMATCH",
         }
-        return type_labels.get(asset_type, asset_type.upper() if asset_type else "")
 
-    # ── Flattened Selected Scene Getters ───────────────────────
-
-    def _get_selected_scene(self) -> Optional[Dict[str, Any]]:
-        """Get the currently selected scene, if any."""
-        if not self._selected_scene_id:
-            return None
-        if not self._asset_index or not hasattr(self._asset_index, "scenes"):
-            return None
-        return self._asset_index.scenes.get(self._selected_scene_id)
-
-    def get_selected_scene_name(self) -> str:
-        scene = self._get_selected_scene()
-        return scene.get("name", "") if scene else ""
-
-    def get_selected_scene_project_name(self) -> str:
-        scene = self._get_selected_scene()
-        if not scene:
+    def get_locate_section_title(self) -> str:
+        asset = self._get_selected_asset()
+        if not asset:
             return ""
-        project_id = scene.get("project_id", "")
-        if not project_id or not self._asset_index:
-            return ""
-        project = getattr(self._asset_index, "projects", {}).get(project_id)
-        name = project.get("name", "") if project else ""
-        return self._format_display_name(name)
+        if str(asset.get("status") or "") == "IDENTITY_MISMATCH":
+            return tr("projects.status.identity_mismatch")
+        return tr("projects.info_panel.file_not_found")
 
-    def get_selected_scene_asset_count(self) -> int:
-        scene = self._get_selected_scene()
-        if not scene or not self._asset_index:
-            return 0
-        scene_id = scene.get("id", "")
-        if not scene_id or not hasattr(self._asset_index, "assets"):
+    def get_selected_asset_relocation_candidate(self) -> str:
+        asset = self._get_selected_asset()
+        return str(asset.get("relocation_candidate") or "") if asset else ""
+
+    def get_selected_asset_has_relocation_candidate(self) -> bool:
+        return bool(self.get_selected_asset_relocation_candidate())
+
+    def _get_selected_folder(self) -> Optional[Dict[str, Any]]:
+        return self._asset_index_folders().get(self._selected_folder_id or "")
+
+    def get_selected_folder_name(self) -> str:
+        folder = self._get_selected_folder()
+        return str(folder.get("name") or "") if folder else ""
+
+    def get_selected_folder_path(self) -> str:
+        folder = self._get_selected_folder()
+        return str(folder.get("path") or "") if folder else ""
+
+    def get_selected_folder_asset_count(self) -> int:
+        if not self._selected_folder_id:
             return 0
         return sum(
-            1
-            for asset in self._asset_index.assets.values()
-            if asset.get("scene_id") == scene_id and self._asset_file_exists(asset)
-        )
-
-    def get_selected_scene_created(self) -> str:
-        scene = self._get_selected_scene()
-        if not scene:
-            return ""
-        created_at = scene.get("created_at", "")
-        return self._format_timestamp(created_at) if created_at else ""
-
-    def get_selected_scene_modified(self) -> str:
-        scene = self._get_selected_scene()
-        if not scene:
-            return ""
-        modified_at = scene.get("modified_at", "")
-        return self._format_timestamp(modified_at) if modified_at else ""
-
-    # ── Flattened Selected Project Getters ─────────────────────
-
-    def _get_selected_project(self) -> Optional[Dict[str, Any]]:
-        """Get the currently selected project, if any."""
-        if not self._selected_project_id:
-            return None
-        if not self._asset_index or not hasattr(self._asset_index, "projects"):
-            return None
-        return self._asset_index.projects.get(self._selected_project_id)
-
-    def get_selected_project_name(self) -> str:
-        project = self._get_selected_project()
-        name = project.get("name", "") if project else ""
-        return self._format_display_name(name)
-
-    def get_selected_project_created(self) -> str:
-        project = self._get_selected_project()
-        if not project:
-            return ""
-        created_at = project.get("created_at", "")
-        return self._format_timestamp(created_at) if created_at else ""
-
-    def get_selected_project_modified(self) -> str:
-        project = self._get_selected_project()
-        if not project:
-            return ""
-        modified_at = project.get("modified_at", "")
-        return self._format_timestamp(modified_at) if modified_at else ""
-
-    def _format_timestamp(self, timestamp: str) -> str:
-        """Format ISO timestamp to readable string."""
-        if not timestamp:
-            return ""
-        try:
-            import datetime
-
-            dt = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            return dt.strftime("%b %d, %Y, %H:%M")
-        except Exception:
-            return timestamp
-
-    def _ensure_import_project(
-        self, default_name: str = "Default"
-    ) -> Optional[str]:
-        # Import to currently selected project if one is selected, otherwise use Default
-        if not self._asset_index:
-            return None
-        
-        # If a project is currently selected, use that
-        if self._selected_project_id:
-            project = self._asset_index.projects.get(self._selected_project_id)
-            if project:
-                return self._selected_project_id
-        
-        # Fall back to Default project
-        self._ensure_default_project()
-        for pid, proj in self._asset_index.projects.items():
-            if proj.get("name") == "Default":
-                return pid
-        return None
-
-    def _metadata_to_asset_kwargs(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        format_specific = metadata.get("format_specific", {}) or {}
-        asset_type = metadata.get("type") or "unknown"
-
-        kwargs: Dict[str, Any] = {
-            "type": asset_type,
-            "file_size_bytes": metadata.get("size_bytes", 0),
-            "created_at": metadata.get("created"),
-            "modified_at": metadata.get("modified"),
-        }
-
-        if asset_type in ("ply_3dgs", "ply_pcl", "ply", "rad", "sog", "spz", "mesh"):
-            kwargs["geometry_metadata"] = format_specific
-        elif asset_type == "dataset":
-            kwargs["dataset_metadata"] = format_specific
-
-        return kwargs
-
-    def _generate_asset_thumbnail_for_values(
-        self,
-        asset_id: str,
-        asset_type: str,
-        asset_path: str,
-        dataset_metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        if not self._asset_thumbnails or not self._asset_index or not asset_id:
-            return
-        try:
-            thumb_path = None
-            if asset_type == "dataset":
-                generate_dataset_preview = getattr(
-                    self._asset_thumbnails,
-                    "generate_dataset_preview",
-                    None,
-                )
-                if callable(generate_dataset_preview):
-                    thumb_path = generate_dataset_preview(
-                        asset_type,
-                        asset_id,
-                        asset_path,
-                        dataset_metadata or {},
-                    )
-            else:
-                generate_rendered_preview = getattr(
-                    self._asset_thumbnails,
-                    "generate_rendered_preview",
-                    None,
-                )
-                if callable(generate_rendered_preview):
-                    thumb_path = generate_rendered_preview(
-                        asset_type,
-                        asset_id,
-                        asset_path,
-                    )
-
-            if thumb_path is None:
-                thumb_path = self._asset_thumbnails.generate_placeholder(
-                    asset_type,
-                    asset_id,
-                )
-            self._asset_index.update_asset(asset_id, thumbnail_path=str(thumb_path))
-        except Exception as exc:
-            _logger.debug(f"Failed to generate thumbnail for {asset_id}: {exc}")
-
-    def _generate_asset_thumbnail(self, asset: Any) -> None:
-        if not asset:
-            return
-        asset_id = getattr(asset, "id", "")
-        asset_type = getattr(asset, "type", "")
-        asset_path = getattr(asset, "absolute_path", "") or getattr(asset, "path", "")
-        dataset_metadata = getattr(asset, "dataset_metadata", {}) or {}
-        self._generate_asset_thumbnail_for_values(
-            asset_id,
-            asset_type,
-            asset_path,
-            dataset_metadata,
-        )
-
-    def _is_managed_thumbnail_path(self, thumbnail_path: str) -> bool:
-        if not self._asset_thumbnails or not thumbnail_path:
-            return False
-
-        try:
-            thumbs_dir = (
-                Path(self._asset_thumbnails.thumbnails_dir)
-                .expanduser()
-                .resolve()
-            )
-            path = Path(str(thumbnail_path)).expanduser().resolve()
-            try:
-                return path.is_relative_to(thumbs_dir)
-            except AttributeError:
-                return path == thumbs_dir or thumbs_dir in path.parents
-        except Exception:
-            return False
-
-    def _asset_needs_thumbnail_refresh(self, asset: Dict[str, Any]) -> bool:
-        if not self._asset_thumbnails:
-            return False
-
-        asset_id = asset.get("id", "")
-        asset_type = asset.get("type", "")
-        if not asset_id:
-            return False
-
-        thumbnail_path = asset.get("thumbnail_path") or ""
-        thumbnail_exists = False
-        if thumbnail_path:
-            try:
-                thumbnail_exists = Path(str(thumbnail_path)).expanduser().exists()
-            except Exception:
-                thumbnail_exists = False
-
-        thumbnail_size_ok = True
-        matches_expected_size = getattr(
-            self._asset_thumbnails,
-            "thumbnail_matches_expected_size",
-            None,
-        )
-        if (
-            thumbnail_exists
-            and callable(matches_expected_size)
-            and self._is_managed_thumbnail_path(str(thumbnail_path))
-        ):
-            thumbnail_size_ok = matches_expected_size(thumbnail_path)
-
-        if asset_type == "dataset":
-            expected_path = getattr(
-                self._asset_thumbnails,
-                "get_dataset_thumbnail_path",
-                lambda _asset_id: None,
-            )(asset_id)
-            if (
-                expected_path
-                and str(thumbnail_path) == str(expected_path)
-                and thumbnail_exists
-                and thumbnail_size_ok
-            ):
-                return False
-            placeholder_path = self._asset_thumbnails.get_thumbnail_path(asset_id)
-            return (
-                (not thumbnail_exists)
-                or (not thumbnail_size_ok)
-                or str(thumbnail_path) == str(placeholder_path)
-            )
-
-        if asset_type in {
-            "checkpoint",
-            "mesh",
-            "ply_3dgs",
-            "ply_pcl",
-            "ply",
-            "rad",
-            "sog",
-            "spz",
-        }:
-            has_rendered = getattr(
-                self._asset_thumbnails,
-                "has_rendered_thumbnail",
-                lambda _aid: False,
-            )(asset_id)
-            return (
-                not has_rendered
-                or not thumbnail_exists
-                or not thumbnail_size_ok
-            )
-
-        return (not thumbnail_exists) or (not thumbnail_size_ok)
-
-    def _asset_needs_metadata_sync(self, asset: Dict[str, Any]) -> bool:
-        asset_type = asset.get("type", "")
-        file_path = asset.get("absolute_path") or asset.get("path", "")
-        if not file_path or not os.path.exists(file_path):
-            return False
-
-        if asset_type == "dataset":
-            dataset_meta = asset.get("dataset_metadata", {}) or {}
-            return (
-                asset.get("file_size_bytes", 0) <= 0
-                or "image_count" not in dataset_meta
-                or "mask_count" not in dataset_meta
-                or "database_present" not in dataset_meta
-                or "image_root" not in dataset_meta
-            )
-
-        if asset_type in ("ply_3dgs", "ply_pcl", "ply", "rad", "sog", "spz", "mesh"):
-            geom_meta = asset.get("geometry_metadata", {}) or {}
-            # Need sync if empty or if gaussian_count is not present
-            return not geom_meta or geom_meta.get("gaussian_count") is None
-        return asset.get("file_size_bytes", 0) <= 0
-
-    def _sync_existing_asset_metadata(self) -> bool:
-        if not self._asset_index or not self._asset_scanner:
-            return False
-
-        updated_any = False
-        for asset_id, asset in list(self._asset_index.assets.items()):
-            if self._asset_needs_metadata_sync(asset):
-                file_path = asset.get("absolute_path") or asset.get("path", "")
-                try:
-                    metadata = self._asset_scanner.scan_file(file_path)
-                except Exception as exc:
-                    _logger.debug(f"Failed to rescan asset metadata for {file_path}: {exc}")
-                    metadata = None
-
-                if metadata:
-                    update_kwargs = self._metadata_to_asset_kwargs(metadata)
-                    size_bytes = metadata.get("size_bytes")
-                    if size_bytes is not None and size_bytes != asset.get("file_size_bytes", 0):
-                        update_kwargs["file_size_bytes"] = size_bytes
-
-                    modified_at = metadata.get("modified")
-                    if modified_at and modified_at != asset.get("modified_at"):
-                        update_kwargs["modified_at"] = modified_at
-
-                    created_at = metadata.get("created")
-                    if created_at and not asset.get("created_at"):
-                        update_kwargs["created_at"] = created_at
-
-                    if update_kwargs:
-                        self._asset_index.update_asset(asset_id, **update_kwargs)
-                        updated_any = True
-
-            asset = self._asset_index.assets.get(asset_id, asset)
-            if self._asset_needs_thumbnail_refresh(asset):
-                self._generate_asset_thumbnail_for_values(
-                    asset_id,
-                    asset.get("type", ""),
-                    asset.get("absolute_path") or asset.get("path", ""),
-                    asset.get("dataset_metadata", {}) or {},
-                )
-                updated_any = True
-
-        return updated_any
-
-    def _scan_and_register_asset(
-        self,
-        path: str,
-        *,
-        project_id: Optional[str],
-        scene_id: Optional[str],
-        fallback_role: str = "reference",
-        override_type: Optional[str] = None,
-        override_role: Optional[str] = None,
-    ):
-        metadata = self._asset_scanner.scan_file(path) if self._asset_scanner else {}
-        asset_kwargs = self._metadata_to_asset_kwargs(metadata)
-        # Always pop type and role from kwargs to avoid duplicate keyword argument error
-        kwargs_type = asset_kwargs.pop("type", None)
-        kwargs_role = asset_kwargs.pop("role", None)
-        asset_type = override_type or kwargs_type or "unknown"
-        role = override_role or kwargs_role or fallback_role
-
-        # Final safety: ensure type and role are not in kwargs (they're passed explicitly)
-        asset_kwargs.pop("type", None)
-        asset_kwargs.pop("role", None)
-
-        asset = self._asset_index.create_asset(
-            project_id=project_id,
-            name=Path(path).name,
-            type=asset_type,
-            path=path,
-            absolute_path=path,
-            scene_id=scene_id,
-            role=role,
-            **asset_kwargs,
-        )
-        if asset:
-            self._generate_asset_thumbnail(asset)
-        return asset
-
-    def _log_info(self, message: str, *args) -> None:
-        if args:
-            message = message % args
-        try:
-            lf.log.info(message)
-        except Exception:
-            _logger.info(message)
-
-    def _log_warn(self, message: str, *args) -> None:
-        if args:
-            message = message % args
-        try:
-            lf.log.warn(message)
-        except Exception:
-            _logger.warning(message)
-
-    def _log_error(self, message: str, *args) -> None:
-        if args:
-            message = message % args
-        try:
-            lf.log.error(message)
-        except Exception:
-            _logger.error(message)
-
-    # ── Event Handlers ────────────────────────────────────────
-
-    def toggle_filter(self, _handle, _ev, args):
-        """Toggle a filter on/off (multi-select)."""
-        if not args:
-            return
-        filter_id = str(args[0])
-
-        # Toggle the filter in the set
-        if filter_id in self._active_filters:
-            self._active_filters.discard(filter_id)
-        else:
-            self._active_filters.add(filter_id)
-
-        self._dirty_model(
-            "active_filters", "filters", "assets"
+            asset.get("folder_id") == self._selected_folder_id
+            for asset in self._asset_index_assets().values()
         )
 
     def set_view_mode(self, _handle, _ev, args):
-        """Set the view mode (gallery or list)."""
-        if not args:
+        mode = str(args[0]) if args else ""
+        if mode not in ("gallery", "list") or mode == self._view_mode:
             return
-        mode = str(args[0])
         self._view_mode = mode
-        self._dirty_model("view_mode", "is_gallery_view", "is_list_view", "assets")
+        self._reset_scroll()
+        self._refresh_records(assets=True)
+        self._dirty_fields("is_gallery_view", "is_list_view")
+        self._persist_project_manager_state()
 
-    def cycle_sort_mode(self, _handle, _ev, args):
-        """Cycle through supported sort modes."""
-        try:
-            current_index = self.SORT_MODES.index(self._sort_mode)
-        except ValueError:
-            current_index = 0
-        self._sort_mode = self.SORT_MODES[(current_index + 1) % len(self.SORT_MODES)]
-        self._dirty_model("sort_mode", "sort_label", "assets")
+    def toggle_inspector(self, _handle=None, _ev=None, _args=None):
+        self._inspector_expanded = not self._inspector_expanded
+        self._dirty_inspector_layout()
 
-    def toggle_asset_selection(self, _handle, _ev, args):
-        """Toggle selection state of an asset."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
+    def get_selected_asset_thumbnail_decorator(self) -> str:
+        asset = self._get_selected_asset()
+        return self._thumbnail_decorator(self._asset_with_poster(asset)) if asset else "none"
 
-        # Handle Ctrl/Cmd multi-select via args[1] if provided
-        multi_select = len(args) > 1 and bool(args[1])
-        self._select_asset_id(
-            asset_id,
-            toggle=True,
-            multi_select=multi_select,
+    def open_quick_look(self, _handle=None, _ev=None, _args=None) -> None:
+        if self.get_selected_asset_id():
+            self._quick_look_visible = True
+            self._dirty_fields(
+                "quick_look_visible", "quick_look_thumbnail"
+            )
+
+    def close_quick_look(self, _handle=None, _ev=None, _args=None) -> None:
+        if self._quick_look_visible:
+            self._quick_look_visible = False
+            self._dirty_fields("quick_look_visible")
+
+    def toggle_quick_look(self) -> None:
+        if self._quick_look_visible:
+            self.close_quick_look()
+        else:
+            self.open_quick_look()
+
+    def cycle_sort_mode(self, _handle=None, _ev=None, _args=None):
+        index = (self.SORT_MODES.index(self._sort_mode) + 1) % len(self.SORT_MODES)
+        self._choose_sort("sort:" + self.SORT_MODES[index])
+
+    def open_view_menu(self, _handle=None, _ev=None, _args=None):
+        items = [
+            {"label": tr("projects.gallery.action.grid"), "action": "gallery"},
+            {"label": tr("projects.gallery.action.list"), "action": "list"},
+            *self._sort_menu_items(),
+            {"label": tr("projects.property.size") + " ›", "action": "thumbnail", "separator_before": True},
+        ]
+        icons = {
+            "gallery": "layout-grid", "list": "layout-list", "thumbnail": "arrows-maximize",
+        }
+        for item in items:
+            item["icon"] = "../icon/" + icons.get(item["action"], "adjustments") + ".png"
+        def choose(action: str) -> None:
+            if action in ("gallery", "list"):
+                self.set_view_mode(None, None, [action])
+            elif action.startswith(("sort:", "order:")):
+                self._choose_sort(action)
+            elif action == "thumbnail":
+                self._thumbnail_menu_visible = True
+                self._dirty_fields("thumbnail_menu_visible")
+
+        self._show_shared_context_menu(items, choose)
+
+    def close_thumbnail_menu(self, _handle=None, _ev=None, _args=None) -> None:
+        if self._thumbnail_menu_visible:
+            self._thumbnail_menu_visible = False
+            self._dirty_fields("thumbnail_menu_visible")
+
+    def reset_thumbnail_size(self, _handle=None, _ev=None, _args=None) -> None:
+        self.set_thumbnail_size(168.0)
+
+    def _add_folder_from_path(self, directory: str, *, recursive: bool = True) -> Optional[str]:
+        if not self._asset_index or not directory.strip():
+            return None
+        folder = self._library_command(
+            "add_folder", directory.strip(), recursive=recursive
         )
+        if folder is None:
+            return None
+        self._selected_folder_id = folder.id
+        self._set_asset_selection(set(), cursor=None, anchor=None)
+        self.refresh_catalog(scan_folders=False)
+        folder_path = str(getattr(folder, "path", "") or directory).strip()
+        if recursive:
+            self._scan_asset_folders(folder_id=folder.id, directory=folder_path)
+        else:
+            self._scan_asset_folders(folder_id=folder.id, directory=folder_path, recursive=False)
+        return folder.id
 
-    def _selection_visibility_fields(self):
-        return (
-            "selection_type",
+    def add_asset_folder(self, _handle=None, _ev=None, _args=None):
+        self.on_add_folder(None, None, None)
+
+    def on_add_folder(self, _handle=None, _ev=None, _args=None):
+        start = str(resolve_default_asset_directory())
+        directory = lf.ui.open_folder_dialog(
+            tr("projects.dialog.select_folder"), start
+        )
+        if directory:
+            folder_only = tr("projects.action.folder_only")
+            include_subfolders = tr("projects.action.include_subfolders")
+
+            def choose_scan(button: str) -> None:
+                if button == folder_only:
+                    self._add_folder_from_path(str(directory), recursive=False)
+                elif button == include_subfolders:
+                    self._add_folder_from_path(str(directory), recursive=True)
+
+            lf.ui.confirm_dialog(
+                tr("projects.dialog.scan_depth"),
+                tr("projects.dialog.scan_depth_message"),
+                [folder_only, include_subfolders, tr("common.cancel")],
+                choose_scan,
+            )
+
+    def on_import_project(self, _handle=None, _ev=None, _args=None):
+        if not self._asset_index:
+            return
+        try:
+            path = lf.ui.open_project_file_dialog(
+                "", tr("projects.dialog.choose_existing")
+            )
+        except TypeError:
+            path = lf.ui.open_project_file_dialog("")
+        if not path:
+            return
+        if not is_supported_asset_path(path):
+            self._log_warn("Asset Manager only supports .licht projects: %s", path)
+            self._set_catalog_notice(tr("projects.status.import_failed"))
+            return
+        try:
+            project, _created = self._library_command(
+                "register_licht_asset",
+                path,
+                pin=True,
+            )
+            if project is not None:
+                self._set_asset_selection({project.id}, cursor=project.id, anchor=project.id)
+                self.refresh_catalog(scan_folders=False)
+            else:
+                self._set_catalog_notice(tr("projects.status.import_failed"))
+        except Exception:
+            self._set_catalog_notice(tr("projects.status.import_failed"))
+
+    def _select_folder_id(self, folder_id: str) -> bool:
+        if folder_id not in {*self._asset_index_folders(), SCOPE_ALL, SCOPE_LOCAL, SCOPE_RECENT, *GALLERY_SCOPES}:
+            return False
+        if folder_id in self._asset_index_folders():
+            self._gallery_last_folder = folder_id
+        entering_gallery = folder_id in GALLERY_SCOPES and self._selected_folder_id != folder_id
+        if self._inspection_pipeline is not None:
+            self._inspection_pipeline.cancel()
+        self._selected_folder_id = folder_id
+        if entering_gallery:
+            self._controller().refresh()
+        self._set_asset_selection(set(), cursor=None, anchor=None)
+        self._reset_scroll()
+        self._refresh_records(assets=True, folders=True)
+        self._dirty_fields(
+            "selected_folder_id",
+            "selected_drop_target",
+            "all_assets_selected",
             "show_selection_none",
             "show_selection_asset",
-            "show_selection_scene",
-            "show_selection_project",
+            "show_selection_folder",
             "show_selection_multiple",
-            "has_selection",
-            "has_multi_selection",
+            "selected_folder_name",
+            "selected_folder_path",
+            "selected_folder_asset_count",
         )
+        self._start_inspection_refresh()
+        return True
+
+    def select_folder(self, _handle, _ev, args):
+        self._select_folder_id(self._resolve_event_value(args, _ev, "data-folder-id"))
 
     def _select_asset_id(
         self,
         asset_id: str,
         *,
-        toggle: bool = False,
         multi_select: bool = False,
+        range_select: bool = False,
+        row_element=None,
+        container=None,
     ) -> bool:
-        if not asset_id:
-            self._log_warn(
-                "Asset Manager click ignored: no asset id resolved from event/DOM"
-            )
+        if asset_id.startswith("recent:"):
+            if (
+                self._selected_folder_id != SCOPE_RECENT
+                or asset_id not in self._recent_only_assets()
+            ):
+                return False
+        elif asset_id not in self._all_display_assets():
             return False
-
-        asset = None
-        if self._asset_index and hasattr(self._asset_index, "assets"):
-            asset = self._asset_index.assets.get(asset_id)
-        if asset is None:
-            available = []
-            if self._asset_index and hasattr(self._asset_index, "assets"):
-                available = list(self._asset_index.assets.keys())[:10]
-            self._log_warn(
-                "Asset Manager click resolved asset_id=%s but asset is missing "
-                "from index. sample_ids=%s",
-                asset_id,
-                available,
-            )
-            return False
-
-        if multi_select:
+        visible_ids = [
+            str(asset.get("id") or asset.get("project_uuid") or "")
+            for asset in self._filtered_assets()
+        ]
+        if range_select and self._selection_anchor_id in visible_ids:
+            start = visible_ids.index(self._selection_anchor_id)
+            end = visible_ids.index(asset_id)
+            lo, hi = sorted((start, end))
+            selected = set(visible_ids[lo : hi + 1])
+        elif multi_select:
+            selected = set(self._selected_asset_ids)
             if asset_id in self._selected_asset_ids:
-                self._selected_asset_ids.remove(asset_id)
+                selected.remove(asset_id)
             else:
-                self._selected_asset_ids.add(asset_id)
-        elif toggle and self._selected_asset_ids == {asset_id}:
-            self._selected_asset_ids.clear()
+                selected.add(asset_id)
         else:
-            self._selected_asset_ids = {asset_id}
-
-        self._update_selection_type()
-        self.refresh_catalog()
+            selected = {asset_id}
+        cursor = asset_id if asset_id in selected else next(iter(selected), None)
+        anchor = asset_id if not multi_select and not range_select else _SELECTION_UNCHANGED
+        self._set_asset_selection(selected, cursor=cursor, anchor=anchor)
+        self._sync_asset_selection_dom(container, row_element)
+        self._dirty_selection()
+        self._start_inspection_refresh()
         return True
 
-    def _update_selection_type(self):
-        """Update selection type based on current selection."""
-        if not self._selected_asset_ids:
-            self._selection_type = "none"
-        elif len(self._selected_asset_ids) == 1:
-            self._selection_type = "asset"
-        else:
-            self._selection_type = "multiple"
-
-    def on_search(self, _handle, _ev, args):
-        """Handle search input changes (real-time)."""
-        if args and len(args) > 0:
-            self._search_query = str(args[0])
-        self._dirty_model("search_query", "assets")
-
-    def on_pending_tag_change(self, _handle, _ev, args):
-        """Update the pending tag input buffer."""
-        self._pending_tag_name = str(args[0]) if args else ""
-
-    def on_add_tag(self, _handle, _ev, args):
-        """Add the pending tag to the currently selected asset."""
-        asset = self._get_selected_asset()
-        if not asset or not self._asset_index:
-            return
-        tag = self._pending_tag_name.strip()
-        if not tag:
-            return
-        self._asset_index.add_tag_to_asset(asset["id"], tag)
-        self._pending_tag_name = ""
-        self.refresh_catalog()
-        self._dirty_model("assets", "selected_asset_tags")
-
-    def on_remove_tag(self, _handle, _ev, args):
-        """Remove a tag from the currently selected asset."""
-        asset = self._get_selected_asset()
-        if not asset or not self._asset_index or not args:
-            return
-        tag = str(args[0]).strip()
-        if not tag:
-            return
-        self._asset_index.remove_tag_from_asset(asset["id"], tag)
-        self.refresh_catalog()
-        self._dirty_model("assets", "selected_asset_tags")
-
-    # ── New Project Handlers ──────────────────────────────────
-
-    def toggle_new_project_menu(self, _handle, _ev, _args):
-        """Toggle the new project dropdown menu visibility."""
-        self._new_project_menu_open = not self._new_project_menu_open
-        self._dirty_model("new_project_menu_open")
-
-    def on_create_project_dialog(self, _handle, _ev, _args):
-        """Open system dialog to create a new project."""
-        # Close the dropdown menu
-        self._new_project_menu_open = False
-        self._dirty_model("new_project_menu_open")
-
-        def _on_project_name_entered(name):
-            if not name or not name.strip():
-                return
-
-            name = name.strip()
-
-            try:
-                # Create new project
-                project = self._asset_index.create_project(name=name)
-                if not project:
-                    self._log_error("Failed to create project")
-                    return
-
-                # Refresh the catalog to show the new project
-                self.refresh_catalog()
-                self._log_info("Created new project: %s", name)
-
-            except Exception as e:
-                self._log_error("Failed to create new project: %s", e)
-
-        lf.ui.input_dialog(
-            tr("asset_manager.dialog.create_new_project"),
-            tr("asset_manager.dialog.enter_project_name"),
-            "",
-            _on_project_name_entered
+    def _dirty_selection(self) -> None:
+        if self._handle:
+            self._handle.dirty_all()
+        self._dirty_fields(
+            "selected_asset_id",
+            "selected_count",
+            "selected_count_text",
+            "show_selection_none",
+            "show_selection_asset",
+            "show_selection_folder",
+            "show_selection_multiple",
+            "selected_asset_name",
+            "selected_asset_folder_name",
+            "selected_asset_has_folder",
+            "selected_asset_path",
+            "selected_asset_size",
+            "selected_asset_created",
+            "selected_asset_modified",
+            "selected_health_state",
+            "selected_health_label",
+            "selected_has_problem",
+            "selected_fix_label",
+            "selected_fix_action",
+            "selected_asset_file_missing",
+            "selected_asset_can_locate",
+            "open_button_label",
+            "selected_fix_requires_action",
+            "locate_section_title",
+            "selected_asset_relocation_candidate",
+            "selected_asset_has_relocation_candidate",
+            "selected_asset_expected_path",
+            "quick_look_visible",
+            "quick_look_thumbnail",
+            "quick_look_has_thumbnail",
+            "inspector_saved", "inspector_saved_at", "inspector_opened",
+            "inspector_iteration", "inspector_strategy", "inspector_resumable",
+            "inspector_training_summary", "inspector_model_summary",
+            "inspector_gaussians", "inspector_sh_degree", "inspector_dataset",
+            "inspector_dataset_path", "inspector_dataset_reachable",
+            "inspector_embedded", "inspector_has_metrics", "inspector_metrics",
+            "inspector_license", "inspector_license_notice", "selected_project_title",
+            "inspector_physical_size", "inspector_dead_bytes", "inspector_reclaimable",
+            "inspector_saves", "inspector_autosave_newer", "inspector_has_details",
+            "inspector_card_diagnostic", "inspector_can_resume",
+            "inspector_operations_expanded", "contents_pending", "contents_has_pending",
+            "inspector_gallery_action_label", "inspector_has_gallery_action", "inspector_gallery_action_enabled",
+            "inspector_gallery_action_tooltip",
+            "inspector_gallery_title", "inspector_gallery_description", "inspector_can_edit_gallery_details",
+            "inspector_training_tooltip", "inspector_model_tooltip", "inspector_reclaimable_tooltip",
+            "inspector_verify_result",
+            "catalog_notice",
+            "has_catalog_notice",
         )
+        if self._handle:
+            self._handle.update_record_list("contents_rows", self.get_contents_rows())
 
-    # ── Panel Resize Handlers ─────────────────────────────────
-
-    def on_sidebar_resize_start(self, _handle, event, _args):
-        """Start dragging the sidebar resize handle."""
-        self._sidebar_dragging = True
-        self._sidebar_drag_start_x = float(event.get_parameter("mouse_x", "0"))
-        # Use the current width from instance variable
-        self._sidebar_start_width = self._sidebar_width
-        event.stop_propagation()
-
-    def on_sidebar_resize_delta(self, mouse_x: float) -> None:
-        """Update sidebar width during drag."""
-        if not self._sidebar_dragging:
+    def on_locate_file(self, _handle=None, _ev=None, args=None):
+        asset_id = self._resolve_event_value(args, _ev, "data-asset-id") or self.get_selected_asset_id()
+        if not asset_id or not self._asset_index:
             return
-        delta_x = mouse_x - self._sidebar_drag_start_x
-        new_width = self._sidebar_start_width + delta_x
-        # Enforce minimum width of 160dp
-        new_width = max(160.0, new_width)
-        self._sidebar_width = new_width
-        # The width is bound via data-style-width, so just dirty the model
-        self._dirty_model("sidebar_width")
-
-    def on_sidebar_resize_end(self) -> None:
-        """End sidebar resize drag."""
-        self._sidebar_dragging = False
-
-    def on_right_panel_resize_start(self, _handle, event, _args):
-        """Start dragging the right panel resize handle."""
-        self._right_panel_dragging = True
-        self._right_panel_drag_start_x = float(event.get_parameter("mouse_x", "0"))
-        # Use the current width from instance variable
-        self._right_panel_start_width = self._right_panel_width
-        event.stop_propagation()
-
-    def on_right_panel_resize_delta(self, mouse_x: float) -> None:
-        """Update right panel width during drag."""
-        if not self._right_panel_dragging:
+        path = lf.ui.open_project_file_dialog("")
+        if not path:
             return
-        delta_x = self._right_panel_drag_start_x - mouse_x
-        new_width = self._right_panel_start_width + delta_x
-        # Enforce minimum width of 200dp
-        new_width = max(200.0, new_width)
-        self._right_panel_width = new_width
-        # The width is bound via data-style-width, so just dirty the model
-        self._dirty_model("right_panel_width")
-
-    def on_right_panel_resize_end(self) -> None:
-        """End right panel resize drag."""
-        self._right_panel_dragging = False
-
-    def on_import_splat(self, _handle, _ev, args):
-        """Import a splat/point-cloud file (PLY, SOG, SPZ, USD formats)."""
-        if not self._asset_index:
-            _logger.warning("Asset index not initialized")
-            return
-
-        file_path = lf.ui.open_ply_file_dialog("")
-        if not file_path:
-            return
-
         try:
-            project_id = self._ensure_import_project()
-
-            path_lower = file_path.lower()
-            if path_lower.endswith('.ply'):
-                asset_type = None  # Let scanner detect ply_3dgs vs ply_pcl
-                fallback_role = (
-                    "initial_point_cloud"
-                    if 'point_cloud' in path_lower or 'initial' in path_lower
-                    else "trained_output"
-                )
-            elif path_lower.endswith(('.sog', '.spz')):
-                asset_type = path_lower.split('.')[-1]
-                fallback_role = (
-                    "initial_point_cloud"
-                    if 'point_cloud' in path_lower or 'initial' in path_lower
-                    else "trained_output"
-                )
-            elif path_lower.endswith(('.usd', '.usda', '.usdc', '.usdz')):
-                asset_type = "usd"
-                fallback_role = "reference"
+            if self._library_command("relink_asset", asset_id, path):
+                self.refresh_catalog(scan_folders=False)
             else:
-                asset_type = None
-                fallback_role = "reference"
+                self._set_catalog_notice(tr("projects.status.locate_id_mismatch"))
+        except Exception:
+            self._set_catalog_notice(tr("projects.status.locate_id_mismatch"))
 
-            asset = self._scan_and_register_asset(
-                file_path,
-                project_id=project_id,
-                scene_id=self._selected_scene_id,
-                fallback_role=fallback_role,
-                override_type=asset_type,
-            )
-            self._import_menu_open = False
-
-            if asset:
-                self._selected_asset_ids.add(asset.id)
-                self._update_selection_type()
-
-            self.refresh_catalog()
-            self._dirty_model("import_menu_open")
-
-            if asset:
-                _logger.info(f"Imported asset: {asset.name}")
-
-        except Exception as e:
-            _logger.error(f"Failed to import splat: {e}")
-
-    def on_import_mesh(self, _handle, _ev, args):
-        """Import a mesh file (OBJ, FBX, GLTF, etc.)."""
-        if not self._asset_index:
-            _logger.warning("Asset index not initialized")
-            return
-
-        file_path = lf.ui.open_mesh_file_dialog("")
-        if not file_path:
-            return
-
-        try:
-            project_id = self._ensure_import_project()
-
-            asset = self._scan_and_register_asset(
-                file_path,
-                project_id=project_id,
-                scene_id=self._selected_scene_id,
-                fallback_role="reference",
-                override_type="mesh",
-            )
-            self._import_menu_open = False
-
-            if asset:
-                self._selected_asset_ids.add(asset.id)
-                self._update_selection_type()
-
-            self.refresh_catalog()
-            self._dirty_model("import_menu_open")
-
-            if asset:
-                _logger.info(f"Imported asset: {asset.name}")
-
-        except Exception as e:
-            _logger.error(f"Failed to import mesh: {e}")
-
-    def on_import_dataset(self, _handle, _ev, args):
-        """Import a dataset folder."""
-        if not self._asset_index:
-            _logger.warning("Asset index not initialized")
-            return
-
-        # Open folder dialog for datasets
-        folder_path = lf.ui.open_dataset_folder_dialog()
-
-        if not folder_path:
-            return
-
-        try:
-            # Validate dataset structure
-            dataset_info = self._asset_scanner.validate_dataset(folder_path)
-
-            if not dataset_info.get("is_valid", False):
-                _logger.warning(f"Invalid dataset structure: {folder_path}")
-                return
-
-            context = ensure_dataset_catalog_context(
-                folder_path,
-                asset_index=self._asset_index,
-                scanner=self._asset_scanner,
-                thumbnails=self._asset_thumbnails,
-            )
-            project_id = context.get("project_id")
-            scene_id = context.get("scene_id")
-            asset_id = context.get("asset_id")
-            asset = self._asset_index.get_asset(asset_id) if asset_id else None
-
-            # Link dataset to scene
-            if asset:
-                # Auto-select the newly imported dataset to show its info
-                # Add to selection instead of replacing (allow multiple imports)
-                self._selected_asset_ids.add(asset.id)
-                # Preserve user's existing project/scene filters - don't change them
-                # The dataset will appear in the catalog based on current filters
-                self._update_selection_type()
-            self._import_menu_open = False
-
-            # Refresh UI
-            self.refresh_catalog()
-            self._dirty_model("import_menu_open")
-            self._update_selection_details()
-
-            if asset:
-                _logger.info(f"Imported dataset: {asset.name}")
-
-        except Exception as e:
-            _logger.error(f"Failed to import dataset: {e}")
-
-    def on_load_selected(self, _handle, _ev, args):
-        """Load selected asset(s) into the viewer."""
-        if not self._selected_asset_ids:
-            return
-
-        for asset_id in self._selected_asset_ids:
-            if not self._asset_index or not hasattr(self._asset_index, "assets"):
-                continue
-
-            asset = self._asset_index.assets.get(asset_id)
-            if not asset:
-                continue
-
-            file_path = asset.get("absolute_path") or asset.get("path")
-            if not file_path or not os.path.exists(file_path):
-                self._asset_index.delete_asset(asset_id)
-                continue
-
-            try:
-                if asset.get("type") not in self.LOADABLE_TYPES:
-                    continue
-                # Load based on asset type
-                asset_type = asset.get("type", "")
-                if asset_type == "dataset":
-                    # Datasets need special loading with output path
-                    output_path = asset.get("output_path") or str(
-                        Path(file_path) / "output"
-                    )
-                    lf.load_file(
-                        file_path,
-                        is_dataset=True,
-                        output_path=output_path,
-                    )
-                else:
-                    # Regular mesh/splat file loading
-                    transform_node_name = self._load_asset_with_hierarchy(file_path)
-                    self._apply_asset_transform(asset, transform_node_name)
-                _logger.info(f"Loaded asset: {asset.get('name')}")
-            except Exception as e:
-                _logger.error(f"Failed to load asset {asset_id}: {e}")
-
-    def _delete_asset_from_catalog(self, asset_id: str) -> bool:
-        if not self._asset_index:
-            return False
-        if hasattr(self._asset_index, "delete_asset"):
-            return bool(self._asset_index.delete_asset(asset_id))
-        if hasattr(self._asset_index, "remove_asset"):
-            return bool(self._asset_index.remove_asset(asset_id))
-        return False
-
-    def on_remove_from_catalog(self, _handle, _ev, args):
-        """Remove selected assets from catalog (not from disk)."""
-        if not self._selected_asset_ids:
-            return
-
-        removed_count = 0
-        for asset_id in list(self._selected_asset_ids):
-            try:
-                if self._delete_asset_from_catalog(asset_id):
-                    removed_count += 1
-            except Exception as e:
-                _logger.warning(f"Failed to remove asset {asset_id}: {e}")
-
-        # Clear selection
-        self._selected_asset_ids.clear()
-        self._update_selection_type()
-
-        # Refresh UI
-        self.refresh_catalog()
-
-        _logger.info(f"Removed {removed_count} assets from catalog")
-
-    def select_project(self, _handle, _ev, args):
-        """Select a project to filter scenes and assets."""
-        project_id = self._resolve_event_value(args, _ev, "data-project-id")
-        self._select_project_id(project_id)
-
-    def _select_project_id(self, project_id: str) -> bool:
-        if not project_id:
-            return False
-        self._selected_project_id = project_id if project_id != "all" else None
-        self._selected_scene_id = None  # Clear scene selection when project changes
-        self._selected_asset_ids.clear()
-        self._selection_type = "project" if self._selected_project_id else "none"
-
-        self._dirty_model(
-            "projects",
-            "scenes",
-            "assets",
-            "selected_count",
-            "selected_total_size",
-            "selection_type",
-            "selected_project_name",
-            "selected_project_created",
-            "selected_project_modified",
-            *self._selection_visibility_fields(),
-        )
-        return True
-
-    def select_scene(self, _handle, _ev, args):
-        """Select a scene to filter assets."""
-        scene_id = self._resolve_event_value(args, _ev, "data-scene-id")
-        self._select_scene_id(scene_id)
-
-    def _select_scene_id(self, scene_id: str) -> bool:
-        if not scene_id:
-            return False
-        self._selected_scene_id = scene_id if scene_id != "all" else None
-        self._selected_asset_ids.clear()
-        self._selection_type = "scene" if self._selected_scene_id else "none"
-
-        self._dirty_model(
-            "scenes",
-            "assets",
-            "asset_count",
-            "selected_count",
-            "selected_total_size",
-            "selection_type",
-            "selected_scene_name",
-            "selected_scene_project_name",
-            "selected_scene_asset_count",
-            "selected_scene_created",
-            "selected_scene_modified",
-            "selected_scene_assets",
-            *self._selection_visibility_fields(),
-        )
-        return True
-
-    def toggle_import_menu(self, _handle, _ev, args):
-        """Toggle the import dropdown menu."""
-        self._import_menu_open = not self._import_menu_open
-        self._dirty_model("import_menu_open")
-
-    def on_import_checkpoint(self, _handle, _ev, args):
-        """Import a checkpoint file."""
-        if not self._asset_index:
-            _logger.warning("Asset index not initialized")
-            return
-
-        # Open file dialog for checkpoint
-        file_path = lf.ui.open_checkpoint_file_dialog()
-
-        if not file_path:
-            return
-
-        try:
-            asset = self._scan_and_register_asset(
-                file_path,
-                project_id=self._ensure_import_project(),
-                scene_id=self._selected_scene_id,
-                fallback_role="training_checkpoint",
-                override_type="checkpoint",
-                override_role="training_checkpoint",
-            )
-            self._import_menu_open = False
-
-            # Refresh UI
-            self.refresh_catalog()
-            self._dirty_model("import_menu_open")
-
-            if asset:
-                _logger.info(f"Imported checkpoint: {asset.name}")
-
-        except Exception as e:
-            _logger.error(f"Failed to import checkpoint: {e}")
-
-    def on_locate_file(self, _handle, _ev, args):
-        """Open file dialog to locate missing file."""
-        if not self._selected_asset_ids or len(self._selected_asset_ids) != 1:
-            return
-
-        asset_id = list(self._selected_asset_ids)[0]
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return
-
-        asset = self._asset_index.assets.get(asset_id)
+    def on_selected_fix(self, _handle=None, _ev=None, _args=None):
+        asset = self._get_selected_asset()
         if not asset:
             return
-
-        # Open file dialog - use ply dialog as it supports multiple asset formats
-        file_path = lf.ui.open_ply_file_dialog("")
-
-        if not file_path:
-            return
-
-        try:
-            # Update asset path
-            self._asset_index.update_asset(
-                asset_id,
-                path=file_path,
-                absolute_path=os.path.abspath(file_path),
-                exists=True,
+        action = self.get_selected_fix_action()
+        if action == "locate":
+            self.on_locate_file()
+        elif action == "verify":
+            self._start_project_operation(
+                asset["id"], "Verify project",
+                lambda progress, cancel: self._verify_project(asset["id"], asset["path"], progress, cancel),
             )
-            self.refresh_catalog()
-            _logger.info(f"Updated asset path: {asset.get('name', 'unknown')}")
-        except Exception as e:
-            _logger.error(f"Failed to locate file: {e}")
+        elif action == "repair":
+            self.open_project_operation(None, None, ["repair"])
 
-    def select_asset_by_id(self, _handle, _ev, args):
-        """Select an asset by ID."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        self._select_asset_id(asset_id)
+    def _verify_project(self, asset_id: str, path: str, progress: Callable[..., None], cancel: Callable[[], bool]) -> Any:
+        result = self._native_io_call("verify_project_file", path, progress, cancel)
+        status = str(getattr(getattr(result, "status", None), "name", getattr(result, "status", "")) or "").lower()
+        self._verify_results[asset_id] = status or tr("projects.status.verified")
+        return result
+
+    def on_use_found_location(self, _handle=None, _ev=None, args=None):
+        asset_id = self._resolve_event_value((), _ev, "data-asset-id") or self.get_selected_asset_id()
+        if not asset_id or not self._asset_index:
+            return
+        asset = self._asset_dict(asset_id)
+        candidate = str((asset or {}).get("relocation_candidate") or "")
+        if not candidate:
+            return
+        try:
+            if self._library_command("relink_asset", asset_id, candidate):
+                self.refresh_catalog(scan_folders=False)
+            else:
+                self._log_warn("Could not use the found location for this project")
+        except Exception as exc:
+            self._log_error("Failed to relink .licht project: %s", exc)
+
+    def _selected_transfer_recovery(self, *, label=False):
+        asset = self._get_selected_asset()
+        if not asset:
+            return ""
+        badge = self._gallery_badge(asset)
+        if not badge["health_badge"] and badge["gallery_action"] in ("resume", "retry"):
+            return badge["gallery_action_label"] if label else badge["gallery_action"]
+        return ""
 
     def on_load_asset(self, _handle, _ev, args):
-        """Load a specific asset by ID into the viewer."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        self._load_asset(asset_id, replace_scene=False)
+        # The action button must not also toggle its containing compact strip.
+        if _ev is not None:
+            self._stop_event(_ev)
+        asset_id = self._resolve_event_value(args, _ev, "data-asset-id") or self.get_selected_asset_id()
+        asset = self._asset_dict(asset_id) or {}
+        if str(asset.get("status") or "") in ("MISSING", "IDENTITY_MISMATCH"):
+            self.on_locate_file(None, None, [asset_id])
+        elif asset.get("status") == "REPAIR_ONLY":
+            self.open_project_operation(None, None, ["repair"])
+        else:
+            self._load_asset(asset_id)
 
-    def on_load_asset_new(self, _handle, _ev, args):
-        """Clear the scene and load a specific asset by ID into the viewer."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        self._load_asset(asset_id, replace_scene=True)
+    def _dialog_entry(self) -> Optional[Dict[str, Any]]:
+        return self._asset_dict(self._dialog_asset_id or self.get_selected_asset_id())
 
-    def on_add_asset_to_scene(self, _handle, _ev, args):
-        """Load a specific asset by ID into the current scene."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        self._load_asset(asset_id, replace_scene=False)
+    def get_dialog_title(self) -> str:
+        return tr({
+            "update_thumbnail": "projects.dialog.update_thumbnail",
+            "license": "projects.contents.license_chooser",
+            "remove_content": "projects.contents.remove",
+            "compact_content": "projects.contents.compact",
+            "rename": "projects.dialog.rename_project",
+            "gallery_details": "projects.gallery.details.dialog",
+            "repair": "projects.dialog.repair",
+            "locate_dataset": "projects.dialog.locate_dataset",
+        }.get(self._dialog_kind, "projects.inspector.operations"))
 
-    def _load_asset(self, asset_id: str, *, replace_scene: bool) -> None:
-        if not asset_id:
+    def get_dialog_confirm_label(self) -> str:
+        return tr({
+            "update_thumbnail": "projects.action.update_thumbnail",
+            "license": "common.save",
+            "remove_content": "projects.contents.remove",
+            "compact_content": "projects.contents.compact",
+            "rename": "common.save",
+            "gallery_details": "common.save",
+            "repair": "projects.action.repair",
+            "locate_dataset": "projects.action.locate_dataset",
+        }.get(self._dialog_kind, "common.ok"))
+
+    def _set_dialog(self, kind: str, data: Optional[Dict[str, Any]] = None) -> None:
+        self._dialog_serial += 1
+        self._dialog_key = f"projects:{id(self)}:{self._dialog_serial}"
+        self._dialog_kind = str(kind or "")
+        self._dialog_data = dict(data or {})
+        self._dialog_busy = bool(self._dialog_data.get("busy"))
+        if self._handle:
+            self._handle.dirty_all()
+        self._request_model_update()
+        self._show_project_form()
+
+    def _project_form(self):
+        return form_content(self._dialog_kind, self._dialog_data, tr=tr,
+                            confirm_label=self.get_dialog_confirm_label(), busy=self._dialog_busy)
+
+    def _show_project_form(self) -> None:
+        if not self._dialog_kind:
             return
+        body, buttons = self._project_form()
+        key = self._dialog_key
+        lf.ui.form_dialog(key, self.get_dialog_title(), body, buttons,
+                          lambda label, values: self._project_form_result(key, label, values),
+                          lambda values: self._project_form_changed(key, values),
+                          width=560 if self._dialog_kind in {"remove_content", "compact_content", "license", "gallery_details"} else 720)
 
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            self._log_warn("Asset index not initialized")
+    def _refresh_project_form(self, *, body: bool = True) -> None:
+        if not self._dialog_kind:
             return
+        content, buttons = self._project_form()
+        lf.ui.form_dialog_update(self._dialog_key, buttons, content if body else None)
 
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            self._log_warn("Asset not found: %s", asset_id)
+    def _read_project_form(self, values) -> None:
+        for key in ("destination", "format", "source", "name", "gallery_title", "gallery_description", "license_choice", "license_name", "license_text", "attribution"):
+            if key in values:
+                self._dialog_data[key] = str(values[key])
+
+    def _project_form_changed(self, key, values) -> None:
+        if key != self._dialog_key or not self._dialog_kind:
             return
-        if asset.get("type") not in self.LOADABLE_TYPES:
-            self._log_warn("Asset type is not loadable: %s", asset.get("type"))
+        previous = self._dialog_data.get("license_choice")
+        self._read_project_form(values)
+        current = self._dialog_data.get("license_choice")
+        if previous != current:
+            # Replace form content after the native control finishes its event.
+            self._schedule_ui(lambda: self._refresh_project_form() if key == self._dialog_key else None)
+
+    def _project_form_result(self, key, label, values) -> None:
+        if key != self._dialog_key or not self._dialog_kind:
             return
-
-        file_path = asset.get("absolute_path") or asset.get("path")
-        if not file_path or not os.path.exists(file_path):
-            self._delete_asset_from_catalog(asset_id)
+        self._read_project_form(values)
+        if not label or label == tr("common.cancel"):
+            self.close_project_dialog()
             return
+        if label == tr("projects.dialog.choose_destination"):
+            self.dialog_choose_destination()
+        else:
+            self.confirm_project_dialog()
+        # A canceled native picker returns to the same form and its values.
+        if self._dialog_kind:
+            self._show_project_form()
 
-        try:
-            if replace_scene:
-                lf.clear_scene()
-
-            # Load based on asset type
-            asset_type = asset.get("type", "")
-            if asset_type == "dataset":
-                # Datasets need special loading with output path
-                output_path = asset.get("output_path") or str(
-                    Path(file_path) / "output"
-                )
-                lf.load_file(
-                    file_path,
-                    is_dataset=True,
-                    output_path=output_path,
-                )
-                self._queue_pending_transform_application(asset)
-            else:
-                # Regular mesh/splat file loading
-                transform_node_name = self._load_asset_with_hierarchy(file_path)
-                self._apply_asset_transform(asset, transform_node_name)
-            self._log_info("Loaded asset: %s", asset.get("name", "unknown"))
-
-            # Select the loaded asset
-            self._selected_asset_ids = {asset_id}
-            self._selection_type = "asset"
-            self.refresh_catalog()
-        except Exception as e:
-            self._log_error("Failed to load asset %s: %s", asset_id, e)
-
-    def _node_name(self, node: Any) -> str:
-        try:
-            return str(node.get("name"))
-        except Exception:
-            return ""
-
-    def _load_asset_with_hierarchy(self, file_path: str) -> Optional[str]:
-        scene = lf.get_scene()
-        before_ids = {node.id for node in scene.get_nodes()} if scene is not None else set()
-        lf.load_file(file_path)
-        scene = lf.get_scene()
-        if scene is None:
-            return None
-
-        new_nodes = [node for node in scene.get_nodes() if node.id not in before_ids]
-        by_id = {node.id: node for node in new_nodes}
-        for node in new_nodes:
-            if getattr(getattr(node, "type", None), "name", "") != "GROUP":
-                continue
-            parent = by_id.get(getattr(node, "parent_id", -1))
-            if parent is None:
-                continue
-            parent_name = self._node_name(parent)
-            if self._node_name(node) == f"{parent_name}_transform":
-                return self._node_name(node)
-        for node in new_nodes:
-            if getattr(getattr(node, "type", None), "name", "") == "GROUP" and getattr(node, "parent_id", -1) == -1:
-                return self._node_name(node)
-        for node in new_nodes:
-            if getattr(node, "parent_id", -1) == -1:
-                return self._node_name(node)
-        return None
-
-    def _quat_to_euler_deg(self, quat: Any) -> Optional[List[float]]:
-        try:
-            x, y, z, w = [float(v) for v in quat[:4]]
-            n = (x * x + y * y + z * z + w * w) ** 0.5
-            if n == 0.0:
-                return [0.0, 0.0, 0.0]
-            x, y, z, w = x / n, y / n, z / n, w / n
-
-            t0 = 2.0 * (w * x + y * z)
-            t1 = 1.0 - 2.0 * (x * x + y * y)
-            roll = math.atan2(t0, t1)
-
-            t2 = 2.0 * (w * y - z * x)
-            t2 = 1.0 if t2 > 1.0 else t2
-            t2 = -1.0 if t2 < -1.0 else t2
-            pitch = math.asin(t2)
-
-            t3 = 2.0 * (w * z + x * y)
-            t4 = 1.0 - 2.0 * (y * y + z * z)
-            yaw = math.atan2(t3, t4)
-            return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
-        except Exception:
-            return None
-
-    def _apply_asset_transform(self, asset: Dict[str, Any], transform_node_name: Optional[str]) -> bool:
-        try:
-            if not transform_node_name:
-                geometry_metadata = asset.get("geometry_metadata", {}) or {}
-                transform_node_name = geometry_metadata.get("transform_node_name")
-            if not transform_node_name:
-                return False
-
-            transform_metadata = asset.get("transform_metadata") or {}
-            if not transform_metadata:
-                return False
-
-            matrix = transform_metadata.get("matrix")
-            if isinstance(matrix, list) and len(matrix) == 16:
-                lf.set_node_transform(transform_node_name, matrix)
-                _logger.info("Applied saved matrix transform to '%s'", transform_node_name)
-                return True
-
-            translation = transform_metadata.get("translation", [0.0, 0.0, 0.0])
-            scale = transform_metadata.get("scale", [1.0, 1.0, 1.0])
-            euler_deg = transform_metadata.get("rotation_euler_deg")
-            if not euler_deg:
-                euler_deg = self._quat_to_euler_deg(
-                    transform_metadata.get("rotation_quat", [0.0, 0.0, 0.0, 1.0])
-                )
-            if not euler_deg:
-                euler_deg = [0.0, 0.0, 0.0]
-
-            matrix = lf.compose_transform(translation, euler_deg, scale)
-            lf.set_node_transform(transform_node_name, matrix)
-            _logger.info("Applied saved transform to '%s'", transform_node_name)
-            return True
-        except Exception as e:
-            _logger.warning(f"Failed to apply asset transform: {e}")
-            return False
-
-    def _queue_pending_transform_application(self, asset: Dict[str, Any]) -> None:
-        transform_metadata = asset.get("transform_metadata") or {}
-        geometry_metadata = asset.get("geometry_metadata", {}) or {}
-        subtree_transforms = geometry_metadata.get("subtree_transforms")
-        has_matrix = isinstance(transform_metadata.get("matrix"), list) and len(transform_metadata.get("matrix")) == 16
-        has_subtree = isinstance(subtree_transforms, dict) and bool(subtree_transforms)
-        if not has_matrix and not has_subtree:
-            return
-
-        self._pending_transform_applications.append(
-            {
-                "asset_id": str(asset.get("id", "")),
-                "asset_name": str(asset.get("name", "")),
-                "transform_metadata": transform_metadata,
-                "geometry_metadata": geometry_metadata,
-                "queued_at": time.time(),
-                "attempts": 0,
-                "root_applied": False,
-                "pending_subtree_nodes": set(),
-            }
-        )
+    def close_project_dialog(self, _handle=None, _ev=None, _args=None) -> None:
+        self._dialog_kind = ""
+        self._dialog_key = ""
+        self._dialog_data = {}
+        self._dialog_busy = False
+        if self._handle:
+            self._handle.dirty_all()
         self._request_model_update()
 
-    def _resolve_loaded_asset_root_name(self, scene, pending: Dict[str, Any]) -> Optional[str]:
-        geometry_metadata = pending.get("geometry_metadata", {}) or {}
-        candidate_names: List[str] = []
-        for key in ("scene_node_name", "transform_node_name"):
-            value = geometry_metadata.get(key)
-            if isinstance(value, str) and value:
-                candidate_names.append(value)
-
-        asset_name = pending.get("asset_name")
-        if isinstance(asset_name, str) and asset_name:
-            candidate_names.append(asset_name)
-
-        seen: Set[str] = set()
-        deduped = []
-        for name in candidate_names:
-            if name in seen:
-                continue
-            seen.add(name)
-            deduped.append(name)
-
-        for name in deduped:
-            try:
-                if scene.get_node(name) is not None:
-                    return name
-            except Exception:
-                continue
-        return None
-
-    def _apply_pending_transform(self, scene, pending: Dict[str, Any]) -> bool:
-        transform_metadata = pending.get("transform_metadata", {}) or {}
-        geometry_metadata = pending.get("geometry_metadata", {}) or {}
-        root_name = self._resolve_loaded_asset_root_name(scene, pending)
-        if not root_name:
+    def _can_edit_gallery_details(self) -> bool:
+        asset = self._get_selected_asset()
+        if not asset or asset.get("remote_only"):
             return False
+        linked = self._gallery_project_id(asset) in self._gallery_state.get("links", {})
+        return bool(linked or not asset.get("recent_only") and asset["id"] in self._asset_index_assets())
 
-        if not pending.get("root_applied"):
-            matrix = transform_metadata.get("matrix")
-            if isinstance(matrix, list) and len(matrix) == 16:
-                lf.set_node_transform(root_name, matrix)
-            else:
-                translation = transform_metadata.get("translation", [0.0, 0.0, 0.0])
-                scale = transform_metadata.get("scale", [1.0, 1.0, 1.0])
-                euler_deg = transform_metadata.get("rotation_euler_deg")
-                if not euler_deg:
-                    euler_deg = self._quat_to_euler_deg(
-                        transform_metadata.get("rotation_quat", [0.0, 0.0, 0.0, 1.0])
-                    )
-                if not euler_deg:
-                    euler_deg = [0.0, 0.0, 0.0]
-                composed = lf.compose_transform(translation, euler_deg, scale)
-                lf.set_node_transform(root_name, composed)
-            pending["root_applied"] = True
-
-        subtree_transforms = geometry_metadata.get("subtree_transforms")
-        if not isinstance(subtree_transforms, dict) or not subtree_transforms:
-            return True
-
-        if not pending.get("pending_subtree_nodes"):
-            pending["pending_subtree_nodes"] = {
-                str(name)
-                for name in subtree_transforms.keys()
-                if str(name) and str(name) != root_name
-            }
-
-        unresolved = set(pending.get("pending_subtree_nodes", set()))
-        for node_name in list(unresolved):
-            node = scene.get_node(node_name)
-            if node is None:
-                continue
-            meta = subtree_transforms.get(node_name)
-            if not isinstance(meta, dict):
-                unresolved.discard(node_name)
-                continue
-            local_matrix = meta.get("local_matrix")
-            if isinstance(local_matrix, list) and len(local_matrix) == 16:
-                lf.set_node_transform(node_name, local_matrix)
-            unresolved.discard(node_name)
-
-        pending["pending_subtree_nodes"] = unresolved
-        return not unresolved
-
-    def _flush_pending_transform_applications(self) -> None:
-        if not self._pending_transform_applications:
+    def open_gallery_details(self, _handle=None, _ev=None, _args=None) -> None:
+        if not self._can_edit_gallery_details():
             return
-        scene = lf.get_scene()
-        if scene is None:
-            return
+        asset = self._get_selected_asset()
+        details = self._gallery_details(asset)
+        self._dialog_asset_id = asset["id"]
+        self._set_dialog("gallery_details", {
+            "path": asset.get("path", ""), "gallery_title": details["title"],
+            "gallery_description": details["description"],
+            "gallery_project_id": self._gallery_project_id(asset),
+            "gallery_identity": self._gallery_state.get("identity"),
+        })
 
-        now = time.time()
-        next_pending: List[Dict[str, Any]] = []
-        for pending in self._pending_transform_applications:
+    def remember_gallery_details(self, project_id: str, title: str, description: str) -> None:
+        if project_id not in self._asset_index_assets():
+            return
+        if self._library_command(
+            "update_asset", project_id, gallery_details_draft={"title": title, "description": description}
+        ) is not None:
+            self.refresh_catalog(scan_folders=False)
+
+    def open_project_operation(self, _handle=None, _ev=None, args=None) -> None:
+        action = self._resolve_event_value(args, _ev, "data-project-operation")
+        if not action and args:
+            action = str(args[0])
+        if not action:
+            return
+        asset_id = self._resolve_event_value((), _ev, "data-asset-id") or self.get_selected_asset_id()
+        asset = self._asset_dict(asset_id)
+        if not asset or asset.get("remote_only"):
+            return
+        if action == "export_as":
+            self._export_asset(asset)
+            return
+        if action in {"clean", "compact_content"}:
+            asset = dict(asset)
+            if (self._contents_busy(asset_id) or
+                    action not in {item["action"] for item in operation_actions(self._asset_with_inspection(asset))}):
+                return
+            if action == "clean":
+                from .project_cleanup import open_project_cleanup
+
+                def run_closed(operation, complete, *, expected_commit_uuid):
+                    current = self._asset_dict(asset_id)
+                    if not current or str(current.get("path") or "") != str(asset["path"]):
+                        raise RuntimeError(tr("project_cleanup.changed"))
+                    if not self._start_project_operation(asset_id, tr("project_cleanup.title"), operation,
+                            operation_kind="clean", on_finished=complete,
+                            expected_commit_uuid=expected_commit_uuid):
+                        raise RuntimeError(tr("project_cleanup.changed"))
+
+                def refresh():
+                    self._inspection_by_asset.pop(asset_id, None)
+                    if self._inspection_pipeline is not None:
+                        self._inspection_pipeline.invalidate(asset_id)
+                    self.refresh_catalog(scan_folders=False)
+
+                open_project_cleanup(str(asset["path"]), run_closed, refresh)
+                return
+            self._dialog_asset_id = asset_id
+            self._set_dialog("compact_content", {"message": tr("projects.contents.confirm_compact")})
+            return
+        self._dialog_asset_id = asset_id
+        details = self._inspection_by_asset.get(asset_id, {}).get("details")
+        if action == "update_thumbnail":
+            dataset_available, embedded_available = self._thumbnail_source_availability(
+                str(asset.get("path") or "")
+            )
+            data = dialog_model(
+                action,
+                entry=asset,
+                details=details,
+                dataset_available=dataset_available,
+                embedded_available=embedded_available,
+                viewport_available=self._has_renderable_project_viewport(
+                    str(asset.get("path") or "")
+                ),
+            )
+        else:
+            data = dialog_model(action, entry=asset, details=details)
+        data["name"] = self._get_asset_display_name(asset)
+        self._set_dialog(action, data)
+
+    def dialog_choose_destination(self, _handle=None, _ev=None, _args=None) -> None:
+        source = Path(str(self._dialog_data.get("path") or "project.licht"))
+        path = lf.ui.save_project_file_dialog(source.stem + "-copy.licht", str(source.parent))
+        if path:
+            self._dialog_data["destination"] = str(path)
+
+    def confirm_project_dialog(self, _handle=None, _ev=None, _args=None) -> None:
+        action = self._dialog_kind
+        asset = self._dialog_entry()
+        if not action or not asset or not asset.get("path"):
+            return
+        path = str(asset["path"])
+        data = self._dialog_data
+        if action == "gallery_details":
+            project_id = data["gallery_project_id"]
+            title = str(data.get("gallery_title", "")).strip()
+            description = str(data.get("gallery_description", ""))
+            if not title:
+                data["message"] = tr("projects.gallery.details.title_required")
+                self._refresh_project_form()
+                return
             try:
-                done = self._apply_pending_transform(scene, pending)
-                if done:
-                    continue
-                pending["attempts"] = int(pending.get("attempts", 0)) + 1
-                age = now - float(pending.get("queued_at", now))
-                if age > 15.0 or pending["attempts"] > 40:
-                    _logger.warning(
-                        "Timed out applying deferred transform for asset '%s' (id=%s)",
-                        pending.get("asset_name", ""),
-                        pending.get("asset_id", ""),
-                    )
-                    continue
-                next_pending.append(pending)
-            except Exception as e:
-                _logger.warning(
-                    "Deferred transform apply failed for asset '%s': %s",
-                    pending.get("asset_name", ""),
-                    e,
+                if project_id in self._gallery_state.get("links", {}):
+                    controller = self._controller()
+                    if controller.service.identity() != data["gallery_identity"]:
+                        raise ValueError(tr("projects.gallery.error.account_changed"))
+                    controller.service.set_local_details(project_id, title, description)
+                    controller._schedule_poll()
+                elif not asset.get("recent_only") and self._library_command(
+                    "update_asset", asset["id"], gallery_details_draft={"title": title, "description": description}
+                ) is not None:
+                    self.refresh_catalog(scan_folders=False)
+                else:
+                    raise ValueError(tr("projects.gallery.error.storage"))
+            except Exception as exc:
+                data["message"] = str(exc)
+                self._refresh_project_form()
+                return
+            self.close_project_dialog()
+            return
+        if action == "update_thumbnail":
+            dataset_available, embedded_available = self._thumbnail_source_availability(path)
+            sources = thumbnail_source_options(
+                asset,
+                dataset_available=dataset_available,
+                embedded_available=embedded_available,
+                viewport_available=self._has_renderable_project_viewport(path),
+            )
+            if data.get("source") not in sources:
+                data["sources"] = sources
+                data["source"] = next(
+                    (
+                        source
+                        for source in ("first_dataset", "first_embedded", "viewport")
+                        if source in sources
+                    ),
+                    "image_file",
                 )
-        self._pending_transform_applications = next_pending
-
-    def on_remove_asset(self, _handle, _ev, args):
-        """Remove a specific asset from the catalog by ID."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        if not asset_id:
+                self._refresh_project_form()
+                return
+            if not self._start_thumbnail_operation(asset):
+                return
+        elif action == "license":
+            try:
+                identifier, notice = license_value(data)
+            except ValueError as error:
+                data["message"] = tr(str(error))
+                return
+            self._start_project_operation(asset["id"], tr("projects.contents.license_chooser"), lambda _progress, _cancel: self._native_io_call("set_project_license", path, identifier, notice))
+        elif action == "remove_content":
+            row = data["row"]
+            options = {"compact": False, "drop_unbound_checkpoints": False}
+            if row["kind"] == "license":
+                function = lambda _progress, _cancel: self._native_io_call("clear_project_license", path)
+            else:
+                if row["kind"] == "save": options["save_generation"] = row["generation"]
+                elif row["kind"] == "checkpoint": options["checkpoint_uuid"] = row["checkpoint_uuid"]
+                elif row["kind"] == "dataset": options["drop_embedded_dataset"] = True
+                elif row["kind"] == "thumbnail": options["drop_thumbnail"] = True
+                elif row["kind"] == "metrics": options["drop_metrics"] = True
+                function = lambda progress, cancel: self._native_io_call("reduce_size", path, options, progress, cancel)
+            self._start_project_operation(asset["id"], tr("projects.contents.removing").format(part=row["label"]), function,
+                                          content_row=row, operation_kind="remove")
+        elif action == "compact_content":
+            self._start_project_operation(asset["id"], tr("projects.contents.compact"),
+                lambda progress, cancel: self._native_io_call("compact_project_file", path, progress, cancel),
+                content_row={"id": "compact", "kind": "compact"}, operation_kind="compact")
+        elif action == "rename":
+            name = str(data.get("name") or "").strip()
+            if name:
+                after = None if asset.get("recent_only") else lambda: self._rename_catalog_entry(asset["id"], name)
+                self._start_project_operation(
+                    asset["id"],
+                    "Rename project",
+                    lambda _progress, _cancel: self._native_io_call("set_project_title", path, name),
+                    after=after,
+                    reverify_asset=True,
+                )
+        elif action == "repair":
+            destination = str(data.get("destination") or "")
+            if not destination:
+                self.dialog_choose_destination()
+                destination = str(data.get("destination") or "")
+            if destination:
+                self._start_project_operation(asset["id"], "Repair project", lambda _progress, _cancel: self._native_io_call("repair_project", path, destination, asset["id"]), backup=False)
+        elif action == "locate_dataset":
+            directory = lf.ui.open_folder_dialog(tr("projects.dialog.select_dataset"), str(Path(path).parent))
+            if directory:
+                self._start_project_operation(asset["id"], "Locate dataset", lambda _progress, _cancel: self._native_io_call("set_dataset_reference", path, directory))
+        if action not in {"update_thumbnail", "license", "rename", "repair", "locate_dataset", "remove_content", "compact_content"}:
             return
+        self.close_project_dialog()
 
-        if not self._asset_index:
-            self._log_warn("Asset index not initialized")
+    def _export_asset(self, asset: Dict[str, Any]) -> None:
+        """Show the File > Export panel for this project, opening the project first when needed."""
+        path = str(asset.get("path") or "")
+
+        def show_export() -> None:
+            lf.ui.set_panel_enabled("lfs.export", True)
+
+        if self._is_active_project_path(path):
+            self._on_close_panel()
+            show_export()
             return
+        from .file_menu import open_project_with_confirmation
+
+        open_project_with_confirmation(path, then=show_export)
+
+    def _rename_catalog_entry(self, asset_id: str, name: str) -> None:
+        self._library_command("update_asset", asset_id, name=name)
+
+    def _start_thumbnail_operation(self, asset: Dict[str, Any]) -> bool:
+        source = str(self._dialog_data.get("source") or "first_dataset")
+        path = str(asset["path"])
+        active = self._is_active_project_path(path)
+        project_id = str(asset.get("native_project_uuid") or asset.get("project_uuid") or asset["id"])
+        if active and project_id.startswith("recent:"):
+            card = self._native_io_call("inspect_project_card", path)
+            project_id = str(card.project_uuid)
+        if source == "image_file":
+            image_path = str(getattr(lf.ui, "open_image_dialog", lambda *_args: "")(""))
+            if not image_path:
+                return False
+            if active:
+                self._start_project_operation(
+                    asset["id"],
+                    tr("projects.action.update_thumbnail"),
+                    lambda _progress, _cancel: self._apply_encoded_active_preview(
+                        path, project_id, "encode_preview_from_image_file", image_path
+                    ),
+                    reverify_asset=True,
+                    closed_file=False,
+                )
+            else:
+                self._start_project_operation(asset["id"], tr("projects.action.update_thumbnail"), lambda _progress, _cancel: self._native_io_call("preview_from_image_file", path, image_path), reverify_asset=True)
+        elif source == "viewport":
+            self._start_project_operation(
+                asset["id"],
+                tr("projects.action.update_thumbnail"),
+                lambda _progress, _cancel: self._capture_viewport_preview(path, project_id),
+                reverify_asset=True,
+                closed_file=False,
+            )
+        else:
+            native_name = "preview_from_first_embedded_image" if source == "first_embedded" else "preview_from_first_dataset_image"
+            encode_name = (
+                "encode_preview_from_first_embedded_image"
+                if source == "first_embedded"
+                else "encode_preview_from_first_dataset_image"
+            )
+            if active:
+                self._start_project_operation(
+                    asset["id"],
+                    tr("projects.action.update_thumbnail"),
+                    lambda _progress, _cancel: self._apply_encoded_active_preview(
+                        path, project_id, encode_name, path
+                    ),
+                    reverify_asset=True,
+                    closed_file=False,
+                )
+            else:
+                self._start_project_operation(asset["id"], tr("projects.action.update_thumbnail"), lambda _progress, _cancel: self._native_io_call(native_name, path), reverify_asset=True)
+        return True
+
+    @staticmethod
+    def _capture_viewport_preview(path: str, project_id: str) -> Any:
+        from .asset_storage import preview_capture
+
+        active_path = AssetManagerPanel._active_project_path()
+        renderable_viewport = False
+        try:
+            scene_getter = getattr(lf, "get_render_scene", None)
+            scene = scene_getter() if callable(scene_getter) else None
+            exporter = getattr(lf, "export_viewport_image", None)
+            renderable_viewport = (
+                scene is not None
+                and int(getattr(scene, "total_gaussian_count", 0) or 0) > 0
+                and callable(exporter)
+            )
+        except (RuntimeError, TypeError, ValueError):
+            pass
+        if "viewport" not in thumbnail_source_options(
+            {"path": path},
+            viewport_available=(
+                renderable_viewport
+                and bool(active_path)
+                and Path(path).resolve() == Path(active_path).resolve()
+            ),
+        ):
+            raise RuntimeError("The current viewport no longer belongs to this project")
+
+        with preview_capture(project_id) as target:
+            exporter = getattr(lf, "export_viewport_image", None)
+            if not callable(exporter):
+                raise RuntimeError("The current viewport has no captured image")
+            exporter(str(target), "png")
+            png = target.read_bytes()
+        if not AssetManagerPanel._is_active_project_path(path):
+            raise RuntimeError("The current viewport no longer belongs to this project")
+        AssetManagerPanel._apply_active_project_preview(path, project_id, png)
+
+    @staticmethod
+    def _apply_encoded_active_preview(
+        path: str, project_id: str, native_name: str, *args: Any
+    ) -> None:
+        png = AssetManagerPanel._native_io_call(native_name, *args)
+        AssetManagerPanel._apply_active_project_preview(path, project_id, png)
+
+    @staticmethod
+    def _thumbnail_error_message(error: Any) -> str:
+        message = str(error)
+        for line in message.splitlines():
+            if line.strip().startswith("user_message:"):
+                return line.split("user_message:", 1)[1].strip()
+        return message
+
+    @staticmethod
+    def _apply_active_project_preview(path: str, project_id: str, png: Any) -> None:
+        apply = getattr(lf, "project_set_preview", None)
+        if not callable(apply):
+            raise RuntimeError("The active project cannot accept this thumbnail")
+        try:
+            apply(png, path=path, project_uuid=str(project_id or ""))
+        except RuntimeError as exc:
+            raise RuntimeError(AssetManagerPanel._thumbnail_error_message(exc)) from exc
+        poll = getattr(lf, "project_poll_write", None)
+        if not callable(poll):
+            return
+        deadline = time.monotonic() + 600.0
+        while time.monotonic() < deadline:
+            try:
+                state = poll()
+            except Exception as exc:
+                raise RuntimeError(AssetManagerPanel._thumbnail_error_message(exc)) from exc
+            if not isinstance(state, dict):
+                return
+            error = state.get("error") or ""
+            if error:
+                raise RuntimeError(AssetManagerPanel._thumbnail_error_message(error))
+            if not state.get("running"):
+                return
+            time.sleep(0.05)
+        raise RuntimeError("The project thumbnail write did not finish")
+
+    def _start_project_operation(
+        self,
+        asset_id: str,
+        title: str,
+        operation: Callable[[Callable[..., None], Callable[[], bool]], Any],
+        *,
+        after: Optional[Callable[[], None]] = None,
+        backup: bool = True,
+        content_row: Optional[Dict[str, Any]] = None,
+        operation_kind: str = "",
+        reverify_asset: bool = False,
+        closed_file: bool = True,
+        on_finished: Optional[Callable[[Optional[Exception]], None]] = None,
+        expected_commit_uuid: Optional[str] = None,
+    ) -> bool:
+        if self._contents_busy(asset_id):
+            return False
+        asset = dict(self._asset_dict(asset_id) or {})
+        if not asset.get("path"):
+            self._set_catalog_notice(tr("projects.status.locate_id_mismatch"))
+            return False
+        project_name = self._get_asset_display_name(asset)
+        asset["operation_path"] = str(Path(asset["path"]).resolve())
+        inspected = self._inspection_by_asset.get(asset_id, {})
+        card = getattr(inspected.get("details"), "card", None) or inspected.get("card")
+        native_project_id = str(getattr(card, "project_uuid", "") or "") if card is not None else ""
+        if asset.get("recent_only"):
+            if not native_project_id:
+                self._set_catalog_notice(
+                    self._inspection_errors.get(asset_id) or tr("projects.status.unreadable")
+                )
+                return False
+            asset["id"] = native_project_id
+            asset["commit_uuid"] = str(card.commit_uuid)
+        elif card is not None and native_project_id == asset_id:
+            asset["commit_uuid"] = str(card.commit_uuid)
+        if expected_commit_uuid is not None:
+            # Previewed operations must guard the snapshot the user confirmed,
+            # rather than an older catalog scan or a newer unconfirmed save.
+            asset["commit_uuid"] = str(expected_commit_uuid)
+        operation_id = "project-" + str(uuid.uuid4())
+        cancel = threading.Event()
+        metadata = dict(project_name=project_name, operation_kind=operation_kind,
+                        part={key: (content_row or {}).get(key, "") for key in ("kind", "label", "number", "total", "images")})
+        self._project_operations[operation_id] = {
+            "asset_id": asset_id,
+            "status": "running",
+        }
+        self._contents_feedback[asset_id] = dict(row_id=(content_row or {}).get("id", ""), status="running", operation_kind=operation_kind)
+        if self._inspection_pipeline is not None:
+            self._inspection_pipeline.cancel()
+        self._request_model_update()
+        self._dirty_selection()
+
+        def complete(error=None, facts=None, inspection_error="") -> None:
+            row = self._project_operations.get(operation_id)
+            if row is None:
+                return
+            try:
+                if error is not None:
+                    raise error
+                row["status"] = "completed"
+                if self._inspection_pipeline is not None:
+                    self._inspection_pipeline.invalidate(asset_id)
+                if reverify_asset:
+                    self._inspection_by_asset.pop(asset_id, None)
+                if facts:
+                    self._inspection_by_asset[asset_id] = facts
+                self._inspection_errors.pop(asset_id, None)
+                self._row_inspection_generation += 1
+                if reverify_asset and not asset.get("recent_only"):
+                    verify_asset = getattr(self._asset_index, "verify_asset", None)
+                    if callable(verify_asset):
+                        self._library_command("verify_asset", asset_id)
+                if after is not None:
+                    after()
+                self._contents_feedback.pop(asset_id, None)
+                if inspection_error:
+                    self._contents_feedback[asset_id] = dict(row_id=(content_row or {}).get("id", ""), status="failed",
+                        reason=tr("projects.contents.refresh_failed").format(reason=inspection_error))
+                self.refresh_catalog(scan_folders=False)
+            except Exception as exc:
+                _log.exception("Complete project operation failed operation=%s path=%s", title, asset["path"])
+                row["status"] = "failed"
+                self._contents_feedback[asset_id] = dict(row_id=(content_row or {}).get("id", ""), status="failed", reason=str(exc))
+                if content_row is None:
+                    self._set_catalog_notice(str(exc))
+                error = exc
+            finally:
+                self._request_model_update()
+                self._dirty_selection()
+                if on_finished is not None:
+                    on_finished(error)
+
+        def worker() -> None:
+            facts = None
+            inspection_error = ""
+
+            try:
+                if closed_file:
+                    from .project_operations import ProjectOperations
+                    store = ProjectOperations(lf.io)
+                    store.run(
+                        operation_id,
+                        asset,
+                        title,
+                        lambda: operation(lambda *_args: None, cancel.is_set),
+                        backup=backup,
+                        metadata=metadata,
+                    )
+                else:
+                    operation(lambda *_args: None, cancel.is_set)
+                error = None
+            except Exception as exc:
+                _log.exception("Project worker failed operation=%s path=%s", title, asset["path"])
+                error = exc
+            if error is None and (content_row or operation_kind or asset.get("recent_only")):
+                try:
+                    facts = self._inspect_contents(str(asset["path"]))
+                except Exception as exc:
+                    _log.exception("Inspect completed project operation failed path=%s", asset["path"])
+                    inspection_error = str(exc)
+            self._schedule_ui(lambda: complete(error, facts, inspection_error))
 
         try:
-            removed_asset_ids = self._delete_asset_and_managed_storage(asset_id)
-            if not removed_asset_ids:
-                self._log_warn("Asset index does not support asset deletion")
+            threading.Thread(target=worker, daemon=True, name="ProjectsOperation").start()
+        except Exception as exc:
+            complete(error=exc)
+        return True
+
+    def native_file_drop(self, path: str) -> bool:
+        """Register a native .licht drop when Projects owns the drop target."""
+        if not self._asset_index or not is_supported_asset_path(path):
+            return False
+        try:
+            project, _created = self._library_command("register_licht_asset", path)
+        except Exception as exc:
+            self._log_error("Failed to add dropped .licht project %s: %s", path, exc)
+            self._set_catalog_notice(tr("projects.status.import_failed"))
+            return True
+        if project is None:
+            self._set_catalog_notice(tr("projects.status.import_failed"))
+            return True
+        self._set_asset_selection({project.id}, cursor=project.id, anchor=project.id)
+        self.refresh_catalog(scan_folders=False)
+        return True
+
+    def _load_asset(self, asset_id: str) -> None:
+        if not asset_id:
+            return
+        self._open_request += 1
+        request = self._open_request
+        generation = self._mount_generation
+        with self._folder_scan_lock:
+            self._folder_scan_rerun_pending = False
+            self._folder_scan_rerun_target = None
+            cancel = self._folder_scan_cancel
+            verify_cancel = self._catalog_verify_cancel
+        if cancel is not None:
+            cancel.set()
+        if verify_cancel is not None:
+            verify_cancel.set()
+        if asset_id.startswith("recent:"):
+            asset = self._asset_dict(asset_id)
+            if not asset or not asset.get("recent_only"):
                 return
+            self._set_asset_selection({asset_id}, cursor=asset_id, anchor=asset_id)
+            self._dirty_selection()
+            from .file_menu import open_recent_project_with_confirmation
 
-            # Remove from selection if selected
-            for removed_asset_id in removed_asset_ids:
-                self._selected_asset_ids.discard(removed_asset_id)
-            self._update_selection_type()
+            open_recent_project_with_confirmation(
+                str(asset.get("path") or ""),
+                keep_asset_manager_open=True,
+            )
+            return
+        if not self._asset_index:
+            return
+        if asset_id.startswith("remote:"):
+            self._select_asset_id(asset_id)
+            self._gallery_command("pull_open")
+            return
+        service, index = self._library_service, self._asset_index
 
-            # Refresh UI
-            self.refresh_catalog()
+        def complete(asset, error) -> None:
+            if request != self._open_request or generation != self._mount_generation:
+                return
+            self._row_catalog_generation += 1
+            if error:
+                self._set_catalog_notice(error)
+                self._request_model_update()
+            if asset is not None:
+                self._open_verified_asset(asset_id, asset)
 
-            self._log_info("Removed asset from catalog: %s", ", ".join(removed_asset_ids))
-        except Exception as e:
-            self._log_error("Failed to remove asset %s: %s", asset_id, e)
+        def worker() -> None:
+            asset, error = None, ""
+            try:
+                project = service.verify(asset_id) if service else index.verify_asset(asset_id)
+                if project is not None:
+                    asset = project.to_dict()
+                error = str(getattr(index, "last_error", "") or "")
+            except Exception as exc:
+                _log.exception("Project open verification failed")
+                error = str(exc)
+            self._schedule_ui(lambda: complete(asset, error))
 
-    def _get_url_import_managed_root(self, asset: Dict[str, Any]) -> Optional[Path]:
-        return None
+        threading.Thread(target=worker, daemon=True, name="AssetManagerOpen").start()
 
-    def _delete_asset_and_managed_storage(self, asset_id: str) -> List[str]:
-        """Delete an asset and any URL-managed storage owned by it."""
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return []
+    def _open_verified_asset(self, asset_id: str, asset: Dict[str, Any]) -> None:
+        if not self._project_available(asset):
+            self.refresh_catalog(scan_folders=False)
+            return
+        self._set_asset_selection({asset_id}, cursor=asset_id, anchor=asset_id)
+        self._dirty_selection()
+        from .file_menu import open_project_with_confirmation
 
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            return []
+        open_project_with_confirmation(
+            str(asset.get("path") or ""),
+            keep_asset_manager_open=True,
+        )
 
-        managed_root = self._get_url_import_managed_root(asset)
-        related_asset_ids = [asset_id]
+    def on_remove_asset(self, _handle, _ev, args):
+        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
+        if asset_id and self._asset_index and self._library_command("delete_asset", asset_id):
+            selected = self._selected_asset_ids - {asset_id}
+            cursor = None if self._selection_cursor_id == asset_id else self._selection_cursor_id
+            self._set_asset_selection(selected, cursor=cursor)
+            self.refresh_catalog(scan_folders=False)
 
-        if managed_root is not None:
-            related_asset_ids = []
-            for candidate_id, candidate in self._asset_index.assets.items():
-                candidate_root = self._get_url_import_managed_root(candidate)
-                if candidate_root == managed_root:
-                    related_asset_ids.append(candidate_id)
+    def _show_shared_context_menu(
+        self,
+        items: List[Dict[str, Any]],
+        on_action: Callable[[str], None],
+        anchor=None,
+    ) -> bool:
+        show = getattr(lf.ui, "show_context_menu", None)
+        mouse_position = getattr(lf.ui, "get_mouse_screen_pos", None)
+        if not callable(show) or (anchor is None and not callable(mouse_position)):
+            return False
+        try:
+            if anchor is not None:
+                x = float(anchor.absolute_left)
+                y = float(anchor.absolute_top) + float(anchor.absolute_height)
+            else:
+                x, y = mouse_position()
+            show(items, float(x), float(y), on_action)
+            return True
+        except Exception as exc:
+            self._log_error("Failed to show context menu: %s", exc)
+            return False
 
-            if managed_root.exists():
-                shutil.rmtree(managed_root)
+    def _asset_context_menu_items(self, asset: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if asset.get("recent_only"):
+            asset = self._asset_with_inspection(asset)
+            items = [{"label": tr("projects.action.open"), "action": "load"}]
+            details = self._inspection_by_asset.get(str(asset.get("id") or ""), {}).get("details")
+            if details is not None:
+                labels = {
+                    "rename": "projects.action.rename",
+                    "update_thumbnail": "projects.action.update_thumbnail",
+                    "inspector": "projects.inspector.title",
+                    "clean": "project_cleanup.title",
+                    "compact_content": "projects.contents.compact",
+                }
+                operations = operation_actions(asset)
+                available = {str(operation.get("action") or "") for operation in operations}
+                for action in ("rename", "update_thumbnail", "inspector", "clean", "compact_content"):
+                    if action in available:
+                        items.append({
+                            "label": tr(labels[action]),
+                            "action": action if action == "inspector" else "project:" + action,
+                        })
+                if self._project_available(asset):
+                    items.append({
+                        "label": tr("projects.action.show_in_folder"),
+                        "action": "show_in_folder",
+                        "separator_before": True,
+                    })
+                if any(operation.get("action") == "export_as" for operation in operations):
+                    items.append({
+                        "label": tr("projects.action.export_as"),
+                        "action": "project:export_as",
+                        "separator_before": True,
+                    })
+            elif self._project_available(asset):
+                items.append({
+                    "label": tr("projects.action.show_in_folder"),
+                    "action": "show_in_folder",
+                    "separator_before": True,
+                })
+            return items
+        items: List[Dict[str, Any]] = []
+        if not asset.get("remote_only") and self._project_available(asset):
+            items.append({"label": tr("projects.action.open"), "action": "load"})
+        if asset.get("remote_only"):
+            items.extend(self._gallery_context_items(asset))
+            return items
 
-        removed_asset_ids: List[str] = []
-        for related_asset_id in related_asset_ids:
-            if self._delete_asset_from_catalog(related_asset_id):
-                removed_asset_ids.append(related_asset_id)
+        operations = operation_actions(asset)
+        operation_ids = {str(operation.get("action") or "") for operation in operations}
+        if "rename" in operation_ids:
+            items.append({"label": tr("projects.action.rename"), "action": "project:rename"})
 
-        return removed_asset_ids
+        details = self._inspection_by_asset.get(
+            str(asset.get("id") or asset.get("project_uuid") or ""), {}
+        ).get("details")
+        has_project_operations = details is not None or asset.get("status") == "REPAIR_ONLY"
+        if has_project_operations and "update_thumbnail" in operation_ids:
+            items.append({
+                "label": tr("projects.action.update_thumbnail"),
+                "action": "project:update_thumbnail",
+            })
+        items.append({"label": tr("projects.inspector.title"), "action": "inspector"})
+        if has_project_operations:
+            for action, label in (("clean", "project_cleanup.title"), ("compact_content", "projects.contents.compact")):
+                if action in operation_ids:
+                    items.append({"label": tr(label), "action": "project:" + action})
 
-    def _get_available_projects_for_asset(self, asset: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Get list of projects this asset can be moved to."""
-        if not self._asset_index or not hasattr(self._asset_index, "projects"):
-            return []
+        items.extend(
+            [
+                {
+                    "label": tr("projects.action.show_in_folder"),
+                    "action": "show_in_folder",
+                    "separator_before": True,
+                },
+                {"label": tr("projects.action.remove_from_library"), "action": "remove"},
+                {"label": tr("projects.action.move_to_trash"), "action": "trash"},
+            ]
+        )
+        if str(asset.get("relocation_candidate") or ""):
+            items.append({
+                "label": tr("projects.action.use_found_location"),
+                "action": "use_found_location",
+            })
 
-        current_project_id = asset.get("project_id", "")
-        projects = []
-
-        for proj_id, proj in self._asset_index.projects.items():
-            if proj_id != current_project_id:
-                projects.append({
-                    "id": proj_id,
-                    "name": proj.get("name", tr("asset_manager.unnamed_project")),
+        if has_project_operations:
+            labels = {
+                "repair": "projects.action.repair",
+                "embed_dataset": "projects.action.embed_dataset",
+                "locate_dataset": "projects.action.locate_dataset",
+            }
+            for operation in operations:
+                action = str(operation.get("action") or "")
+                if action in ("rename", "inspector") or action not in labels:
+                    continue
+                items.append({
+                    "label": tr(labels[action]),
+                    "action": "project:" + action,
                 })
 
-        # Sort by name
-        return sorted(projects, key=lambda p: p["name"].lower())
+        export = next(
+            (operation for operation in operations if operation.get("action") == "export_as"),
+            None,
+        )
+        gallery_items = self._gallery_context_items(asset)
+        show_export = has_project_operations and export is not None
+        if show_export:
+            items.append({
+                "label": tr("projects.action.export_as"),
+                "action": "project:export_as",
+                "separator_before": True,
+            })
+        for index, gallery_item in enumerate(gallery_items):
+            gallery_item = dict(gallery_item)
+            if index == 0:
+                gallery_item["separator_before"] = not show_export
+            items.append(gallery_item)
+        return items
 
-    def on_toggle_asset_menu(self, _handle, _ev, args):
-        """Toggle dropdown menu for an asset."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        if not asset_id:
-            return
+    def _handle_asset_context_action(self, action: str, asset_id: str) -> None:
+        if action.startswith("gallery:"):
+            if not self._select_asset_id(asset_id):
+                return
+            self._gallery_command(action.split(":", 1)[1])
+        elif action == "load":
+            self._load_asset(asset_id)
+        elif action == "inspector":
+            if self._select_asset_id(asset_id):
+                self._inspector_expanded = True
+                self._operations_expanded = True
+                self._dirty_inspector_layout()
+        elif action == "use_found_location":
+            self.on_use_found_location(None, None, [asset_id])
+        elif action == "show_in_folder":
+            self.on_show_in_folder(None, None, [asset_id])
+        elif action == "remove":
+            self.on_remove_asset(None, None, [asset_id])
+        elif action == "trash":
+            self.on_move_asset_to_trash(None, None, [asset_id])
+        elif action.startswith("project:"):
+            if not self._select_asset_id(asset_id):
+                return
+            self.open_project_operation(None, None, [action.partition(":")[2]])
 
-        # Stop event propagation to prevent card selection
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        # Toggle: if already open for this asset, close it; otherwise open for this asset
-        if self._open_menu_asset_id == asset_id:
-            self._open_menu_asset_id = None
-        else:
-            self._open_menu_asset_id = asset_id
-
-        # Always reload projects when menu opens to ensure fresh data
-        if self._handle:
-            if self._open_menu_asset_id:
-                projects = self.get_move_menu_projects()
-                self._log_info("Loading %d projects for move menu", len(projects))
-                self._handle.update_record_list("move_menu_projects", projects)
-            else:
-                self._handle.update_record_list("move_menu_projects", [])
-
-        self._dirty_model("assets")
-
-    def on_rename_asset(self, _handle, _ev, args):
-        """Open rename dialog for an asset."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        if not asset_id:
-            return
-
-        # Stop event propagation
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return
-
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            return
-
-        # Close the menu
-        self._open_menu_asset_id = None
-        self._dirty_model("assets")
-
-        # Prompt for rename using input dialog
-        current_name = asset.get("name", "Unnamed")
-
-        def _on_rename_result(new_name):
-            if new_name and new_name.strip() and new_name.strip() != current_name:
-                try:
-                    self._asset_index.update_asset(asset_id, name=new_name.strip())
-                    self._asset_index.save()
-                    self.refresh_catalog()
-                    self._log_info("Renamed asset to: %s", new_name.strip())
-                except Exception as e:
-                    self._log_error("Failed to rename asset: %s", e)
-
-        lf.ui.input_dialog(
-            tr("asset_manager.dialog.rename_asset"),
-            tr("asset_manager.dialog.enter_new_name", name=current_name),
-            current_name,
-            _on_rename_result
+    def _show_asset_context_menu(self, asset_id: str, anchor=None) -> bool:
+        asset = self._asset_dict(asset_id)
+        return bool(asset) and self._show_shared_context_menu(
+            self._asset_context_menu_items(asset),
+            lambda action: self._handle_asset_context_action(action, asset_id),
+            anchor,
         )
 
     def on_show_in_folder(self, _handle, _ev, args):
-        """Open file manager to show asset location."""
         asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        if not asset_id:
-            return
+        asset = self._asset_dict(asset_id)
+        if asset:
+            reveal = getattr(lf.ui, "reveal_in_file_manager", None)
+            if callable(reveal):
+                reveal(str(asset.get("path") or ""))
 
-        # Stop event propagation
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return
-
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            return
-
-        # Close the menu
-        self._open_menu_asset_id = None
-        self._dirty_model("assets")
-
-        file_path = asset.get("absolute_path") or asset.get("path")
-        if not file_path:
-            self._log_warn("Asset has no file path: %s", asset_id)
-            return
-
-        try:
-            import subprocess
-            import platform
-
-            system = platform.system()
-            if system == "Darwin":  # macOS
-                subprocess.run(["open", "-R", file_path])
-            elif system == "Windows":
-                subprocess.run(["explorer", "/select,", file_path])
-            else:  # Linux
-                subprocess.run(["xdg-open", str(Path(file_path).parent)])
-
-            self._log_info("Opened file location: %s", file_path)
-        except Exception as e:
-            self._log_error("Failed to open file location: %s", e)
-
-    def on_update_thumbnail(self, _handle, _ev, args):
-        """Update asset thumbnail from current camera pose."""
+    def on_move_asset_to_trash(self, _handle, _ev, args):
         asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        if not asset_id:
+        asset = self._asset_dict(asset_id)
+        path = str(asset.get("path") or "") if asset else ""
+        if not asset_id or not path or not self._asset_index:
             return
+        label = tr("projects.dialog.trash_confirm")
 
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return
-
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            return
-
-        # Close the menu
-        self._open_menu_asset_id = None
-        self._dirty_model("assets")
-
-        asset_path = asset.get("absolute_path") or asset.get("path")
-        if not asset_path:
-            self._log_warn("Asset has no file path: %s", asset_id)
-            return
-
-        asset_type = asset.get("type", "")
-        if asset_type.lower() not in self.LOADABLE_TYPES:
-            self._log_warn("Asset type not renderable: %s", asset_type)
-            return
-
-        try:
-            camera = lf.get_camera("main")
-            if camera is None:
-                self._log_warn("No camera available for thumbnail update")
+        def confirmed(button: str) -> None:
+            if button != label:
                 return
-
-            if not self._asset_thumbnails or not hasattr(self._asset_thumbnails, "generate_rendered_preview_from_camera"):
-                self._log_warn("Thumbnail generator not available")
-                return
-
-            thumb_path = self._asset_thumbnails.generate_rendered_preview_from_camera(
-                asset_type,
-                asset_id,
-                asset_path,
-                eye=camera.eye,
-                target=camera.target,
-                up=camera.up,
-            )
-            if thumb_path is not None:
-                self._asset_index.update_asset(asset_id, thumbnail_path=str(thumb_path))
-                self._asset_index.save()
-                self._log_info("Updated thumbnail for %s from current camera", asset_id)
-                self.refresh_catalog()
-            else:
-                self._log_warn("Failed to render thumbnail from camera for %s", asset_id)
-        except Exception as e:
-            self._log_error("Failed to update thumbnail: %s", e)
-
-    def on_move_to_project(self, _handle, _ev, args):
-        """Move asset to a different project."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        if not asset_id:
-            return
-
-        # Stop event propagation
-        if _ev:
             try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
+                _move_to_trash(path)
+                self._library_command("delete_asset", asset_id)
+                selected = self._selected_asset_ids - {asset_id}
+                cursor = None if self._selection_cursor_id == asset_id else self._selection_cursor_id
+                self._set_asset_selection(selected, cursor=cursor)
+                self.refresh_catalog(scan_folders=False)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self._set_catalog_notice(tr("projects.status.trash_failed"))
+                self._log_error("Failed to move project to trash %s: %s", path, exc)
+                self._request_model_update()
 
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return
-
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            return
-
-        # Close the menu
-        self._open_menu_asset_id = None
-        self._dirty_model("assets")
-
-        # Get list of available projects
-        if not hasattr(self._asset_index, "projects"):
-            self._log_warn("No projects available")
-            return
-
-        projects = []
-        for proj_id, proj in self._asset_index.projects.items():
-            if proj_id != asset.get("project_id"):  # Exclude current project
-                projects.append((proj_id, proj.get("name", "Unnamed")))
-
-        if not projects:
-            self._log_info("No other projects available to move to")
-            return
-
-        # Build project list string
-        project_names = [f"{i+1}. {name}" for i, (_, name) in enumerate(projects)]
-        project_list = "\n".join(project_names)
-        current_project = self._asset_index.projects.get(asset.get("project_id", ""), {}).get("name", "Unknown")
-
-        def _on_project_selected(result):
-            if not result or not result.strip():
-                return
-
-            try:
-                # Parse selection (number or name)
-                selection = result.strip()
-                selected_project_id = None
-                selected_project_name = None
-
-                # Try to parse as number first
-                try:
-                    idx = int(selection.split(".")[0]) - 1
-                    if 0 <= idx < len(projects):
-                        selected_project_id, selected_project_name = projects[idx]
-                except (ValueError, IndexError):
-                    # Try to match by name
-                    for proj_id, proj_name in projects:
-                        if selection.lower() in proj_name.lower():
-                            selected_project_id = proj_id
-                            selected_project_name = proj_name
-                            break
-
-                if not selected_project_id:
-                    self._log_warn("Invalid project selection: %s", selection)
-                    return
-
-                # Update asset's project
-                self._asset_index.update_asset(
-                    asset_id,
-                    project_id=selected_project_id,
-                    scene_id=None  # Clear scene since scenes are project-specific
-                )
-                self._asset_index.save()
-                self.refresh_catalog()
-                self._log_info("Moved asset to project: %s", selected_project_name)
-
-            except Exception as e:
-                self._log_error("Failed to move asset: %s", e)
-
-        prompt = tr("asset_manager.dialog.current_project", name=current_project) + "\n\n"
-        prompt += tr("asset_manager.dialog.available_projects") + "\n"
-        prompt += project_list + "\n\n"
-        prompt += tr("asset_manager.dialog.enter_number_or_name")
-        lf.ui.input_dialog(
-            tr("asset_manager.dialog.move_to_project"),
-            prompt,
-            "",
-            _on_project_selected
+        lf.ui.confirm_dialog(
+            tr("projects.dialog.trash_title"),
+            f'{tr("projects.dialog.trash_message")}\n\n{path}',
+            [label, tr("common.cancel")],
+            confirmed,
+            "error",
         )
 
-    def _move_asset_to_project(self, asset_id: str, project_id: str) -> None:
-        """Move asset to a specific project."""
-        self._log_info("Attempting to move asset %s to project %s", asset_id, project_id)
-
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            self._log_warn("Asset index not available")
-            return
-
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            self._log_warn("Asset not found: %s", asset_id)
-            return
-
-        project = self._asset_index.projects.get(project_id)
-        if not project:
-            self._log_warn("Project not found: %s", project_id)
-            return
-
-        try:
-            self._asset_index.update_asset(
-                asset_id,
-                project_id=project_id,
-                scene_id=None  # Clear scene since scenes are project-specific
+    def _folder_context_menu_items(self, folder_id: str) -> List[Dict[str, Any]]:
+        items = [
+            {"label": tr("projects.action.show_in_folder"), "action": "show"},
+            {"label": tr("projects.action.rescan_folders"), "action": "rescan"},
+        ]
+        if folder_id == "default":
+            items.append(
+                {
+                    "label": tr("projects.action.settings"),
+                    "action": "settings",
+                    "separator_before": True,
+                }
             )
-            self._asset_index.save()
-            self.refresh_catalog()
-            self._log_info("Moved asset to project: %s", project.get("name", "Unnamed"))
-        except Exception as e:
-            self._log_error("Failed to move asset: %s", e)
-
-    def on_create_project_and_move(self, _handle, _ev, args):
-        """Create a new project and move asset to it."""
-        asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
-        if not asset_id:
-            return
-
-        # Stop event propagation
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return
-
-        asset = self._asset_index.assets.get(asset_id)
-        if not asset:
-            return
-
-        # Close menu
-        self._open_menu_asset_id = None
-        self._dirty_model("assets", "move_menu_projects")
-        if self._handle:
-            self._handle.update_record_list("move_menu_projects", [])
-
-        def _on_project_name_entered(name):
-            if not name or not name.strip():
-                return
-
-            name = name.strip()
-
-            try:
-                # Create new project
-                project = self._asset_index.create_project(name=name)
-                if not project:
-                    self._log_error("Failed to create project")
-                    return
-
-                # Move asset to new project
-                self._asset_index.update_asset(
-                    asset_id,
-                    project_id=project.id,
-                    scene_id=None
-                )
-                self._asset_index.save()
-                self.refresh_catalog()
-                self._log_info("Created project '%s' and moved asset to it", name)
-
-            except Exception as e:
-                self._log_error("Failed to create project and move asset: %s", e)
-
-        lf.ui.input_dialog(
-            tr("asset_manager.dialog.new_project"),
-            tr("asset_manager.dialog.enter_project_name"),
-            "",
-            _on_project_name_entered
-        )
-
-    def on_toggle_project_menu(self, _handle, _ev, args):
-        """Toggle dropdown menu for a project."""
-        project_id = self._resolve_event_value(args, _ev, "data-project-id")
-        if not project_id:
-            return
-
-        # Stop event propagation to prevent row selection
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        # Toggle: if already open for this project, close it; otherwise open for this project
-        if self._open_menu_project_id == project_id:
-            self._open_menu_project_id = None
         else:
-            self._open_menu_project_id = project_id
+            items.append(
+                {
+                    "label": tr("projects.action.remove_folder"),
+                    "action": "remove",
+                    "separator_before": True,
+                }
+            )
+        if any(
+            asset.get("folder_id") == folder_id
+            and (not asset.get("exists", True) or asset.get("status") == "MISSING")
+            for asset in self._asset_index_assets().values()
+        ):
+            items.append(
+                {
+                    "label": tr("projects.action.clean_missing"),
+                    "action": "clean_missing",
+                }
+            )
+        return items
 
-        self._dirty_model("projects")
-
-    def on_edit_watch_dirs(self, _handle, _ev, args):
-        """Open the watched directories dialog for a project."""
-        project_id = self._resolve_event_value(args, _ev, "data-project-id")
-        if not project_id:
-            return
-
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        # Close the menu. Editing watch directories must not depend on or mutate
-        # the current project selection; the clicked row is the source of truth.
-        self._open_menu_project_id = None
-        self._dirty_model("projects")
-
-        ok = open_watch_dirs_dialog(project_id)
-        if not ok:
-            self._log_warn("Failed to open watch dirs dialog for project %s", project_id)
-
-    def on_rename_project(self, _handle, _ev, args):
-        """Open rename dialog for a project."""
-        project_id = self._resolve_event_value(args, _ev, "data-project-id")
-        if not project_id:
-            return
-
-        # Stop event propagation
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        if not self._asset_index or not hasattr(self._asset_index, "projects"):
-            return
-
-        project = self._asset_index.projects.get(project_id)
-        if not project:
-            return
-
-        # Close the menu
-        self._open_menu_project_id = None
-        self._dirty_model("projects")
-
-        # Prompt for rename using input dialog
-        current_name = project.get("name", "Unnamed Project")
-
-        def _on_rename_result(new_name):
-            if new_name and new_name.strip() and new_name.strip() != current_name:
-                new_name = new_name.strip()
-                try:
-                    self._asset_index.update_project(project_id, name=new_name)
-                    self._asset_index.save()
-                    self.refresh_catalog()
-                    self._log_info("Renamed project to: %s", new_name)
-                except Exception as e:
-                    self._log_error("Failed to rename project: %s", e)
-
-        lf.ui.input_dialog(
-            tr("asset_manager.dialog.rename_project"),
-            tr("asset_manager.dialog.enter_new_name", name=current_name),
-            current_name,
-            _on_rename_result
+    def _show_folder_context_menu(self, folder_id: str) -> bool:
+        if folder_id not in self._asset_index_folders():
+            return False
+        return self._show_shared_context_menu(
+            self._folder_context_menu_items(folder_id),
+            lambda action: self._handle_folder_context_action(action, folder_id),
         )
 
-    def on_delete_project(self, _handle, _ev, args):
-        """Delete a project after moving its assets to Default."""
-        project_id = self._resolve_event_value(args, _ev, "data-project-id")
-        if not project_id:
+    def _handle_folder_context_action(self, action: str, folder_id: str) -> None:
+        if action == "show":
+            folder = self._asset_index_folders().get(folder_id, {})
+            reveal = getattr(lf.ui, "reveal_in_file_manager", None)
+            if callable(reveal) and folder.get("path"):
+                reveal(str(folder["path"]))
+        elif action == "rescan":
+            folder = self._asset_index_folders().get(folder_id, {})
+            self.refresh_catalog(scan_folders=False)
+            self._scan_asset_folders(
+                folder_id=folder_id,
+                directory=str(folder.get("path") or ""),
+                recursive=folder.get("recursive", True) is not False,
+            )
+        elif action == "settings":
+            lf.ui.set_panel_enabled("lfs.preferences", True)
+        elif action == "remove":
+            self.on_delete_folder(None, None, [folder_id])
+        elif action == "clean_missing":
+            removed = self._library_command("clean_missing_entries", folder_id)
+            self._catalog_notice = tr(
+                "projects.status.cleaned_missing", count=int(removed or 0)
+            )
+            self.refresh_catalog(scan_folders=False)
+
+    def on_delete_folder(self, _handle, _ev, args):
+        folder_id = self._resolve_event_value(args, _ev, "data-folder-id")
+        folder = self._asset_index_folders().get(folder_id)
+        if not folder_id or folder_id == "default" or not self._asset_index or not folder:
             return
+        project_count = sum(
+            asset.get("folder_id") == folder_id
+            for asset in self._asset_index_assets().values()
+        )
+        delete_label = tr("projects.action.remove_folder")
 
-        # Stop event propagation
-        if _ev:
-            try:
-                _ev.stop_propagation()
-            except Exception:
-                pass
-
-        if not self._asset_index or not hasattr(self._asset_index, "projects"):
-            return
-
-        project = self._asset_index.projects.get(project_id)
-        if not project:
-            return
-
-        # Prevent deletion of the Default project
-        project_name = project.get("name", "")
-        if project_name.lower() == "default":
-            self._log_warn("Cannot delete the Default project")
-            return
-
-        # Prevent deletion of the Default project
-        project_name = project.get("name", "")
-        if project_name.lower() == "default":
-            self._log_warn("Cannot delete the Default project")
-            return
-
-        # Close the menu
-        self._open_menu_project_id = None
-        self._dirty_model("projects")
-
-        project_name = project.get("name", "Unnamed Project")
-
-        # Find or create Default project
-        default_project = None
-        default_project_id = None
-        for pid, proj in self._asset_index.projects.items():
-            if proj.get("name", "").lower() == "default":
-                default_project_id = pid
-                default_project = proj
-                break
-
-        # Create Default project if it doesn't exist
-        if not default_project_id:
-            try:
-                default_project = self._asset_index.create_project(name="Default")
-                if default_project:
-                    default_project_id = default_project.id
-                    self._log_info("Created Default project for asset migration")
-            except Exception as e:
-                self._log_error("Failed to create Default project: %s", e)
+        def delete_confirmed(button: str) -> None:
+            if button != delete_label:
                 return
+            if self._asset_index and self._library_command("delete_folder", folder_id):
+                self._selected_folder_id = SCOPE_ALL
+                self._set_asset_selection(set(), cursor=None, anchor=None)
+                self.refresh_catalog(scan_folders=False)
 
-        if not default_project_id:
-            self._log_error("Cannot delete project: Default project not available")
-            return
+        lf.ui.confirm_dialog(
+            tr("projects.dialog.remove_folder"),
+            tr(
+                "projects.dialog.remove_folder_message",
+                name=str(folder.get("name") or ""),
+                count=project_count,
+            ),
+            [tr("common.cancel"), delete_label],
+            delete_confirmed,
+        )
 
-        # Move all assets from this project to Default
-        moved_count = 0
-        if hasattr(self._asset_index, "assets"):
-            for asset_id, asset in list(self._asset_index.assets.items()):
-                if asset.get("project_id") == project_id:
-                    try:
-                        self._asset_index.update_asset(
-                            asset_id,
-                            project_id=default_project_id,
-                            scene_id=None  # Clear scene since scenes are project-specific
-                        )
-                        moved_count += 1
-                    except Exception as e:
-                        self._log_warn("Failed to move asset %s to Default: %s", asset_id, e)
+    def refresh_catalog(
+        self,
+        _handle=None,
+        _ev=None,
+        _args=None,
+        *,
+        request_update: bool = True,
+        scan_folders: bool = True,
+    ):
+        if scan_folders:
+            cancel = None
+            verify_cancel = None
+            with self._folder_scan_lock:
+                if self._folder_scan_active or self._catalog_verify_active:
+                    self._folder_scan_rerun_pending = False
+                    self._folder_scan_rerun_target = None
+                    self._scan_stop_requested = True
+                    cancel = self._folder_scan_cancel
+                    verify_cancel = self._catalog_verify_cancel
+            if cancel is not None:
+                cancel.set()
+            if verify_cancel is not None:
+                verify_cancel.set()
+                return
+            if cancel is not None:
+                return
+        self._invalidate_recent_scope_cache()
+        self._sync_default_folder_path()
+        if self._catalog_notice:
+            self._set_catalog_notice("")
+        self._repair_selection()
+        self._refresh_records(assets=True, folders=True)
+        if self._handle:
+            self._handle.dirty_all()
+        if request_update:
+            self._request_model_update()
+        if scan_folders:
+            with self._folder_scan_lock:
+                self._scan_stopped_visible = False
+            self._start_catalog_verify()
+            self._scan_asset_folders()
 
-        # Delete the project
-        try:
-            if hasattr(self._asset_index, "delete_project"):
-                self._asset_index.delete_project(project_id)
-            elif hasattr(self._asset_index, "remove_project"):
-                self._asset_index.remove_project(project_id)
-            else:
-                # Fallback: remove from projects dict directly
-                if hasattr(self._asset_index, "projects"):
-                    del self._asset_index.projects[project_id]
-
-            self._asset_index.save()
-
-            # Clear selection if the deleted project was selected
-            if self._selected_project_id == project_id:
-                self._selected_project_id = None
-                self._selected_scene_id = None
-                self._selected_asset_ids.clear()
-                self._selection_type = "none"
-
-            self.refresh_catalog()
-            self._log_info(
-                "Deleted project '%s' and moved %d assets to Default",
-                project_name, moved_count
-            )
-        except Exception as e:
-            self._log_error("Failed to delete project: %s", e)
-
-    # ── Lifecycle ─────────────────────────────────────────────
-
-    def on_mount(self, doc):
-        super().on_mount(doc)
-        self._doc = doc
-        set_active_asset_manager_panel(self)
-        self._bind_dom_event_listeners(doc)
-
-        # Initialize backend
-        backend_ok = self._initialize_backend()
-        if not backend_ok:
-            _logger.warning(
-                "Asset Manager backend not available - running in limited mode"
-            )
-
-        # Load index
-        if self._asset_index and hasattr(self._asset_index, "load"):
-            try:
-                self._asset_index.load()
-                if (
-                    self._sync_existing_asset_metadata()
-                    and self._asset_index.library_path.exists()
-                ):
-                    self._library_mtime = self._asset_index.library_path.stat().st_mtime
-                if self._asset_index.library_path.exists():
-                    self._library_mtime = self._asset_index.library_path.stat().st_mtime
-            except Exception as e:
-                _logger.warning(f"Failed to load asset index: {e}")
-
-        # Sync the currently loaded runtime dataset into the catalog when possible.
-        # Only auto-select the current scene asset on first mount, not on reopen,
-        # to preserve user's previous selection and show all assets.
-        has_existing_selection = bool(self._selected_asset_ids)
-        self._sync_runtime_scene_catalog(select_current=not has_existing_selection)
-
-        # Clear scene filter on reopen to show all assets in the project
-        # (respecting active filters like Splat/PCL/Dataset/Checkpoint)
-        if has_existing_selection:
-            self._selected_scene_id = None
-
-        # Initial refresh must dirty scalar bindings after catalog load.
-        self.refresh_catalog()
-        self._last_scene_generation = RuntimeState.scene_generation.value
-        self._last_language_generation = RuntimeState.language_generation.value
-        self._subscribe_reactive_state()
-
-    def on_scene_changed(self, doc):
-        self._flush_pending_transform_applications()
-        self._sync_runtime_scene_catalog(select_current=True)
-        self._last_scene_generation = RuntimeState.scene_generation.value
-        self.refresh_catalog()
-
-    def on_update(self, doc):
-        """Dirty-policy update for catalog and deferred scene work."""
-        changed = False
-
-        language_generation = RuntimeState.language_generation.value
-        if language_generation != self._last_language_generation:
-            self._last_language_generation = language_generation
-            if self._handle:
-                self._handle.dirty_all()
-            changed = True
-
+    def _scan_asset_folders(
+        self,
+        folder_id: Optional[str] = None,
+        directory: Optional[str] = None,
+        *,
+        recursive: bool = True,
+    ) -> None:
         if not self._asset_index:
-            return changed
+            return
+        target: Optional[tuple[str, str, bool]]
+        if folder_id and directory:
+            target = (str(folder_id), str(directory), bool(recursive))
+        else:
+            target = None
+        with self._folder_scan_lock:
+            if self._folder_scan_active:
+                if self._folder_scan_rerun_pending:
+                    if self._folder_scan_rerun_target != target:
+                        self._folder_scan_rerun_target = None
+                else:
+                    self._folder_scan_rerun_pending = True
+                    self._folder_scan_rerun_target = target
+                return
+            if not self._panel_mounted:
+                return
+            if target is None and not any(
+                folder.get("path")
+                for folder in self._asset_index_folders().values()
+            ):
+                return
+            self._folder_scan_active = True
+            self._folder_scan_rerun_pending = False
+            self._folder_scan_rerun_target = None
+            self._scan_stop_requested = False
+            self._scan_stopped_visible = False
+            progress = AssetFolderScanProgress(self._queue_worker_update)
+            if target is not None:
+                progress.report(current_root=target[1])
+            else:
+                for folder in self._asset_index_folders().values():
+                    path = str(folder.get("path") or "").strip()
+                    if path:
+                        progress.report(current_root=path)
+                        break
+            self._scan_progress = progress
+            cancel_event = threading.Event()
+            self._folder_scan_cancel = cancel_event
+            scan_folder_id = target[0] if target else None
+            scan_directory = target[1] if target else None
+            scan_recursive = target[2] if target else True
+            thread = threading.Thread(
+                target=self._folder_scan_worker,
+                args=(
+                    self._asset_index,
+                    cancel_event,
+                    scan_folder_id,
+                    scan_directory,
+                    scan_recursive,
+                    progress,
+                    self._mount_generation,
+                ),
+                daemon=True,
+                name="AssetManagerFolderScan",
+            )
+            self._folder_scan_thread = thread
+        thread.start()
+        self._publish_scan_progress()
 
-        self._flush_pending_transform_applications()
-        if self._pending_transform_applications:
+    def _folder_scan_worker(
+        self,
+        index: Any,
+        cancel_event: threading.Event,
+        folder_id: Optional[str],
+        directory: Optional[str],
+        recursive: bool,
+        progress: AssetFolderScanProgress,
+        generation: int,
+    ) -> None:
+        global _folder_scan_completed_in_process
+        try:
+            if self._library_service is not None and not (folder_id and directory):
+                result = self._library_service.scan(cancel_event, progress=progress)
+            elif folder_id and directory:
+                scan_args = (index, folder_id, directory, cancel_event)
+                if recursive:
+                    result = scan_asset_folder(*scan_args, progress=progress)
+                else:
+                    result = scan_asset_folder(*scan_args, progress=progress, recursive=False)
+            else:
+                result = scan_all_asset_folders(
+                    index, cancel_event, progress=progress
+                )
+            with self._folder_scan_lock:
+                self._folder_scan_error = bool(result.failed)
+                self._folder_scan_unavailable = bool(getattr(result, "unavailable", False))
+        except Exception:
+            with self._folder_scan_lock:
+                self._folder_scan_error = True
+            _log.exception("Asset Manager folder scan failed")
+        finally:
+            with self._folder_scan_lock:
+                self._folder_scan_active = False
+                self._folder_scan_refresh_pending = True
+                if self._scan_stop_requested:
+                    self._scan_stopped_visible = True
+                self._scan_stop_requested = False
+                if self._folder_scan_thread is threading.current_thread():
+                    self._folder_scan_thread = None
+                _folder_scan_completed_in_process = True
+            scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+            if callable(scheduler):
+                scheduler(lambda: self._complete_folder_scan(generation))
+
+    def _finish_folder_scan(self) -> None:
+        with self._folder_scan_lock:
+            if not self._folder_scan_refresh_pending:
+                return
+            self._folder_scan_refresh_pending = False
+        if not self._panel_mounted:
+            return
+        self.refresh_catalog(scan_folders=False)
+
+    def _complete_folder_scan(self, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != self._mount_generation:
+            return
+        self._finish_folder_scan()
+        with self._folder_scan_lock:
+            scan_error = self._folder_scan_error
+            scan_unavailable = self._folder_scan_unavailable
+            self._folder_scan_error = False
+            self._folder_scan_unavailable = False
+        if scan_unavailable:
+            self._set_catalog_notice(tr("projects.status.folder_unavailable"))
+        elif scan_error:
+            self._set_catalog_notice(tr("projects.status.scan_errors"))
+        with self._folder_scan_lock:
+            rerun = self._folder_scan_rerun_pending
+            target = self._folder_scan_rerun_target
+            self._folder_scan_rerun_pending = False
+            self._folder_scan_rerun_target = None
+        self._publish_scan_progress()
+        if rerun and self._panel_mounted:
+            if target is not None:
+                self._scan_asset_folders(folder_id=target[0], directory=target[1], recursive=target[2])
+            else:
+                self._scan_asset_folders()
+
+    def _catalog_epoch(self) -> Optional[int]:
+        if not self._asset_index:
+            return None
+        getter = getattr(self._asset_index, "peek_catalog_epoch", None)
+        if not callable(getter):
+            getter = getattr(self._asset_index, "catalog_epoch", None)
+        if callable(getter):
+            return int(getter())
+        if isinstance(getter, int):
+            return getter
+        return None
+
+    def _publish_catalog_if_changed(self) -> bool:
+        epoch = self._catalog_epoch()
+        if epoch is None or epoch == self._catalog_epoch_seen:
+            return False
+        if self._library_service is not None and self._handle is not None:
+            self._refresh_catalog_snapshot_async()
+            return False
+        self._catalog_epoch_seen = epoch
+        self._invalidate_recent_scope_cache()
+        self._repair_selection()
+        self._refresh_records(assets=True, folders=True)
+        self._dirty_selection()
+        self._start_inspection_refresh()
+        return True
+
+    def _subscribe_catalog(self) -> None:
+        subscribe = getattr(self._asset_index, "subscribe", None)
+        if self._catalog_unsubscribe is None and callable(subscribe):
+            self._catalog_unsubscribe = subscribe(self._queue_worker_update)
+
+    def _queue_worker_update(self) -> None:
+        scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+        if not callable(scheduler):
+            return
+        with self._worker_notification_lock:
+            if self._worker_notification_pending or not self._panel_mounted:
+                return
+            self._worker_notification_pending = True
+            generation = self._mount_generation
+
+        def complete() -> None:
+            with self._worker_notification_lock:
+                self._worker_notification_pending = False
+            if generation == self._mount_generation and self._panel_mounted:
+                self._invalidate_recent_scope_cache()
+                self._request_model_update()
+
+        scheduler(complete)
+
+    def _start_catalog_verify(self) -> None:
+        if not self._asset_index or not self._panel_mounted:
+            return
+        if not callable(getattr(self._asset_index, "verify_asset", None)):
+            return
+        if not callable(getattr(self._asset_index, "list_projects", None)):
+            return
+        with self._folder_scan_lock:
+            if self._catalog_verify_active:
+                return
+            if not self._panel_mounted:
+                return
+            self._catalog_verify_active = True
+            self._catalog_verify_succeeded = False
+            self._catalog_verify_refresh_pending = False
+            cancel_event = threading.Event()
+            self._catalog_verify_cancel = cancel_event
+            visible_ids = [
+                str(asset.get("id") or asset.get("project_uuid") or "")
+                for asset in self._window_assets(self._filtered_assets())
+            ]
+            thread = threading.Thread(
+                target=self._catalog_verify_worker,
+                args=(self._asset_index, cancel_event, visible_ids, self._mount_generation),
+                daemon=True,
+                name="AssetManagerCatalogVerify",
+            )
+            self._catalog_verify_thread = thread
+        thread.start()
+
+    def _catalog_verify_worker(
+        self, index: Any, cancel_event: threading.Event,
+        visible_ids: List[str], generation: int,
+    ) -> None:
+        try:
+            verify_catalog_projects(
+                self._library_service or index, cancel_event, visible_asset_ids=visible_ids
+            )
+            self._catalog_verify_succeeded = not cancel_event.is_set()
+        except Exception as exc:
+            _log.exception("Projects catalog verification failed path=%s", self.STORAGE_PATH)
+            reason = str(exc)
+            self._schedule_ui(lambda: self._set_catalog_notice(reason))
+        finally:
+            with self._folder_scan_lock:
+                self._catalog_verify_active = False
+                self._catalog_verify_refresh_pending = True
+                if self._catalog_verify_thread is threading.current_thread():
+                    self._catalog_verify_thread = None
+            self._schedule_ui(lambda: self._complete_catalog_verify(generation))
+
+    def _complete_catalog_verify(self, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != self._mount_generation:
+            return
+        with self._folder_scan_lock:
+            if not self._catalog_verify_refresh_pending:
+                return
+            self._catalog_verify_refresh_pending = False
+        if not self._panel_mounted:
+            return
+        self._invalidate_recent_scope_cache()
+        self._publish_catalog_if_changed()
+        self._refresh_records(assets=True, folders=True)
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _publish_scan_progress(self) -> bool:
+        active = self.get_scan_active()
+        status = self.get_scan_status()
+        if (
+            active == self._published_scan_active
+            and status == self._published_scan_status
+        ):
+            return False
+        self._published_scan_active = active
+        self._published_scan_status = status
+        self._dirty_fields(
+            "scan_active",
+            "scan_status",
+            "has_scan_status",
+            "refresh_action_tooltip",
+            "stop_scan_label",
+        )
+        return True
+
+    def _sync_default_folder_path(self) -> bool:
+        if not self._asset_index:
+            return False
+        current = str(resolve_default_asset_directory())
+        if current == self._last_default_folder_path:
+            return False
+        setter = getattr(self._library_service, "_call", None) if self._library_service else getattr(self._asset_index, "set_default_folder_path", None)
+        if not callable(setter):
+            self._last_default_folder_path = current
+            return False
+        result = setter("set_default_folder_path", current) if self._library_service else setter(current)
+        if not result:
+            return False
+        self._last_default_folder_path = current
+        self._repair_selection()
+        self._refresh_records(assets=True, folders=True)
+        if self._handle:
+            self._handle.dirty_all()
+        self._scan_asset_folders()
+        return True
+
+    def _refresh_records(self, *, assets: bool = False, folders: bool = False) -> None:
+        if folders:
+            self._row_folder_generation += 1
+        if not self._handle:
+            return
+        if folders:
+            self._handle.update_record_list("folders", self.get_folder_list())
+            self._handle.dirty("folders")
+            self._handle.dirty("all_assets_count")
+        if assets:
+            self._measure_text_columns()
+            self._release_obsolete_thumbnail_sources()
+            rows = self.get_filtered_assets()
+            self._release_thumbnails_outside_window()
+            self._handle.update_record_list("assets", rows)
+            self._handle.dirty("assets")
+            for field in (
+                "asset_results_summary",
+                "can_clean_missing",
+                "asset_list_top_spacer_height",
+                "asset_list_bottom_spacer_height",
+                "asset_gallery_top_spacer_height",
+                "asset_gallery_bottom_spacer_height",
+                "asset_card_slot_width",
+                "asset_card_thumbnail_height",
+                "asset_list_wide",
+                "asset_list_show_folder",
+                "asset_list_show_size",
+                "asset_list_gallery_compact",
+                "col_name_label", "col_gallery_label", "col_size_label", "col_modified_label", "col_folder_label",
+                "asset_list_name_width", "asset_list_gallery_width", "asset_list_size_width",
+                "asset_list_modified_width", "asset_list_folder_width",
+            ):
+                self._handle.dirty(field)
+        self._request_model_update()
+
+    def _dirty_model(self, *fields):
+        field_set = set(fields)
+        self._refresh_records(
+            assets="assets" in field_set,
+            folders="folders" in field_set,
+        )
+        self._dirty_fields(*(field for field in fields if field not in ("assets", "folders")))
+
+    def _dirty_fields(self, *fields: str) -> None:
+        if not self._handle:
+            return
+        for field in fields:
+            self._handle.dirty(field)
+        self._request_model_update()
+
+    def _request_model_update(self) -> None:
+        if self._handle:
+            rml_widgets.request_model_update(self._handle)
+
+    def _reset_scroll(self) -> None:
+        self._asset_window_scroll_top = 0.0
+        scroll = self._asset_scroll_container()
+        if scroll:
+            scroll.scroll_top = 0.0
+
+    def _asset_scroll_container(self, doc=None):
+        document = doc or self._doc
+        return document.get_element_by_id("asset-gallery-scroll") if document else None
+
+    @staticmethod
+    def _ui_scale():
+        return max(0.1, float(getattr(lf.ui, "get_ui_scale", lambda: 1.0)() or 1.0))
+
+    def _sync_panel_layout(self, doc=None):
+        document = doc or self._doc
+        popup = document.get_element_by_id("asset-popup") if document else None
+        if not popup:
+            return False
+        scale = self._ui_scale()
+        scale_changed = abs(scale - self._last_ui_scale) > 0.001
+        self._last_ui_scale = scale
+        height = float(popup.client_height or 0) / scale
+        if self._host_geometry:
+            height = self._host_geometry[1]
+        if height <= 0:
+            return False
+        widths = []
+        for identifier in ("asset-shell", "asset-popup"):
+            element = document.get_element_by_id(identifier) if document else None
+            value = float(getattr(element, "client_width", 0) or 0) if element else 0.0
+            if value > 0:
+                widths.append(value / scale)
+        width = max(widths, default=0.0)
+        if self._host_geometry:
+            width = self._host_geometry[0]
+        if width <= 0:
+            width = self._content_width
+        if width > 0:
+            layout_metrics = breakpoint_metrics(width)
+            breakpoint_changed = layout_metrics["breakpoint"] != self._layout_class
+            width_changed = abs(width - self._content_width) > 0.5
+            if breakpoint_changed or scale_changed:
+                self._layout_class = layout_metrics["breakpoint"]
+                self._content_width = width
+                if self._layout_class == "wide":
+                    self._inspector_width = min(420.0, max(INSPECTOR_COLUMN_MIN, self._inspector_width))
+                self._dirty_layout_fields()
+            elif width_changed:
+                self._content_width = width
+                # The results viewport below owns continuous-width bindings.
+                # Waiting for its measured width avoids a stale first update
+                # followed by a second update on every host-resize frame.
+        signature = (scale, self._layout_class, self._is_floating, height,
+                     self._inspector_preferred_height)
+        if signature == self._layout_signature:
+            return False
+        self._layout_signature = signature
+        self._main_min_height = 0.0
+        self._dirty_fields("main_min_height", "inspector_style_height")
+        if scale_changed:
+            self._dirty_layout_fields()
+        self._request_layout_recheck()
+        return True
+
+    def _request_layout_recheck(self) -> None:
+        # Rml applies the responsive styles after on_update. Read the resulting
+        # browser width once on the next UI turn, including float/dock changes.
+        schedule = getattr(lf.ui, "schedule", None)
+        if not self._panel_mounted or self._layout_recheck_pending or not callable(schedule):
+            return
+        self._layout_recheck_pending = True
+        generation = self._mount_generation
+
+        def recheck() -> None:
+            if generation != self._mount_generation:
+                return
+            self._layout_recheck_pending = False
+            if self._panel_mounted and self._sync_asset_window_viewport():
+                self._refresh_records(assets=True)
+                # The new row heights can change scrollbar space once more.
+                self._request_layout_recheck()
+
+        schedule(recheck)
+
+    def on_host_geometry_changed(self, width: float, height: float, scale: float) -> None:
+        """Use native host bounds, which cannot grow with overflowing children."""
+        geometry = (width / scale, height / scale)
+        if self._host_geometry and all(
+                abs(before - after) <= 0.5
+                for before, after in zip(self._host_geometry, geometry)):
+            return
+        previous = self._host_geometry
+        self._host_geometry = geometry
+        if not self._is_floating and math.isfinite(geometry[0]) and geometry[0] > 0.0:
+            previous_width = self._observed_outer_panel_width
+            self._observed_outer_panel_width = geometry[0]
+            if previous_width is not None and abs(previous_width - geometry[0]) > 0.5:
+                self._outer_panel_width_save_deadline = time.monotonic() + 0.25
+        if (previous is None or abs(previous[1] - geometry[1]) > 0.5
+                or breakpoint_for_width(previous[0]) != breakpoint_for_width(geometry[0])):
+            self._layout_signature = None
+        self._request_model_update()
+
+    def _sync_asset_window_viewport(self, doc=None) -> bool:
+        scroll = self._asset_scroll_container(doc)
+        if not scroll:
+            return False
+        try:
+            scale = self._ui_scale()
+            values = tuple(native_to_dp(value, scale) for value in (
+                scroll.scroll_top,
+                scroll.client_height,
+                getattr(scroll, "client_width", 0.0),
+            ))
+        except (TypeError, ValueError):
+            return False
+        old = (
+            self._asset_window_scroll_top,
+            self._asset_window_client_height,
+            self._asset_window_client_width,
+        )
+        old_window = self._asset_window_viewport_signature(*old)
+        self._asset_window_scroll_top, self._asset_window_client_height, self._asset_window_client_width = values
+        width_changed = abs(old[2] - values[2]) > 0.5
+        if width_changed:
+            # Updating every width binding for every native pixel is expensive:
+            # each binding is applied to the header and every visible row. Keep
+            # structural changes exact, but coalesce continuous geometry to an
+            # 8 dp bucket while the host is being dragged.
+            effective_width = self._effective_list_layout_width(values[2])
+            columns = list_column_widths(
+                effective_width, self._list_column_overrides, self._text_column_metrics
+            )
+            signature = (
+                self._view_mode,
+                round(values[2], 1) if self._view_mode == "gallery" else None,
+                columns["gallery"], columns["size"],
+                columns["modified"], columns["folder"],
+            )
+            if signature != self._responsive_width_signature:
+                self._responsive_width_signature = signature
+                if self._view_mode == "gallery":
+                    self._update_gallery_window_geometry(self._last_asset_match_count)
+                    self._dirty_fields(
+                        "asset_card_slot_width", "asset_card_thumbnail_height",
+                        "asset_gallery_top_spacer_height", "asset_gallery_bottom_spacer_height",
+                    )
+                else:
+                    self._dirty_fields(
+                        "asset_list_wide", "asset_list_show_size", "asset_list_show_folder",
+                        "asset_list_gallery_compact", "asset_list_gallery_width",
+                        "asset_list_size_width", "asset_list_modified_width",
+                        "asset_list_folder_width",
+                    )
+        return old_window != self._asset_window_viewport_signature(*values)
+
+    def _asset_window_viewport_signature(
+        self, scroll_top: float, client_height: float, client_width: float
+    ) -> tuple:
+        """Geometry that actually changes the virtualized record window."""
+        if self._view_mode == "gallery":
+            columns, _slot_width, row_height = self._gallery_window_metrics(client_width)
+            first = max(0, int(scroll_top // row_height) - ASSET_WINDOW_OVERSCAN_ROWS)
+            start = first // ASSET_WINDOW_BATCH_ROWS * ASSET_WINDOW_BATCH_ROWS
+            visible = (
+                math.ceil(client_height / row_height)
+                if client_height > 0
+                else ASSET_GALLERY_FALLBACK_ROWS
+            ) + ASSET_WINDOW_OVERSCAN_ROWS * 2 + ASSET_WINDOW_BATCH_ROWS - 1
+            return "gallery", columns, start, visible
+        row_height = ASSET_LIST_ROW_HEIGHT_DP
+        first = max(0, int(scroll_top // row_height) - ASSET_WINDOW_OVERSCAN_ROWS)
+        start = first // ASSET_WINDOW_BATCH_ROWS * ASSET_WINDOW_BATCH_ROWS
+        visible = (
+            math.ceil(client_height / row_height)
+            if client_height > 0
+            else ASSET_LIST_FALLBACK_ROWS
+        ) + ASSET_WINDOW_OVERSCAN_ROWS * 2 + ASSET_WINDOW_BATCH_ROWS - 1
+        return "list", row_height, start, visible
+
+    def _bind_dom_event_listeners(self, doc) -> None:
+        shell = doc.get_element_by_id("asset-shell")
+        if shell:
+            shell.add_event_listener("keydown", self._on_asset_manager_keydown)
+            shell.add_event_listener("mousedown", self._on_asset_manager_mousedown)
+            shell.add_event_listener("click", self._on_asset_manager_click)
+            shell.add_event_listener("dblclick", self._on_asset_manager_double_click)
+            shell.add_event_listener("dragstart", self._on_asset_drag_start)
+            shell.add_event_listener("dragend", self._on_asset_drag_end)
+            shell.add_event_listener("dragover", self._on_gallery_drag_over)
+            shell.add_event_listener("dragout", self._on_gallery_drag_out)
+            shell.add_event_listener("dragdrop", self._on_gallery_drop)
+        scroll = doc.get_element_by_id("asset-gallery-scroll")
+        if scroll:
+            scroll.add_event_listener("scroll", self._on_asset_scroll)
+            scroll.add_event_listener("mousescroll", self._on_gallery_precise_scroll)
+            scroll.add_event_listener("keydown", self._on_asset_results_keydown)
+        doc.add_event_listener("mousemove", self._on_resize_mousemove)
+        doc.add_event_listener("mouseup", self._on_resize_mouseup)
+
+    def _on_asset_scroll(self, event) -> None:
+        scroll = event.current_target()
+        if self._asset_scroll_event_suppressed:
+            current = float(scroll.scroll_top or 0.0)
+            self._asset_scroll_event_suppressed = False
+            if abs(current - self._asset_scroll_suppressed_top) <= 0.01:
+                return
+        if self._sync_asset_window_viewport():
+            self._asset_window_refresh_pending = True
             self._request_model_update()
 
-        scene_generation = RuntimeState.scene_generation.value
-        if scene_generation != self._last_scene_generation:
-            self._last_scene_generation = scene_generation
-            self._sync_runtime_scene_catalog(select_current=True)
-            self.refresh_catalog(request_update=False)
-            changed = True
-
+    def _on_gallery_precise_scroll(self, event) -> None:
+        scroll = event.current_target()
+        if not scroll:
+            return
         try:
-            library_path = self._asset_index.library_path
-            if library_path.exists():
-                current_mtime = library_path.stat().st_mtime
-                if current_mtime > self._library_mtime:
-                    self._asset_index.load()
-                    if self._sync_existing_asset_metadata() and library_path.exists():
-                        current_mtime = library_path.stat().st_mtime
-                    self._library_mtime = current_mtime
-                    self.refresh_catalog(request_update=False)
-                    changed = True
+            delta = float(event.get_parameter("wheel_delta_y", "0"))
+        except (TypeError, ValueError):
+            return
+        maximum = max(0.0, float(scroll.scroll_height) - float(scroll.client_height))
+        new_top = min(max(float(scroll.scroll_top) + delta * PRECISE_SCROLL_STEP * self._ui_scale(), 0.0), maximum)
+        if abs(new_top - float(scroll.scroll_top)) > 0.01:
+            scroll.scroll_top = new_top
+            self._asset_scroll_event_suppressed = True
+            self._asset_scroll_suppressed_top = new_top
+        if self._sync_asset_window_viewport():
+            self._asset_window_refresh_pending = True
+            self._request_model_update()
+        self._stop_event(event)
 
-            if hasattr(self._asset_index, "mark_missing_files"):
-                previous_missing = sum(
-                    1
-                    for asset in self._asset_index.assets.values()
-                    if not asset.get("exists", True)
+    def _on_asset_manager_click(self, event) -> None:
+        if self._input_capture_active():
+            return
+        container = event.current_target()
+        target = event.target()
+        action_element = rml_widgets.find_ancestor_with_attribute(target, "data-asset-action", container)
+        if action_element is not None:
+            action = action_element.get_attribute("data-asset-action", "")
+            asset_id = action_element.get_attribute("data-asset-id", "")
+            if action == "gallery" or action.startswith("gallery:"):
+                self._select_asset_id(asset_id)
+                self._gallery_command(action.partition(":")[2] or "primary")
+            elif action == "load":
+                self._load_asset(asset_id)
+            elif action == "menu":
+                self._show_asset_context_menu(asset_id, action_element)
+            elif action == "select":
+                self._select_asset_id(
+                    asset_id,
+                    multi_select=self._event_multi_select(event),
+                    range_select=self._event_range_select(event),
+                    row_element=action_element,
+                    container=container,
                 )
-                current_missing, _total = self._asset_index.mark_missing_files()
-                if current_missing != previous_missing:
-                    if library_path.exists():
-                        self._library_mtime = library_path.stat().st_mtime
-                    self.refresh_catalog(request_update=False)
-                    changed = True
+                self._focus_asset_results()
+            self._stop_event(event)
+            return
+        folder_element = rml_widgets.find_ancestor_with_attribute(target, "data-folder-id", container)
+        if folder_element is None:
+            return
+        menu_element = rml_widgets.find_ancestor_with_attribute(target, "data-folder-action", container)
+        if menu_element is not None:
+            self._show_folder_context_menu(menu_element.get_attribute("data-folder-id", ""))
+        else:
+            self._select_folder_id(folder_element.get_attribute("data-folder-id", ""))
+        self._stop_event(event)
+
+    def _on_asset_manager_mousedown(self, event) -> None:
+        if self._input_capture_active():
+            return
+        try:
+            button = int(event.get_parameter("button", "0"))
+        except (TypeError, ValueError):
+            return
+        container = event.current_target()
+        resize_element = rml_widgets.find_ancestor_with_attribute(
+            event.target(), "data-resize", container
+        )
+        if resize_element is not None:
+            if button == 0:
+                self._start_resize(resize_element.get_attribute("data-resize", ""), event)
+                # RmlUi detects double clicks only after mousedown propagates.
+            return
+        if button != 1:
+            return
+        element = rml_widgets.find_ancestor_with_attribute(event.target(), "data-asset-action", container)
+        if element is None or element.get_attribute("data-asset-action", "") != "select":
+            return
+        asset_id = element.get_attribute("data-asset-id", "")
+        if self._select_asset_id(asset_id, row_element=element, container=container):
+            self._show_asset_context_menu(asset_id)
+            self._stop_event(event)
+
+    def _on_asset_manager_double_click(self, event) -> None:
+        if self._input_capture_active():
+            return
+        container = event.current_target()
+        target = event.target()
+        if rml_widgets.find_ancestor_with_attribute(target, "data-thumbnail-size", container) is not None:
+            self.reset_thumbnail_size()
+            self._stop_event(event)
+            return
+        resize_element = rml_widgets.find_ancestor_with_attribute(
+            target, "data-resize", container
+        )
+        if resize_element is not None:
+            self._reset_resize(resize_element.get_attribute("data-resize", ""))
+            self._stop_event(event)
+            return
+        element = rml_widgets.find_ancestor_with_attribute(event.target(), "data-asset-action", container)
+        if element is None or element.get_attribute("data-asset-action", "") != "select":
+            return
+        asset_id = element.get_attribute("data-asset-id", "")
+        if asset_id:
+            self._load_asset(asset_id)
+            self._stop_event(event)
+
+    def _on_asset_drag_start(self, event) -> None:
+        container = event.current_target()
+        element = rml_widgets.find_ancestor_with_attribute(
+            event.target(), "data-asset-action", container
+        )
+        if element is None or element.get_attribute("data-asset-action", "") != "select":
+            return
+        asset_id = element.get_attribute("data-asset-id", "")
+        if not asset_id or not self._asset_index:
+            return
+        if asset_id.startswith("recent:"):
+            return
+        remote = self._asset_dict(asset_id) or {}
+        if remote.get("remote_only"):
+            self._begin_remote_gallery_drag(remote, event)
+            return
+        project = self._library_command("verify_asset", asset_id)
+        if project is None:
+            self.refresh_catalog(scan_folders=False)
+            return
+        asset = (
+            project.to_dict()
+            if project is not None and hasattr(project, "to_dict")
+            else (self._asset_dict(asset_id) or {})
+        )
+        if not self._project_available(asset):
+            self.refresh_catalog(scan_folders=False)
+            return
+        begin_drag = getattr(lf.ui, "begin_drag_payload", None)
+        if not callable(begin_drag):
+            return
+        if self._drag_payload_token is not None:
+            cancel_drag = getattr(lf.ui, "cancel_drag_payload", None)
+            if callable(cancel_drag):
+                cancel_drag(self._drag_payload_token)
+        token = begin_drag(
+            PROJECT_DRAG_PAYLOAD_TYPE,
+            str(asset.get("path") or ""),
+            self._get_asset_display_name(asset),
+        )
+        self._drag_payload_token = int(token)
+        self._gallery_drag = (asset_id, self._gallery_state.get("identity"))
+        self._set_asset_selection({asset_id}, cursor=asset_id, anchor=asset_id)
+        self._sync_asset_selection_dom(container, element)
+        self._dirty_selection()
+        self._stop_event(event)
+
+    def _begin_remote_gallery_drag(self, asset, event):
+        from .asset_gallery_ui import GALLERY_DRAG_PAYLOAD_TYPE
+        payload = self._gallery_drag_payload(asset)
+        if payload is None:
+            return
+        if self._drag_payload_token is not None:
+            lf.ui.cancel_drag_payload(self._drag_payload_token)
+        self._drag_payload_token = int(lf.ui.begin_drag_payload(
+            GALLERY_DRAG_PAYLOAD_TYPE, json.dumps(payload), self._get_asset_display_name(asset)))
+        self._gallery_drag = (asset["id"], self._gallery_state.get("identity"))
+        self._select_asset_id(asset["id"])
+        self._stop_event(event)
+
+    def _gallery_drop_target(self, event):
+        if not self._gallery_drag or self._gallery_drag[1] != self._gallery_state.get("identity"):
+            return None
+        element = rml_widgets.find_ancestor_with_attribute(
+            event.target(), "data-gallery-drop-target", event.current_target())
+        if element is None:
+            element = rml_widgets.find_ancestor_with_attribute(
+                event.target(), "data-folder-id", event.current_target())
+        if element is None:
+            return None
+        asset = self._asset_dict(self._gallery_drag[0]) or {}
+        folder = self._gallery_drop_target_folder(element)
+        if asset.get("remote_only") and folder in self._asset_index_folders():
+            return element
+        return None
+
+    @staticmethod
+    def _gallery_drop_target_folder(element):
+        return element.get_attribute("data-gallery-drop-target", "") or element.get_attribute("data-folder-id", "")
+
+    def _on_gallery_drag_over(self, event):
+        element = self._gallery_drop_target(event)
+        if element is not self._gallery_drop_element:
+            self._on_gallery_drag_out(event)
+            self._gallery_drop_element = element
+            if element:
+                element.set_class("is-drag-over", True)
+
+    def _on_gallery_drag_out(self, event):
+        if self._gallery_drop_element:
+            self._gallery_drop_element.set_class("is-drag-over", False)
+            self._gallery_drop_element = None
+
+    def _on_gallery_drop(self, event):
+        element = self._gallery_drop_target(event)
+        if element is None:
+            return
+        identifier, identity = self._gallery_drag
+        folder = self._gallery_drop_target_folder(element)
+        self._on_gallery_drag_out(event)
+        token, self._drag_payload_token = self._drag_payload_token, None
+        self._gallery_drag = None
+        if token is not None:
+            lf.ui.cancel_drag_payload(token)
+        self._gallery_drop_asset(identifier, folder, identity)
+        self._stop_event(event)
+
+    def _on_asset_drag_end(self, event) -> None:
+        self._on_gallery_drag_out(event)
+        self._gallery_drag = None
+        token = self._drag_payload_token
+        self._drag_payload_token = None
+        end_drag = getattr(lf.ui, "end_drag_payload", None)
+        if token is not None and callable(end_drag):
+            end_drag(token)
+            self._stop_event(event)
+
+    def _focus_asset_results(self) -> None:
+        scroll = self._asset_scroll_container()
+        focus = getattr(scroll, "focus", None)
+        if callable(focus):
+            focus()
+
+    def _gallery_columns(self) -> int:
+        if self._layout_class:
+            return grid_columns(self._asset_window_client_width, self.get_thumbnail_size())
+        return gallery_columns(self._asset_window_client_width)
+
+    def _scroll_cursor_into_view(self, index: int) -> None:
+        scroll = self._asset_scroll_container()
+        if self._view_mode == "gallery":
+            row = index // self._gallery_columns()
+            row_height = ASSET_GALLERY_ROW_HEIGHT_DP
+            if self._layout_class:
+                row_height = grid_slot_width(
+                    self._asset_window_client_width, self.get_thumbnail_size()
+                ) * 10.0 / 16.0 + 52.0
+            start = row * row_height
+            end = start + row_height
+        else:
+            row_height = ASSET_LIST_ROW_HEIGHT_DP
+            start = index * row_height
+            end = start + row_height
+        top = self._asset_window_scroll_top
+        height = self._asset_window_client_height
+        if start < top:
+            top = start
+        elif height > 0 and end > top + height:
+            top = max(0.0, end - height)
+        self._asset_window_scroll_top = top
+        if scroll is not None:
+            scroll.scroll_top = top * self._ui_scale()
+
+    def _navigate_selection(self, key: int) -> bool:
+        rows = self._filtered_assets()
+        if not rows:
+            return False
+        ids = [str(asset.get("id") or asset.get("project_uuid") or "") for asset in rows]
+        if self._view_mode == "list":
+            offsets = {KI_UP: -1, KI_DOWN: 1}
+        else:
+            columns = self._gallery_columns()
+            offsets = {KI_LEFT: -1, KI_RIGHT: 1, KI_UP: -columns, KI_DOWN: columns}
+        offset = offsets.get(key)
+        if offset is None:
+            return False
+        if self._selection_cursor_id in ids:
+            index = ids.index(self._selection_cursor_id)
+            index = max(0, min(len(ids) - 1, index + offset))
+        else:
+            index = len(ids) - 1 if offset < 0 else 0
+        asset_id = ids[index]
+        self._set_asset_selection({asset_id}, cursor=asset_id, anchor=asset_id)
+        self._scroll_cursor_into_view(index)
+        self._refresh_records(assets=True)
+        self._dirty_selection()
+        return True
+
+    def _delete_selected_assets(self) -> bool:
+        if not self._asset_index or not self._selected_asset_ids:
+            return False
+        rows = self._filtered_assets()
+        ids = [str(asset.get("id") or asset.get("project_uuid") or "") for asset in rows]
+        cursor_index = ids.index(self._selection_cursor_id) if self._selection_cursor_id in ids else 0
+        selected = self._selected_asset_ids.intersection(ids)
+        selected.intersection_update(self._asset_index_assets())
+        if not selected:
+            return False
+        delete_label = tr("common.delete")
+
+        def confirmed(button: str) -> None:
+            if button != delete_label or self._library_command("delete_assets", list(selected)) <= 0:
+                return
+            self._set_asset_selection(set(), cursor=None, anchor=None)
+            remaining = self._filtered_assets()
+            if remaining:
+                next_index = min(cursor_index, len(remaining) - 1)
+                next_id = str(
+                    remaining[next_index].get("id")
+                    or remaining[next_index].get("project_uuid")
+                    or ""
+                )
+                self._set_asset_selection({next_id}, cursor=next_id, anchor=next_id)
+                self._scroll_cursor_into_view(next_index)
+            self._refresh_records(assets=True, folders=True)
+            self._dirty_selection()
+
+        lf.ui.confirm_dialog(
+            delete_label,
+            tr("projects.dialog.delete_projects"),
+            [tr("common.cancel"), delete_label],
+            confirmed,
+            "error",
+        )
+        return True
+
+    def _on_gallery_shortcut(self, event):
+        if self._input_capture_active():
+            return False
+        target = event.target()
+        tag = getattr(target, "tag_name", "")
+        if callable(tag):
+            tag = tag()
+        if tag in ("input", "textarea", "select"):
+            return False
+        from .gallery_shortcuts import shortcut_command
+        try:
+            key = int(event.get_parameter("key_identifier", "0"))
+        except (TypeError, ValueError):
+            return False
+        command = shortcut_command(getattr(lf, "keymap", None), key,
+            **{name: event.get_bool_parameter(name + "_key", False) for name in ("ctrl", "shift", "alt", "meta")})
+        if command == "refresh_scope":
+            if self._selected_folder_id in GALLERY_SCOPES:
+                self._gallery_command("refresh")
+            else:
+                self.refresh_catalog()
+        elif command:
+            self._gallery_command(command)
+        else:
+            return False
+        self._stop_event(event)
+        return True
+
+    def _on_asset_manager_keydown(self, event):
+        if self._input_capture_active():
+            return False
+        try:
+            key = int(event.get_parameter("key_identifier", "0"))
+        except (TypeError, ValueError):
+            key = 0
+        if key == KI_ESCAPE and self._thumbnail_menu_visible:
+            self.close_thumbnail_menu()
+            self._stop_event(event)
+            return True
+        if key == KI_ESCAPE and self._quick_look_visible:
+            self.close_quick_look()
+            self._stop_event(event)
+            return True
+        if key == KI_ESCAPE and self._inspector_expanded:
+            self._inspector_expanded = False
+            self._dirty_inspector_layout()
+            self._stop_event(event)
+            return True
+        target = event.target()
+        container = event.current_target()
+        asset_action = rml_widgets.find_ancestor_with_attribute(
+            target, "data-asset-action", container
+        )
+        if (
+            asset_action is not None
+            and asset_action.get_attribute("data-asset-action", "") != "select"
+        ):
+            return False
+        tag = getattr(target, "tag_name", "")
+        if callable(tag):
+            tag = tag()
+        if key == KI_SPACE and tag not in ("input", "textarea", "select"):
+            self.toggle_quick_look()
+            self._stop_event(event)
+            return True
+        element = rml_widgets.find_ancestor_with_attribute(target, "data-folder-id", container)
+        if key in (KI_RETURN, 32) and element is not None:
+            self._select_folder_id(element.get_attribute("data-folder-id", ""))
+            self._stop_event(event)
+            return True
+        return self._on_gallery_shortcut(event)
+
+    def _on_asset_results_keydown(self, event) -> None:
+        if self._input_capture_active():
+            return
+        container = event.current_target()
+        action_element = rml_widgets.find_ancestor_with_attribute(
+            event.target(), "data-asset-action", container
+        )
+        if (
+            action_element is not None
+            and action_element.get_attribute("data-asset-action", "") != "select"
+        ):
+            return
+        if self._on_gallery_shortcut(event):
+            return
+        try:
+            key = int(event.get_parameter("key_identifier", "0"))
+        except (TypeError, ValueError):
+            return
+        if key == KI_SPACE:
+            self.toggle_quick_look()
+            self._stop_event(event)
+            return
+        if self._navigate_selection(key):
+            self._stop_event(event)
+            return
+        if key == KI_RETURN:
+            if any(event.get_bool_parameter(name + "_key", False) for name in ("ctrl", "shift", "alt", "meta")):
+                return
+            asset_id = self._selection_cursor_id or self.get_selected_asset_id()
+            visible_ids = {
+                str(asset.get("id") or asset.get("project_uuid") or "")
+                for asset in self._filtered_assets()
+            }
+            if asset_id in visible_ids:
+                self._load_asset(asset_id)
+                self._stop_event(event)
+            return
+        if key == KI_DELETE:
+            if self._delete_selected_assets():
+                self._stop_event(event)
+            return
+        if 2 <= key <= 37 and not self._event_multi_select(event):
+            character = str((key - 2) % 10) if key <= 11 else chr(ord("a") + key - 12)
+            self.set_search_query(self._search_query + character)
+            search = self._doc.get_element_by_id("asset-search-input") if self._doc else None
+            focus = getattr(search, "focus", None)
+            if callable(focus):
+                focus()
+            set_selection = getattr(search, "set_selection_range", None)
+            if callable(set_selection):
+                set_selection(len(self._search_query), len(self._search_query))
+            self._stop_event(event)
+
+    def _sync_asset_selection_dom(self, container=None, selected_element=None) -> None:
+        root = container or self._doc
+        if root is None:
+            return
+        try:
+            rows = root.query_selector_all(".asset-card, .asset-list-row")
+        except Exception:
+            rows = []
+        for row in rows:
+            asset_id = row.get_attribute("data-asset-id", "")
+            row.set_class("is-selected", asset_id in self._selected_asset_ids)
+        if selected_element is not None:
+            selected_element.set_class(
+                "is-selected",
+                selected_element.get_attribute("data-asset-id", "") in self._selected_asset_ids,
+            )
+
+    @staticmethod
+    def _event_multi_select(event) -> bool:
+        if event is None:
+            return False
+        return any(
+            event.get_bool_parameter(key, False)
+            for key in ("ctrl_key", "meta_key", "command_key")
+        )
+
+    @staticmethod
+    def _event_range_select(event) -> bool:
+        return bool(event and event.get_bool_parameter("shift_key", False))
+
+    @staticmethod
+    def _stop_event(event) -> None:
+        try:
+            event.stop_propagation()
         except Exception:
             pass
 
-        return changed
+    @staticmethod
+    def _gallery_review_open() -> bool:
+        get_panel = getattr(lf.ui, "get_panel_object", None)
+        panel = get_panel("lfs.gallery_file") if callable(get_panel) else None
+        return bool(panel and getattr(panel, "_review", None))
 
-    def on_unmount(self, doc):
-        """Save index on unmount."""
-        self._unsubscribe_reactive_state()
-        clear_active_asset_manager_panel(self)
-        if self._asset_index and hasattr(self._asset_index, "save"):
+    @staticmethod
+    def _input_capture_active() -> bool:
+        if AssetManagerPanel._gallery_review_open():
+            return True
+        is_capturing = getattr(getattr(lf, "keymap", None), "is_capturing", None)
+        try:
+            return bool(is_capturing()) if callable(is_capturing) else False
+        except Exception:
+            return False
+
+    def on_bottom_panel_resize_start(self, _handle, event, _args):
+        self._start_resize("inspector-height", event)
+
+    def _list_columns(self):
+        return list_columns(
+            self._effective_list_layout_width(),
+            self._text_column_metrics,
+            self._list_column_overrides,
+        )
+
+    def _effective_list_layout_width(self, client_width: Optional[float] = None) -> float:
+        """Keep list columns stable when the stacked Inspector docks beside them."""
+        width = max(0.0, float(
+            self._asset_window_client_width if client_width is None else client_width
+        ))
+        if not self._inspector_expanded or self._layout_class not in ("compact", "narrow"):
+            return width
+        host_width = max(width, float(self._content_width or 0.0))
+        future_side_width = max(260.0, host_width - INSPECTOR_COLUMN_MIN)
+        return min(width, future_side_width)
+
+    def _measure_text_columns(self):
+        if not self._doc:
+            return
+        prose = self._doc.get_element_by_id("asset-measure-prose")
+        value = self._doc.get_element_by_id("asset-measure-value")
+        if not prose or not value or not hasattr(prose, "measure_text"):
+            return
+        scale = self._ui_scale()
+        folder_records = self._asset_index_folders()
+        folders = tuple(sorted({
+            str(folder_records.get(str(a.get("folder_id")), {}).get("name") or "")
+            for a in self._asset_index_assets().values()
+        }))
+        key = (scale, lf.ui.get_current_language(), folders)
+        if key == self._text_measure_key:
+            return
+        if self._text_locales is None:
+            self._start_text_locales_load()
+            return
+        def widest(element, texts):
+            return max((element.measure_text(text) / scale for text in texts), default=0.0)
+        lf.ui.get_languages()  # Load fallback glyphs before measuring every locale.
+        gallery, labels = self._text_locales
+        self._inspector_label_width = math.ceil(widest(prose, labels))
+        self._text_column_metrics = dict(
+            gallery=math.ceil(widest(prose, gallery)) + 16.0 + 24.0,
+            size=math.ceil(widest(value, ["1023.9 " + unit for unit in ("B", "KB", "MB", "GB", "TB")])) + 16.0,
+            modified=math.ceil(widest(value, ["2000-12-30 23:59"])) + 16.0,
+            folder=min(240.0, math.ceil(widest(prose, folders)) + 16.0))
+        for column in self._text_column_metrics:
+            self._text_column_metrics[column] = max(self._text_column_metrics[column],
+                math.ceil(prose.measure_text(self._list_header_label(column)) / scale) + 16.0)
+        for label in self._doc.query_selector_all(".parameter-label"):
+            label.set_property("width", f"{self._inspector_label_width}dp")
+            label.set_property("min-width", f"{self._inspector_label_width}dp")
+            label.set_property("flex-basis", f"{self._inspector_label_width}dp")
+        self._text_measure_key = key
+
+    def _start_text_locales_load(self) -> None:
+        if self._text_locales_loading:
+            return
+        self._text_locales_loading = True
+        directory = Path(lf.ui.resource_directory()) / "locales"
+        generation = self._mount_generation
+
+        def worker() -> None:
             try:
-                self._asset_index.save()
-            except Exception as e:
-                _logger.warning(f"Failed to save asset index: {e}")
+                texts = _load_locale_measure_texts(directory)
+            except (OSError, ValueError) as exc:
+                _log.warning("Projects locale width data unavailable: %s", exc)
+                texts = ([], [])
 
-        doc.remove_data_model("asset_manager")
-        self._handle = None
-        self._doc = None
+            def complete() -> None:
+                self._text_locales_loading = False
+                if generation != self._mount_generation or not self._panel_mounted:
+                    return
+                self._text_locales = texts
+                self._text_measure_key = None
+                self._measure_text_columns()
+                self._dirty_list_layout_fields()
 
-    def _subscribe_reactive_state(self):
+            self._schedule_ui(complete)
+
+        threading.Thread(target=worker, daemon=True, name="AssetManagerLocaleWidths").start()
+
+    def _list_column_width(self, column: str) -> float:
+        return list_column_widths(
+            self._effective_list_layout_width(),
+            self._list_column_overrides,
+            self._text_column_metrics,
+        )[column]
+
+    def _start_resize(self, region: str, event) -> None:
+        self._resize_region = region
+        self._resize_start_x = float(event.get_parameter("mouse_x", "0"))
+        self._resize_start_y = float(event.get_parameter("mouse_y", "0"))
+        self._resize_start_inspector = self._inspector_width
+        self._resize_start_height = (
+            self._inspector_band_height()
+            if region == "inspector-height"
+            else self._inspector_preferred_height
+        )
+        self._resize_scale = self._ui_scale()
+        self._resize_last_height = self._resize_start_height
+        self._bottom_panel_dragging = region == "inspector-height"
+        if self._bottom_panel_dragging:
+            metrics = breakpoint_metrics(self._content_width or 600.0)
+            panel_height = self._host_geometry[1] if self._host_geometry else 700.0
+            self._resize_inspector_height_max = min(
+                metrics["inspector_max"],
+                max(metrics["inspector_min"], panel_height * 0.5),
+            )
+        if region.startswith("list-column:"):
+            self._resize_start_column = region.partition(":")[2]
+            self._resize_start_column_width = self._list_column_width(self._resize_start_column)
+            minimum_name = 80.0
+            if self._resize_start_column == "name":
+                minimum_gallery = 32.0 if self._list_columns()["gallery"] == 32 else (self._text_column_metrics or {}).get("gallery", 32.0)
+                self._resize_column_min = minimum_name
+                self._resize_column_max = self._resize_start_column_width + max(
+                    0.0, self._list_column_width("gallery") - minimum_gallery
+                )
+            else:
+                self._resize_column_min = (self._text_column_metrics or {}).get(self._resize_start_column, 32.0)
+                self._resize_column_max = min(
+                    280.0,
+                    self._resize_start_column_width + max(0.0, self._list_column_width("name") - minimum_name),
+                )
+            self._resize_column_max = max(self._resize_column_min, self._resize_column_max)
+        self._dirty_fields("bottom_panel_resize_dragging")
+
+    def _reset_resize(self, region: str) -> None:
+        self._resize_region = ""
+        self._bottom_panel_dragging = False
+        defaults = breakpoint_metrics(self._content_width or 1100.0)
+        if region == "inspector":
+            self._inspector_width = defaults["inspector_default"]
+            self._dirty_layout_fields()
+        elif region == "inspector-height":
+            self._inspector_preferred_height = defaults["inspector_default"]
+            self._info_preferred_height = self._inspector_preferred_height
+            self._sync_panel_layout()
+            self._dirty_fields("inspector_height", "inspector_style_height", "bottom_panel_height")
+        elif region.startswith("list-column:"):
+            column = region.partition(":")[2]
+            self._list_column_overrides.pop(column, None)
+            self._dirty_fields(
+                "asset_list_wide", "asset_list_show_size", "asset_list_show_folder", "asset_list_gallery_compact",
+                *(f"asset_list_{name}_width" for name in ("name", "gallery", "size", "modified", "folder"))
+            )
+        self._persist_project_manager_state()
+
+    def _on_resize_mousemove(self, event) -> None:
+        try:
+            mouse_y = float(event.get_parameter("mouse_y", "0"))
+        except (TypeError, ValueError):
+            return
+        region = getattr(self, "_resize_region", "")
+        scale = max(0.001, getattr(self, "_resize_scale", self._ui_scale()))
+        delta_x = (float(event.get_parameter("mouse_x", "0")) - self._resize_start_x) / scale
+        delta_y = (mouse_y - self._resize_start_y) / scale
+        if region == "inspector":
+            self._inspector_width = min(420.0, max(INSPECTOR_COLUMN_MIN, self._resize_start_inspector - delta_x))
+            self._dirty_layout_fields()
+        elif region == "inspector-height" or self._bottom_panel_dragging:
+            metrics = breakpoint_metrics(self._content_width or 600.0)
+            target = min(
+                self._resize_inspector_height_max,
+                max(metrics["inspector_min"], self._resize_start_height - delta_y),
+            )
+            # Avoid a full panel measurement/layout pass for every mouse pixel.
+            # The Inspector height binding is the only live geometry dependency.
+            if abs(target - self._resize_last_height) >= 0.5:
+                self._inspector_preferred_height = target
+                self._resize_last_height = target
+                # RmlPanelHost owns the live native-pixel resize. Keeping this
+                # callback state-only avoids a second layout invalidation from
+                # Python during the same pointer frame; bindings reconcile on Up.
+            self._stop_event(event)
+        elif region.startswith("list-column:"):
+            column = region.partition(":")[2]
+            if column == "name":
+                self._list_column_overrides.pop("gallery", None)
+            else:
+                self._list_column_overrides.pop("name", None)
+            target = min(self._resize_column_max, max(self._resize_column_min, self._resize_start_column_width + delta_x))
+            self._list_column_overrides[column] = target
+            self._dirty_fields(
+                "asset_list_wide", "asset_list_show_size", "asset_list_show_folder", "asset_list_gallery_compact",
+                *(f"asset_list_{name}_width" for name in ("name", "gallery", "size", "modified", "folder"))
+            )
+            self._stop_event(event)
+
+    def _on_resize_mouseup(self, event) -> None:
+        region = getattr(self, "_resize_region", "")
+        if region:
+            if region == "inspector-height":
+                self._info_preferred_height = self._inspector_preferred_height
+            self._bottom_panel_dragging = False
+            self._resize_region = ""
+            if region == "inspector-height":
+                self._dirty_fields(
+                    "bottom_panel_resize_dragging", "inspector_height", "inspector_style_height"
+                )
+            else:
+                self._dirty_fields("bottom_panel_resize_dragging")
+            self._persist_project_manager_state()
+            self._stop_event(event)
+
+    def _resolve_event_value(self, args, event, attribute: str) -> str:
+        if args and args[0] not in (None, ""):
+            return str(args[0])
+        if event is None:
+            return ""
+        for getter_name in ("current_target", "target"):
+            getter = getattr(event, getter_name, None)
+            element = getter() if callable(getter) else None
+            while element is not None:
+                value = element.get_attribute(attribute, "")
+                if value:
+                    return str(value)
+                element = element.parent()
+        return ""
+
+    def _subscribe_reactive_state(self) -> None:
         if self._reactive_unsubscribers:
             return
+        signal = getattr(RuntimeState, "language_generation", None)
+        subscribe = getattr(signal, "subscribe", None)
+        if callable(subscribe):
+            self._reactive_unsubscribers.append(subscribe(lambda _value: self._language_changed()))
 
-        native_signals = (
-            RuntimeState.scene_generation,
-            RuntimeState.language_generation,
-        )
-        self._reactive_unsubscribers = [
-            signal.subscribe(lambda _value: self._request_model_update())
-            for signal in native_signals
-        ]
+    def _language_changed(self) -> None:
+        self._refresh_records(assets=True, folders=True)
+        self._dirty_selection()
+        if self._handle:
+            self._handle.dirty_all()
+        self._request_model_update()
 
-    def _unsubscribe_reactive_state(self):
+    def _unsubscribe_reactive_state(self) -> None:
         for unsubscribe in self._reactive_unsubscribers:
             try:
                 unsubscribe()
@@ -3596,713 +5176,258 @@ class AssetManagerPanel(Panel):
                 pass
         self._reactive_unsubscribers = []
 
-    def _request_model_update(self):
-        if self._handle:
-            rml_widgets.request_model_update(self._handle)
-
-    def _bind_dom_event_listeners(self, doc) -> None:
-        """Bind stable DOM listeners for dynamic Asset Manager rows.
-
-        The generated asset/project/scene rows are replaced by data-for updates.
-        Binding once to a stable parent mirrors the working popup panels and
-        avoids relying on per-row data-event callbacks for card selection.
-        """
-        content = doc.get_element_by_id("asset-popup-content")
-        if content:
-            content.add_event_listener("mousedown", self._on_asset_manager_mousedown)
-            content.add_event_listener("click", self._on_asset_manager_click)
-            content.add_event_listener(
-                "dblclick", self._on_asset_manager_double_click
-            )
-        gallery_scroll = doc.get_element_by_id("asset-gallery-scroll")
-        if gallery_scroll:
-            gallery_scroll.add_event_listener(
-                "mousescroll", self._on_gallery_precise_scroll
-            )
-
-        # Resize-start is bound declaratively in RML via data-event-mousedown.
-        # Only keep document-level listeners here for active drag tracking.
-        doc.add_event_listener("mousemove", self._on_resize_mousemove)
-        doc.add_event_listener("mouseup", self._on_resize_mouseup)
-
-    def _on_gallery_precise_scroll(self, event) -> None:
-        scroll_el = event.current_target()
-        if not scroll_el:
-            return
-
+    def _sync_panel_space_state(self) -> bool:
+        get_panel = getattr(lf.ui, "get_panel", None)
         try:
-            wheel_delta = float(event.get_parameter("wheel_delta_y", "0"))
-        except (TypeError, ValueError):
-            return
-
-        max_scroll = max(0.0, scroll_el.scroll_height - scroll_el.client_height)
-        if max_scroll <= 0.0:
-            event.stop_propagation()
-            return
-
-        new_scroll = min(
-            max(scroll_el.scroll_top + wheel_delta * PRECISE_SCROLL_STEP, 0.0),
-            max_scroll,
-        )
-        if abs(new_scroll - scroll_el.scroll_top) > 0.01:
-            scroll_el.scroll_top = new_scroll
-
-        event.stop_propagation()
-
-    def _on_asset_manager_click(self, event) -> None:
-        if self._input_capture_active():
-            return
-
-        container = event.current_target()
-        target = event.target()
-        if target is None:
-            return
-
-        action_el = rml_widgets.find_ancestor_with_attribute(
-            target, "data-asset-action", container
-        )
-        if action_el is not None:
-            action = action_el.get_attribute("data-asset-action", "")
-            asset_id = action_el.get_attribute("data-asset-id", "")
-
-            if action == "load":
-                self.on_load_asset(None, event, [asset_id])
-            elif action == "load_new":
-                self._load_menu_asset_id = None
-                self._dirty_model("assets")
-                self.on_load_asset_new(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "add_to_scene":
-                self._load_menu_asset_id = None
-                self._dirty_model("assets")
-                self.on_add_asset_to_scene(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "remove":
-                self.on_remove_asset(None, event, [asset_id])
-            elif action == "menu":
-                self._load_menu_asset_id = None
-                self.on_toggle_asset_menu(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "rename":
-                self.on_rename_asset(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "show_in_folder":
-                self.on_show_in_folder(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "update_thumbnail":
-                self.on_update_thumbnail(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "move_to_project":
-                self.on_move_to_project(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "remove_from_menu":
-                self.on_remove_asset(None, event, [asset_id])
-                self._stop_event(event)
-                return
-            elif action == "create_project":
-                self.on_create_project_and_move(None, event, [asset_id])
-                # Close menu after creating project
-                self._open_menu_asset_id = None
-                self._dirty_model("assets", "move_menu_projects")
-                if self._handle:
-                    self._handle.update_record_list("move_menu_projects", [])
-                self._stop_event(event)
-                return
-            elif action == "move_to_existing_project":
-                project_id = action_el.get_attribute("data-project-id", "")
-                self._log_info("Move to existing project clicked: asset=%s, project=%s", asset_id, project_id)
-                if project_id:
-                    self._move_asset_to_project(asset_id, project_id)
-                    # Close menu after move
-                    self._open_menu_asset_id = None
-                    self._dirty_model("assets", "move_menu_projects")
-                    if self._handle:
-                        self._handle.update_record_list("move_menu_projects", [])
-                else:
-                    self._log_warn("No project_id found on action element")
-                self._stop_event(event)
-                return
-            elif action in ("select", "scene_asset"):
-                # Close any open menu when selecting an asset
-                if self._open_menu_asset_id:
-                    self._open_menu_asset_id = None
-                    self._dirty_model("assets", "move_menu_projects")
-                    if self._handle:
-                        self._handle.update_record_list("move_menu_projects", [])
-                if self._load_menu_asset_id:
-                    self._load_menu_asset_id = None
-                    self._dirty_model("assets")
-                self._select_asset_id(
-                    asset_id,
-                    toggle=False,
-                    multi_select=self._event_multi_select(event),
-                )
-            self._stop_event(event)
-            return
-
-        project_el = rml_widgets.find_ancestor_with_attribute(
-            target, "data-project-id", container
-        )
-        if project_el is not None:
-            # Check if this is a project action (menu, rename, delete)
-            project_action_el = rml_widgets.find_ancestor_with_attribute(
-                target, "data-project-action", container
-            )
-            if project_action_el is not None:
-                action = project_action_el.get_attribute("data-project-action", "")
-                project_id = project_action_el.get_attribute("data-project-id", "")
-
-                if action == "menu":
-                    self.on_toggle_project_menu(None, event, [project_id])
-                    self._stop_event(event)
-                    return
-                elif action == "watch_dirs":
-                    self.on_edit_watch_dirs(None, event, [project_id])
-                    self._stop_event(event)
-                    return
-                elif action == "rename":
-                    self.on_rename_project(None, event, [project_id])
-                    self._stop_event(event)
-                    return
-                elif action == "delete":
-                    self.on_delete_project(None, event, [project_id])
-                    self._stop_event(event)
-                    return
-
-            # Regular project selection (not an action button)
-            project_id = project_el.get_attribute("data-project-id", "")
-            # Close any open project menu when selecting a project
-            if self._open_menu_project_id:
-                self._open_menu_project_id = None
-                self._dirty_model("projects")
-            if self._select_project_id(project_id):
-                self._stop_event(event)
-            return
-
-        scene_el = rml_widgets.find_ancestor_with_attribute(
-            target, "data-scene-id", container
-        )
-        if scene_el is not None:
-            scene_id = scene_el.get_attribute("data-scene-id", "")
-            if self._select_scene_id(scene_id):
-                self._stop_event(event)
-            return
-
-        # Close open asset menu when clicking elsewhere
-        if self._open_menu_asset_id:
-            self._open_menu_asset_id = None
-            self._dirty_model("assets", "move_menu_projects")
-            if self._handle:
-                self._handle.update_record_list("move_menu_projects", [])
-
-        if self._load_menu_asset_id:
-            self._load_menu_asset_id = None
-            self._dirty_model("assets")
-
-        # Close open project menu when clicking elsewhere
-        if self._open_menu_project_id:
-            self._open_menu_project_id = None
-            self._dirty_model("projects")
-
-    def _on_asset_manager_mousedown(self, event) -> None:
-        if self._input_capture_active():
-            return
-
-        try:
-            button = int(event.get_parameter("button", "0"))
-        except (AttributeError, TypeError, ValueError):
-            return
-        if button != 1:
-            return
-
-        container = event.current_target()
-        target = event.target()
-        if target is None:
-            return
-
-        action_el = rml_widgets.find_ancestor_with_attribute(
-            target, "data-asset-action", container
-        )
-        if action_el is None:
-            return
-
-        action = action_el.get_attribute("data-asset-action", "")
-        if action not in ("select", "scene_asset"):
-            return
-
-        asset_id = action_el.get_attribute("data-asset-id", "")
-        if not asset_id:
-            return
-
-        if self._select_asset_id(asset_id):
-            self._load_menu_asset_id = asset_id
-            self._open_menu_asset_id = None
-            self._open_menu_project_id = None
-            self._dirty_model("assets", "projects")
-        self._stop_event(event)
-
-    def _on_asset_manager_double_click(self, event) -> None:
-        if self._input_capture_active():
-            return
-
-        container = event.current_target()
-        target = event.target()
-        if target is None:
-            return
-
-        action_el = rml_widgets.find_ancestor_with_attribute(
-            target, "data-asset-action", container
-        )
-        if action_el is None:
-            return
-
-        action = action_el.get_attribute("data-asset-action", "")
-        if action not in ("select", "scene_asset"):
-            return
-
-        asset_id = action_el.get_attribute("data-asset-id", "")
-        if not asset_id:
-            return
-
-        self._load_menu_asset_id = None
-        self.on_load_asset(None, event, [asset_id])
-        self._stop_event(event)
-
-    def _input_capture_active(self) -> bool:
-        keymap = getattr(lf, "keymap", None)
-        is_capturing = getattr(keymap, "is_capturing", None)
-        if not callable(is_capturing):
-            return False
-        try:
-            return bool(is_capturing())
+            info = get_panel(self.id) if callable(get_panel) else None
         except Exception:
+            info = None
+        panel_space = getattr(info, "space", self._panel_space)
+        is_floating = panel_space == lf.ui.PanelSpace.FLOATING
+        changed = panel_space != self._panel_space or is_floating != self._is_floating
+        self._panel_space = panel_space
+        self._is_floating = is_floating
+        if info is not None:
+            self._restore_remembered_left_dock_width(panel_space)
+        if changed:
+            self._layout_signature = None
+            self._dirty_layout_fields()
+        return changed
+
+    def _sync_outer_panel_width_preference(self) -> None:
+        if self._is_floating or not read_project_manager_preferences()["rememberState"]:
+            self._outer_panel_width_save_deadline = 0.0
+            return
+        getter = getattr(lf.ui, "get_left_dock_width", None)
+        if not callable(getter):
+            return
+        width = float(getter())
+        if not math.isfinite(width) or width <= 0.0:
+            return
+        now = time.monotonic()
+        if self._observed_outer_panel_width is None:
+            self._observed_outer_panel_width = width
+            return
+        if abs(width - self._observed_outer_panel_width) > 0.5:
+            self._observed_outer_panel_width = width
+            self._outer_panel_width_save_deadline = now + 0.25
+            return
+        if self._outer_panel_width_save_deadline and now >= self._outer_panel_width_save_deadline:
+            self._outer_panel_width_save_deadline = 0.0
+            self._persist_project_manager_state()
+
+    def _refresh_after_project_write(self) -> bool:
+        # The scanner can hold the catalog lock while committing a batch. Keep
+        # the last observed generation until it finishes, then refresh the save.
+        with self._folder_scan_lock:
+            if self._folder_scan_active or self._catalog_verify_active:
+                return False
+        poll_write = getattr(lf, "project_poll_write", None)
+        if not callable(poll_write) or not self._asset_index:
+            return False
+        try:
+            poll = poll_write()
+            if not isinstance(poll, dict) or "generation" not in poll:
+                return False
+            generation = int(poll.get("generation") or 0)
+            running = bool(poll.get("running"))
+            path = str(poll.get("path") or "")
+            error = str(poll.get("error") or "")
+        except Exception:
+            self._log_warn("Failed to poll .licht project save state")
             return False
 
-    def _event_multi_select(self, event) -> bool:
-        for key in ("ctrl_key", "meta_key", "command_key"):
-            try:
-                if event.get_bool_parameter(key, False):
-                    return True
-            except Exception:
-                pass
-        return False
+        previous_generation = self._last_project_write_generation
+        find_by_path = getattr(self._asset_index, "find_asset_by_path", None)
+        project = find_by_path(path) if path and callable(find_by_path) else None
+        first_poll_needs_refresh = False
+        if previous_generation is None and path:
+            if project is None:
+                first_poll_needs_refresh = True
+            else:
+                asset = self._asset_dict(project.id) or {}
+                first_poll_needs_refresh = generation != int(asset.get("generation") or 0)
+        completed = (
+            not running
+            and not error
+            and (
+                first_poll_needs_refresh
+                or self._project_write_was_running
+                or (previous_generation is not None and (
+                    generation != previous_generation
+                    or path != self._last_project_write_path
+                ))
+            )
+        )
+        self._last_project_write_generation = generation
+        self._project_write_was_running = running
+        self._last_project_write_path = path
+        if not completed or not path:
+            return False
 
-    def _stop_event(self, event) -> None:
+        if project is None:
+            folder_id_for_path = getattr(self._asset_index, "folder_id_for_path", None)
+            if not callable(folder_id_for_path) or folder_id_for_path(path) is None:
+                return False
+            try:
+                self._library_command("register_licht_asset", path)
+            except Exception as exc:
+                self._log_error("Failed to register saved project %s: %s", path, exc)
+                return False
+            self._refresh_records(assets=True, folders=True)
+            if self._handle:
+                self._handle.dirty_all()
+            return True
+        verify_asset = getattr(self._asset_index, "verify_asset", None)
+        if not callable(verify_asset) or self._library_command("verify_asset", project.id) is None:
+            return False
+        self._refresh_records(assets=True, folders=True)
+        if self._handle:
+            self._handle.dirty_all()
+        return True
+
+    def refresh_after_thumbnail_write(self, path: str) -> None:
+        if not self._panel_mounted or not self._asset_index:
+            return
+        key = self._project_path_key(path)
+        assets = list(self._asset_index_assets().values()) + list(self._recent_only_assets().values())
+        for asset in assets:
+            if self._project_path_key(asset.get("path")) != key:
+                continue
+            asset_id = str(asset["id"])
+            if not asset.get("recent_only"):
+                self._library_command("verify_asset", asset_id)
+            if self._inspection_pipeline is not None:
+                self._inspection_pipeline.invalidate(asset_id)
+            self._inspection_by_asset.pop(asset_id, None)
+            self._row_inspection_generation += 1
+        self._invalidate_recent_scope_cache()
+        self._refresh_records(assets=True)
+        self._dirty_selection()
+        self._start_inspection_refresh()
+
+    def on_mount(self, doc):
+        super().on_mount(doc)
+        if self._catalog_preview is None and self._prefetched_catalog_preview:
+            self._catalog_preview = self._prefetched_catalog_preview
+            self._row_catalog_generation += 1
+        self._invalidate_recent_scope_cache()
+        RuntimeState.projects_panel_visible.value = True
+        self._panel_mounted = True
+        self._mount_generation += 1
+        self._doc = doc
+        self._text_measure_key = None
+        self._subscribe_gallery()
+        if self._asset_index is None:
+            self._start_backend_initialization()
+        self._repair_selection()
+        self._bind_dom_event_listeners(doc)
+        self._subscribe_reactive_state()
+        self._sync_panel_space_state()
+        self._sync_panel_layout(doc)
+        self._sync_asset_window_viewport(doc)
+        self._request_layout_recheck()
+        self._refresh_records(assets=True, folders=True)
+        if self._handle:
+            self._handle.dirty_all()
+        self._catalog_epoch_seen = self._catalog_epoch()
+        self._subscribe_catalog()
+        self._sync_default_folder_path()
+        self._refresh_after_project_write()
+        if self._asset_index is not None:
+            self._start_catalog_verify()
+            self._start_inspection_refresh()
+        if self._asset_index is not None and not _folder_scan_completed_in_process:
+            self._scan_asset_folders()
+
+    def on_update(self, doc):
+        self._drain_ui_callbacks()
+        changed = self._sync_panel_space_state()
+        self._sync_outer_panel_width_preference()
+        changed = self._sync_default_folder_path() or changed
+        changed = self._refresh_after_project_write() or changed
+        changed = self._sync_panel_layout(doc) or changed
+        changed = self._sync_info_thumbnail(doc) or changed
+        if self._publish_catalog_if_changed():
+            changed = True
+        if self._publish_scan_progress():
+            changed = True
+        window_changed = self._sync_asset_window_viewport(doc)
+        if self._asset_window_refresh_pending or window_changed or self._folder_records_refresh_pending:
+            self._asset_window_refresh_pending = False
+            folders = self._folder_records_refresh_pending
+            self._folder_records_refresh_pending = False
+            self._refresh_records(assets=True, folders=folders)
+            changed = True
+        return changed
+
+    def on_unmount(self, doc):
+        self._persist_project_manager_state()
+        RuntimeState.projects_panel_visible.value = False
+        self._layout_recheck_pending = False
+        self._thumbnail_menu_visible = False
+        if self._gallery_toast_timer:
+            self._gallery_toast_timer.cancel()
+            self._gallery_toast_timer = None
+        if self._gallery_undo_timer:
+            self._gallery_undo_timer.cancel()
+            self._gallery_undo_timer = None
+        if self._gallery_unsubscribe:
+            self._gallery_unsubscribe()
+            self._gallery_unsubscribe = None
+        with self._folder_scan_lock:
+            self._panel_mounted = False
+            self._mount_generation += 1
+            self._folder_scan_rerun_pending = False
+            self._folder_scan_rerun_target = None
+            cancel = self._folder_scan_cancel
+            verify_cancel = self._catalog_verify_cancel
+        if cancel is not None:
+            cancel.set()
+        if verify_cancel is not None:
+            verify_cancel.set()
+        if self._inspection_pipeline is not None:
+            self._inspection_pipeline.close()
+        if self._catalog_unsubscribe:
+            self._catalog_unsubscribe()
+            self._catalog_unsubscribe = None
+        if self._drag_payload_token is not None:
+            cancel_drag = getattr(lf.ui, "cancel_drag_payload", None)
+            if callable(cancel_drag):
+                cancel_drag(self._drag_payload_token)
+            self._drag_payload_token = None
+        release_texture = getattr(lf.ui, "release_rml_texture", None)
+        if callable(release_texture):
+            for source in self._thumbnail_sources_by_asset.values():
+                release_texture(source)
+        self._thumbnail_sources_by_asset.clear()
+        if self._info_thumbnail_source:
+            if callable(release_texture):
+                release_texture(self._info_thumbnail_source)
+            self._info_thumbnail_source = ""
+        self._unsubscribe_reactive_state()
         try:
-            event.stop_propagation()
+            doc.remove_data_model("asset_manager")
         except Exception:
             pass
+        self._handle = None
+        self._doc = None
 
-    def _on_resize_mousemove(self, event) -> None:
-        """Handle mousemove for panel resizing."""
-        try:
-            mouse_x = float(event.get_parameter("mouse_x", "0"))
-        except (TypeError, ValueError):
-            return
-        if self._sidebar_dragging:
-            self.on_sidebar_resize_delta(mouse_x)
-            event.stop_propagation()
-        elif self._right_panel_dragging:
-            self.on_right_panel_resize_delta(mouse_x)
-            event.stop_propagation()
+    def _on_close_panel(self, _handle=None, _event=None, _args=None):
+        self._dismiss_gallery_undo()
+        self._persist_project_manager_state()
+        lf.ui.set_panel_enabled(self.id, False)
 
-    def _on_resize_mouseup(self, _event) -> None:
-        """Handle mouseup to end panel resizing."""
-        self.on_sidebar_resize_end()
-        self.on_right_panel_resize_end()
+    @staticmethod
+    def _log_warn(message: str, *args: Any) -> None:
+        text = message % args if args else message
+        logger = getattr(lf, "log", None)
+        log = getattr(logger, "warn", None)
+        (log if callable(log) else _log.warning)(text)
 
-    # ── Integration Hooks (Stubs) ─────────────────────────────
-
-    def on_training_started(
-        self, project_name: str, scene_name: str, parameters: Dict[str, Any]
-    ) -> Optional[str]:
-        """Called when training starts - create project/scene context.
-
-        Returns:
-            Scene ID if created, None otherwise.
-        """
-        if not self._asset_index:
-            return None
-
-        try:
-            # Create or get project
-            project = self._asset_index.find_or_create_project(project_name)
-            project_id = project.id
-
-            # Create or get scene
-            scene = self._asset_index.find_or_create_scene(project_id, scene_name)
-            scene_id = scene.id
-
-            self._asset_index.save()
-
-            # Update UI if panel is open
-            self._selected_project_id = project_id
-            self._selected_scene_id = scene_id
-            self.refresh_catalog()
-
-            return scene_id
-
-        except Exception as e:
-            _logger.error(f"Failed to create training context: {e}")
-            return None
-
-    def on_checkpoint_saved(
-        self, scene_id: str, checkpoint_path: str, iteration: int
-    ) -> Optional[str]:
-        """Called when checkpoint is saved - add checkpoint asset.
-
-        Returns:
-            Asset ID if created, None otherwise.
-        """
-        if not self._asset_index:
-            return None
-
-        try:
-            scene = (
-                self._asset_index.scenes.get(scene_id)
-                if hasattr(self._asset_index, "scenes")
-                else None
-            )
-            if not scene:
-                return None
-
-            asset = self._scan_and_register_asset(
-                checkpoint_path,
-                project_id=scene.get("project_id"),
-                scene_id=scene_id,
-                fallback_role="training_checkpoint",
-                override_type="checkpoint",
-                override_role="training_checkpoint",
-            )
-
-            if asset:
-                self._asset_index.save()
-
-                # Refresh UI
-                self.refresh_catalog()
-
-                return asset.id
-            return None
-
-        except Exception as e:
-            _logger.error(f"Failed to register checkpoint: {e}")
-            return None
-
-    def on_training_completed(
-        self, scene_id: str, metrics: Optional[Dict[str, Any]] = None
-    ):
-        """Called when training completes."""
-        if not self._asset_index:
-            return
-
-        try:
-            self._asset_index.save()
-
-            # Refresh UI
-            self.refresh_catalog()
-
-        except Exception as e:
-            _logger.error(f"Failed to update training completion: {e}")
-
-    def on_export_generated(
-        self,
-        file_path: str,
-        export_type: str,
-        project_id: Optional[str] = None,
-        scene_id: Optional[str] = None,
-    ) -> Optional[str]:
-        """Called when export is generated - register export asset.
-
-        Args:
-            file_path: Path to exported file
-            export_type: Type of export (ply, rad, sog, spz, mp4, etc.)
-            project_id: Optional associated project
-            scene_id: Optional associated scene
-
-        Returns:
-            Asset ID if created, None otherwise.
-        """
-        if not self._asset_index:
-            return None
-
-        try:
-            asset = self._scan_and_register_asset(
-                project_id=project_id,
-                path=file_path,
-                scene_id=scene_id,
-                fallback_role="export",
-                override_type=export_type,
-                override_role="export",
-            )
-
-            self._asset_index.save()
-
-            # Refresh UI if panel is open
-            self.refresh_catalog()
-
-            return asset.id if asset else None
-
-        except Exception as e:
-            _logger.error(f"Failed to register export: {e}")
-            return None
-
-    # ── Helper Methods ─────────────────────────────────────────
-
-    def refresh_catalog(self, *, request_update: bool = True):
-        """Refresh all catalog data in the UI."""
-        self._reconcile_selection()
-        self._update_all_record_lists()
-        if self._handle:
-            self._handle.dirty_all()
-            if request_update:
-                self._request_model_update()
-
-    def refresh_catalog_scan(self, _handle=None, _ev=None, _args=None):
-        """Rescan all known asset directories and refresh the catalog."""
-        if not self._asset_index:
-            return
-        try:
-            # Rescan all asset paths in the index
-            for asset in list(self._asset_index.assets.values()):
-                path = asset.get("absolute_path") or asset.get("path")
-                if path and os.path.exists(path):
-                    try:
-                        if self._asset_scanner:
-                            metadata = self._asset_scanner.scan_file(path)
-                            if metadata:
-                                self._asset_index.update_asset(asset["id"], **metadata)
-                    except Exception as exc:
-                        _logger.debug(f"Failed to rescan {path}: {exc}")
-            self._asset_index.save()
-            self.refresh_catalog()
-            self._log_info("Refreshed asset catalog")
-        except Exception as exc:
-            self._log_error(f"Failed to refresh catalog: {exc}")
-
-    def clean_missing(self, _handle=None, _ev=None, _args=None):
-        """Prune every catalog entry whose backing file is no longer on disk."""
-        if not self._asset_index or not hasattr(self._asset_index, "assets"):
-            return
-        prune_ids = [
-            asset_id
-            for asset_id, asset in self._asset_index.assets.items()
-            if not (asset.get("absolute_path") or asset.get("path"))
-            or not os.path.exists(asset.get("absolute_path") or asset.get("path"))
-        ]
-        if not prune_ids:
-            return
-        for pid in prune_ids:
-            self._asset_index.delete_asset(pid)
-        self._asset_index.save()
-        self._log_info("Pruned %d missing asset(s) from catalog", len(prune_ids))
-        self.refresh_catalog()
-
-    def _sync_runtime_scene_catalog(self, select_current: bool = False) -> None:
-        if not self._asset_index:
-            return
-        try:
-            params = lf.dataset_params()
-        except Exception:
-            params = None
-
-        if not params or not params.has_params() or not params.data_path:
-            return
-
-        try:
-            context = ensure_dataset_catalog_context(
-                params.data_path,
-                asset_index=self._asset_index,
-                scanner=self._asset_scanner,
-                thumbnails=self._asset_thumbnails,
-            )
-            if select_current and context.get("asset_id"):
-                self._selected_asset_ids = {context["asset_id"]}
-                # Preserve user's existing project/scene filters - don't change them
-                self._update_selection_type()
-        except Exception as exc:
-            _logger.debug("Failed to sync runtime scene catalog: %s", exc)
-
-    def _update_all_record_lists(self):
-        """Update all record lists in the data model."""
-        if not self._handle:
-            return
-
-        self._handle.update_record_list("projects", self.get_project_list())
-        self._handle.update_record_list("scenes", self.get_scene_list())
-        self._handle.update_record_list("filters", self.get_filter_list())
-        # Note: "tags" record list removed - not bound in on_bind_model
-        self._handle.update_record_list("assets", self.get_filtered_assets())
-
-        # Update selection-specific record lists
-        self._update_selection_details()
-
-    def _update_selection_details(self):
-        """Update record lists for selected scene and project."""
-        if not self._handle or self._updating_selection_details:
-            return
-        self._updating_selection_details = True
-        try:
-            scene = self._get_selected_scene()
-            if scene:
-                scene_id = scene.get("id", "")
-                scene_assets = []
-                if self._asset_index and hasattr(self._asset_index, "assets"):
-                    for asset_id, asset in self._asset_index.assets.items():
-                        if asset.get("scene_id") == scene_id:
-                            scene_assets.append(
-                                {
-                                    "id": asset_id,
-                                    "name": asset.get("name", "Unnamed"),
-                                    "type": asset.get("type", "").upper(),
-                                }
-                            )
-                self._handle.update_record_list("selected_scene_assets", scene_assets)
-            else:
-                self._handle.update_record_list("selected_scene_assets", [])
-
-            project = self._get_selected_project()
-            if project:
-                scene_ids = project.get("scene_ids", [])
-                project_scenes = []
-                if self._asset_index and hasattr(self._asset_index, "scenes"):
-                    for scene_id in scene_ids:
-                        scene_data = self._asset_index.scenes.get(scene_id)
-                        if not scene_data:
-                            continue
-
-                        scene_asset_count = 0
-                        if hasattr(self._asset_index, "assets"):
-                            for asset in self._asset_index.assets.values():
-                                if asset.get("scene_id") == scene_id:
-                                    scene_asset_count += 1
-                        project_scenes.append(
-                            {
-                                "id": scene_id,
-                                "name": scene_data.get(
-                                    "name", tr("asset_manager.unnamed_scene")
-                                ),
-                                "asset_count": scene_asset_count,
-                            }
-                        )
-                # Note: selected_project_scenes record list removed - not used in UI
-            # Note: selected_project_scenes record list removed - not used in UI
-
-            selected_asset = self._get_selected_asset()
-            if selected_asset:
-                self._handle.update_record_list(
-                    "selected_asset_tags",
-                    [{"value": tag} for tag in selected_asset.get("tags", [])],
-                )
-            else:
-                self._handle.update_record_list("selected_asset_tags", [])
-
-            self._handle.dirty_all()
-        finally:
-            self._updating_selection_details = False
-
-    def _dirty_model(self, *fields):
-        """Mark fields as dirty to trigger UI refresh."""
-        if not self._handle:
-            return
-
-        if not fields:
-            self._handle.dirty_all()
-            self._update_all_record_lists()
-            return
-
-        # Check if any selection-related fields are being dirtied
-        selection_fields = {
-            "selection_type",
-            "selected_asset",
-            "selected_asset_name",
-            "selected_asset_type",
-            "selected_asset_path",
-            "selected_scene",
-            "selected_scene_name",
-            "selected_scene_project_name",
-            "selected_scene_asset_count",
-            "selected_scene_assets",
-            "selected_project",
-            "selected_project_name",
-            "selected_asset_tags",
-            "show_selection_none",
-            "show_selection_asset",
-            "show_selection_scene",
-            "show_selection_project",
-            "show_selection_multiple",
-        }
-        needs_selection_update = any(f in selection_fields for f in fields)
-
-        for field in fields:
-            self._handle.dirty(field)
-            # Update record lists when they change
-            if field in (
-                "projects",
-                "scenes",
-                "filters",
-                "assets",
-                "selected_asset_tags",
-            ):
-                list_map = {
-                    "projects": self.get_project_list,
-                    "scenes": self.get_scene_list,
-                    "filters": self.get_filter_list,
-                    "assets": self.get_filtered_assets,
-                    "selected_asset_tags": lambda: [
-                        {"value": tag}
-                        for tag in (self._get_selected_asset() or {}).get("tags", [])
-                    ],
-                }
-                if field in list_map:
-                    self._handle.update_record_list(field, list_map[field]())
-
-        # Update selection-specific record lists if needed
-        if needs_selection_update and not self._updating_selection_details:
-            self._update_selection_details()
-
-    def _resolve_event_value(self, args, event, attr_name: str) -> str:
-        if args:
-            value = args[0]
-            if value not in (None, ""):
-                return str(value)
-
-        if event is None:
-            return ""
-
-        for getter_name in ("current_target", "target"):
-            getter = getattr(event, getter_name, None)
-            if getter is None:
-                continue
-            try:
-                element = getter()
-            except Exception:
-                element = None
-
-            while element is not None:
-                try:
-                    value = element.get_attribute(attr_name, "")
-                except Exception:
-                    value = ""
-                if value:
-                    return str(value)
-                try:
-                    element = element.parent()
-                except Exception:
-                    element = None
-
-        return ""
-
-    # ── Import from URL handlers ───────────────────────────────
-
-    def on_import_from_url(self, _handle, _ev, _args):
-        """Open the retained URL import panel."""
-        self._import_menu_open = False
-        self._dirty_model("import_menu_open")
-        open_url_import_panel()
+    @staticmethod
+    def _log_error(message: str, *args: Any) -> None:
+        text = message % args if args else message
+        logger = getattr(lf, "log", None)
+        log = getattr(logger, "error", None)
+        (log if callable(log) else _log.error)(text)

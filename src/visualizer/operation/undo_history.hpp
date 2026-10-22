@@ -13,6 +13,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -68,6 +69,7 @@ namespace lfs::vis::op {
         HistoryResult undoMultiple(size_t count);
         HistoryResult redoMultiple(size_t count);
         void clear();
+        void bindHydratedPayloadStorage(std::span<const lfs::core::Uuid> node_uuids);
 
         void beginTransaction(std::string name);
         void commitTransaction();
@@ -91,6 +93,7 @@ namespace lfs::vis::op {
         [[nodiscard]] UndoMemoryBreakdown transactionMemory() const;
         [[nodiscard]] UndoMemoryBreakdown totalMemory() const;
         [[nodiscard]] bool hasActiveTransaction() const;
+        [[nodiscard]] bool isPlaybackActive() const;
         [[nodiscard]] size_t transactionDepth() const;
         [[nodiscard]] uint64_t transactionAgeMs() const;
         [[nodiscard]] std::string activeTransactionName() const;

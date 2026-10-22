@@ -3,6 +3,7 @@
 
 #include "visualizer/ipc/render_settings_convert.hpp"
 #include "visualizer/ipc/view_context.hpp"
+#include "visualizer/project/session_state.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
 #include "visualizer/rendering/rendering_types.hpp"
 
@@ -17,6 +18,24 @@ TEST(RenderSettingsDefaults, CameraFrustumsAreDisabledByDefault) {
     EXPECT_FALSE(proxy_settings.show_camera_frustums);
     EXPECT_FLOAT_EQ(render_settings.camera_frustum_scale, 0.25f);
     EXPECT_FLOAT_EQ(proxy_settings.camera_frustum_scale, 0.25f);
+}
+
+TEST(RenderSettingsDefaults, SceneReconstructionIsDisabledByDefault) {
+    const lfs::vis::RenderSettings render_settings;
+    const lfs::vis::RenderSettingsProxy proxy_settings;
+
+    EXPECT_EQ(render_settings.scene_upscaler, "native");
+    EXPECT_EQ(render_settings.scene_upscaler_preset, "native");
+    EXPECT_FLOAT_EQ(render_settings.scene_upscaler_scale, 1.0f);
+    EXPECT_EQ(proxy_settings.scene_upscaler, "native");
+    EXPECT_EQ(proxy_settings.scene_upscaler_preset, "native");
+    EXPECT_FLOAT_EQ(proxy_settings.scene_upscaler_scale, 1.0f);
+}
+
+TEST(RenderSettingsDefaults, SceneReconstructionScaleComposesWithBaseScale) {
+    EXPECT_FLOAT_EQ(lfs::vis::effectiveSceneRenderScale(0.8f, 0.5f, true), 0.4f);
+    EXPECT_FLOAT_EQ(lfs::vis::effectiveSceneRenderScale(0.8f, 0.5f, false), 0.8f);
+    EXPECT_FLOAT_EQ(lfs::vis::effectiveSceneRenderScale(1.0f, 0.1f, true), 0.25f);
 }
 
 TEST(RenderSettingsProxy, DepthFilterTransformRoundTrips) {
@@ -47,6 +66,45 @@ TEST(RenderSettingsProxy, DepthFilterTransformRoundTrips) {
     EXPECT_FLOAT_EQ(roundtrip_translation.x, translation.x);
     EXPECT_FLOAT_EQ(roundtrip_translation.y, translation.y);
     EXPECT_FLOAT_EQ(roundtrip_translation.z, translation.z);
+}
+
+TEST(RenderSettingsProxy, SceneReconstructionFieldsRoundTrip) {
+    lfs::vis::RenderSettings settings;
+    settings.scene_upscaler = "spatial";
+    settings.scene_upscaler_preset = "performance";
+    settings.scene_upscaler_scale = 0.5f;
+
+    const auto proxy = lfs::vis::to_proxy(settings);
+    EXPECT_EQ(proxy.scene_upscaler, "spatial");
+    EXPECT_EQ(proxy.scene_upscaler_preset, "performance");
+    EXPECT_FLOAT_EQ(proxy.scene_upscaler_scale, 0.5f);
+
+    lfs::vis::RenderSettings roundtrip;
+    lfs::vis::apply_proxy(roundtrip, proxy);
+    EXPECT_EQ(roundtrip.scene_upscaler, "spatial");
+    EXPECT_EQ(roundtrip.scene_upscaler_preset, "performance");
+    EXPECT_FLOAT_EQ(roundtrip.scene_upscaler_scale, 0.5f);
+}
+
+TEST(RenderSettingsProxy, DepthViewSplitOffsetAndLodFieldsRoundTrip) {
+    lfs::vis::RenderSettings settings;
+    settings.depth_view = true;
+    settings.split_view_offset = 3;
+    settings.lod_auto_enable_rad = true;
+    settings.lod_behind_camera_penalty = 0.55f;
+
+    const auto proxy = lfs::vis::to_proxy(settings);
+    EXPECT_TRUE(proxy.depth_view);
+    EXPECT_EQ(proxy.split_view_offset, 3u);
+    EXPECT_TRUE(proxy.lod_auto_enable_rad);
+    EXPECT_FLOAT_EQ(proxy.lod_behind_camera_penalty, 0.55f);
+
+    lfs::vis::RenderSettings roundtrip;
+    lfs::vis::apply_proxy(roundtrip, proxy);
+    EXPECT_TRUE(roundtrip.depth_view);
+    EXPECT_EQ(roundtrip.split_view_offset, 3u);
+    EXPECT_TRUE(roundtrip.lod_auto_enable_rad);
+    EXPECT_FLOAT_EQ(roundtrip.lod_behind_camera_penalty, 0.55f);
 }
 
 TEST(RenderSettingsBackendNormalization, Explicit3dgsBackendBeatsStaleGutMirror) {
@@ -160,4 +218,105 @@ TEST(RenderSettingsBackendNormalization, RenderingManagerKeepsGutToggleWorking) 
     settings = manager.getSettings();
     EXPECT_EQ(settings.raster_backend, Backend::ThreeDgs);
     EXPECT_FALSE(settings.gut);
+}
+
+TEST(RenderSettingsBackendNormalization, EquirectangularRoundTripRestoresBackend) {
+    using Backend = lfs::rendering::GaussianRasterBackend;
+    for (const auto backend : {Backend::ThreeDgs, Backend::ThreeDgut}) {
+        for (const bool use_proxy : {false, true}) {
+            lfs::vis::RenderingManager manager;
+            auto settings = manager.getSettings();
+            settings.raster_backend = backend;
+            settings.gut = lfs::rendering::isGutBackend(backend);
+            manager.updateSettings(settings);
+            for (int cycle = 0; cycle < 3; ++cycle) {
+                for (const bool enabled : {true, true, false, false}) {
+                    settings = manager.getSettings();
+                    if (use_proxy) {
+                        auto proxy = lfs::vis::to_proxy(settings);
+                        proxy.equirectangular = enabled;
+                        lfs::vis::apply_proxy(settings, proxy);
+                    } else {
+                        settings.equirectangular = enabled;
+                    }
+                    manager.updateSettings(settings);
+                    settings = manager.getSettings();
+                    EXPECT_EQ(settings.equirectangular, enabled);
+                    EXPECT_EQ(settings.raster_backend, enabled ? Backend::ThreeDgut : backend);
+                    EXPECT_EQ(settings.gut, enabled || lfs::rendering::isGutBackend(backend));
+                    settings.background_color = {0.1f, 0.2f, 0.3f};
+                    manager.updateSettings(settings);
+                    EXPECT_EQ(manager.getSettings().raster_backend, settings.raster_backend);
+                }
+            }
+        }
+    }
+}
+
+TEST(RenderSettingsBackendNormalization, EquirectangularDoesNotOverrideLaterBackendChoice) {
+    using Backend = lfs::rendering::GaussianRasterBackend;
+    lfs::vis::RenderingManager manager;
+    auto settings = manager.getSettings();
+    settings.equirectangular = true;
+    manager.updateSettings(settings);
+    settings = manager.getSettings();
+    settings.equirectangular = false;
+    manager.updateSettings(settings);
+    settings = manager.getSettings();
+    settings.raster_backend = Backend::ThreeDgut;
+    settings.gut = true;
+    manager.updateSettings(settings);
+    settings = manager.getSettings();
+    settings.equirectangular = true;
+    manager.updateSettings(settings);
+    settings = manager.getSettings();
+    settings.equirectangular = false;
+    manager.updateSettings(settings);
+    EXPECT_EQ(manager.getSettings().raster_backend, Backend::ThreeDgut);
+    EXPECT_TRUE(manager.getSettings().gut);
+}
+
+TEST(RenderSettingsBackendNormalization, EquirectangularExitPreservesExplicitBackendChange) {
+    using Backend = lfs::rendering::GaussianRasterBackend;
+    lfs::vis::RenderingManager manager;
+    auto settings = manager.getSettings();
+    settings.raster_backend = Backend::ThreeDgut;
+    settings.gut = true;
+    manager.updateSettings(settings);
+    settings.equirectangular = true;
+    manager.updateSettings(settings);
+    settings = manager.getSettings();
+    settings.equirectangular = false;
+    settings.raster_backend = Backend::ThreeDgs;
+    settings.gut = false;
+    manager.updateSettings(settings);
+    EXPECT_EQ(manager.getSettings().raster_backend, Backend::ThreeDgs);
+    EXPECT_FALSE(manager.getSettings().gut);
+}
+
+TEST(RenderSettingsBackendNormalization, ProjectSettingsDiscardLiveProjectionOverride) {
+    using Backend = lfs::rendering::GaussianRasterBackend;
+    for (const bool equirectangular : {false, true}) {
+        lfs::vis::RenderingManager manager;
+        auto settings = manager.getSettings();
+        settings.equirectangular = true;
+        manager.updateSettings(settings);
+
+        lfs::vis::RenderSettings saved;
+        saved.raster_backend = Backend::ThreeDgut;
+        saved.gut = true;
+        saved.equirectangular = equirectangular;
+        const auto json = lfs::vis::project::renderSettingsToProjectJson(saved);
+        const auto restored = lfs::vis::project::renderSettingsFromProjectJson(json, manager.getSettings());
+        ASSERT_TRUE(restored);
+        manager.updateSettings(*restored);
+        EXPECT_EQ(manager.getSettings().raster_backend, Backend::ThreeDgut);
+        EXPECT_EQ(manager.getSettings().equirectangular, equirectangular);
+        EXPECT_EQ(lfs::vis::project::renderSettingsToProjectJson(manager.getSettings()), json);
+
+        settings = manager.getSettings();
+        settings.equirectangular = false;
+        manager.updateSettings(settings);
+        EXPECT_EQ(manager.getSettings().raster_backend, Backend::ThreeDgut);
+    }
 }

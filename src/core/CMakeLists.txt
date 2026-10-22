@@ -8,6 +8,9 @@
 # Tensor CUDA kernels (STATIC, linked privately)
 add_subdirectory(tensor)
 
+# Neural inference kernels (STATIC, linked privately)
+add_subdirectory(nn)
+
 # Core CUDA library (STATIC, linked privately)
 add_subdirectory(cuda)
 
@@ -19,12 +22,16 @@ add_subdirectory(logger)
 
 # Tensor C++ sources (merged from src/core/tensor/)
 set(TENSOR_SOURCES
+        tensor/cuda_event_pool.cpp
         tensor/cuda_stream_context.cpp
+        tensor/stream_lifetime.cpp
         tensor/gpu_slab_allocator.cpp
+        tensor/size_bucketed_pool.cpp
         tensor/lazy_config.cpp
         tensor/lazy_ir.cpp
         tensor/lazy_executor.cpp
         tensor/tensor.cpp
+        tensor/tensor_serialization.cpp
         tensor/tensor_factory.cpp
         tensor/tensor_utils.cpp
         tensor/tensor_matrix_ops.cpp
@@ -38,41 +45,84 @@ set(TENSOR_SOURCES
         tensor/tensor_row_proxy.cpp
         tensor/tensor_nn_ops.cpp
         tensor/pinned_memory_allocator.cpp
-        tensor/offset_allocator.cpp
         tensor/tensor_exports.cu
+        nn/ops.cpp
+        nn/weight_file.cpp
+        nn/weight_file_open.cpp
+        nn/activation_arena.cpp
+        nn/models/moge2.cpp
+        nn/models/lpips.cpp
 )
 
 # Core module sources
 set(CORE_SOURCES
+        abi.cpp
+        alloc_counter.cpp
+        crash_handler.cpp
+        cuda_error.cpp
+        cuda_error_typed.cpp
+        device_fault.cpp
+        error.cpp
+        error_bus.cpp
+        exif.cpp
+        error_envelope.cpp
+        error_latch.cpp
+        error_reporter.cpp
+        guarded_task.cpp
+        host_metrics.cpp
+        failure_report.cpp
+        cuda/memory_arena_owner.cpp
+        cuda/vmm_device_buffer.cpp
+        memory_pressure.cpp
+        memory_domain.cpp
         operator_callbacks.cpp
         animatable_property.cpp
         argument_parser.cpp
         camera.cpp
         checkpoint_format.cpp
-        cuda_alloc_tracker.cpp
         image_loader.cpp
         cuda_version.cpp
+        image_io.cpp
+        image_codecs.cpp
+        image_exr.cpp
+        mapped_file.cpp
+        optimization_properties.cpp
         parameters.cpp
         property_registry.cpp
+        provenance.cpp
         reactive_store.cpp
         scene.cpp
+        session_breadcrumb.cpp
+        uuid.cpp
         splat_simplify.cpp
+        bhatt_lod.cpp
+        octree_lod.cpp
         splat_data.cpp
         splat_data_mirror.cpp
+        splat_data_mirror_centroid.cu
         splat_data_transform.cpp
         splat_exportable_storage.cpp
+        sh_value_quant.cpp
+        shareable_allocation_limit.cpp
         tensor_debug.cpp
         training_snapshot.cpp
+        mesh_data.cpp
+        system_info.cpp
+        user_paths.cpp
+        persisted_settings.cpp
+        legacy_settings_migration.cpp
 )
-# On Windows image_io.cpp and mesh_data.cpp need OpenImageIO/OpenMesh headers
-# that are unavailable in the compute-tranche build; use stubs that throw.
-if(WIN32)
-    list(APPEND CORE_SOURCES image_io_win_stub.cpp mesh_data_win_stub.cpp)
-else()
-    list(APPEND CORE_SOURCES image_io.cpp mesh_data.cpp)
+# The ROCm compute build on Windows has no image codec packages; the compute
+# tests never decode or encode image files, so use a stub.
+if(USE_HIP AND WIN32)
+    list(REMOVE_ITEM CORE_SOURCES image_codecs.cpp image_exr.cpp)
+    list(APPEND CORE_SOURCES image_codecs_win_stub.cpp)
 endif()
 
 add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
+
+add_dependencies(lfs_core lfs_core_abi_stamp)
+target_include_directories(lfs_core BEFORE PRIVATE "${LFS_CORE_ABI_INCLUDE_DIR}")
 
 target_compile_definitions(lfs_core PRIVATE LFS_CORE_EXPORTS)
 
@@ -83,7 +133,9 @@ target_include_directories(lfs_core
         ${CUDAToolkit_INCLUDE_DIRS}
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/io/include
         ${CMAKE_CURRENT_SOURCE_DIR}/tensor  # For internal/ headers
+        ${CMAKE_CURRENT_SOURCE_DIR}/nn
 )
 target_include_directories(lfs_core SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/external
@@ -105,11 +157,15 @@ target_link_libraries(lfs_core
     PRIVATE
         lfs_core_cuda
         lfs_tensor_kernels
+        lfs_nn_kernels
         taywee::args
-        $<$<NOT:$<PLATFORM_ID:Windows>>:OpenImageIO::OpenImageIO>
-        $<$<NOT:$<PLATFORM_ID:Windows>>:OpenMeshCoreStatic>
+        JPEG::JPEG
+        PNG::PNG
+        TIFF::TIFF
+        WebP::webp
+        OpenEXR::OpenEXRCore
+        OpenMeshCore
 )
-
 # OpenMP for tensor multi-threaded operations
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
@@ -122,23 +178,34 @@ if(UNIX)
     target_link_libraries(lfs_core PUBLIC dl)
 endif()
 
+if(WIN32)
+    target_link_libraries(lfs_core PRIVATE bcrypt)
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+    target_link_libraries(lfs_core PRIVATE stdc++exp)
+endif()
+
 # Compiler options
 if(MSVC)
     target_compile_options(lfs_core PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:/Od /Z7>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:/Od>
         $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2 /DNDEBUG>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS -Xcompiler=/bigobj --diag-suppress=27>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS -Xcompiler=/bigobj --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS -Xcompiler=/bigobj --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS -Xcompiler=/bigobj --diag-suppress=27>
     )
     target_compile_definitions(lfs_core PRIVATE _USE_MATH_DEFINES NOMINMAX
         $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
     )
     target_link_options(lfs_core PRIVATE /ignore:4217)
 else()
+    # Release binaries and compiler-cache entries must not depend on the build
+    # host's CPU. Keep the explicit AVX2/FMA baseline below instead of enabling
+    # every instruction detected by -march=native on a hosted runner.
     target_compile_options(lfs_core PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:-O0 -g -fno-omit-frame-pointer -DDEBUG>
-        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-O3 -DNDEBUG -march=native>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-O3 -DNDEBUG>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
     )
 endif()
@@ -189,33 +256,9 @@ if(WIN32 AND _IS_MULTI_CONFIG)
     )
 endif()
 
-# Configure build type
-function(configure_build_type target)
-    get_target_property(target_type ${target} TYPE)
-
-    if(target_type STREQUAL "INTERFACE_LIBRARY")
-        if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-            target_compile_definitions(${target} INTERFACE DEBUG_BUILD)
-        elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-            target_compile_definitions(${target} INTERFACE RELEASE_BUILD)
-        endif()
-    else()
-        if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-            target_compile_definitions(${target} PRIVATE DEBUG_BUILD)
-        elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-            target_compile_definitions(${target} PRIVATE RELEASE_BUILD)
-        endif()
-    endif()
-endfunction()
-
-configure_build_type(lfs_core)
-
 # Allocation profiling
-if(ENABLE_ALLOCATION_PROFILING)
-    target_compile_definitions(lfs_core PUBLIC ENABLE_ALLOCATION_PROFILING=1)
-else()
-    target_compile_definitions(lfs_core PUBLIC ENABLE_ALLOCATION_PROFILING=0)
-endif()
+target_compile_definitions(lfs_core PUBLIC
+    LFS_ALLOCATION_PROFILING_ENABLED=$<BOOL:${LFS_ENABLE_ALLOCATION_PROFILING}>)
 
 message(STATUS "+------------------------------------------------------------------+")
 message(STATUS "|  lfs_core - Core + Tensor Library (SHARED)                       |")

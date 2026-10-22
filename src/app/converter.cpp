@@ -3,16 +3,32 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "app/converter.hpp"
+#include "app/converter_output_paths.hpp"
+#include "app/converter_overwrite.hpp"
+#include "app/terminal_progress_bar.hpp"
+#include "core/checkpoint_format.hpp"
+#include "core/error.hpp"
 #include "core/logger.hpp"
 #include "core/mesh_data.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
+#include "core/provenance.hpp"
 #include "core/splat_data.hpp"
 #include "io/exporter.hpp"
+#include "io/formats/rad.hpp"
+#include "io/formats/ssog.hpp"
 #include "io/loader.hpp"
+#include "io/ply_to_rad_lod.hpp"
+#include "io/project_document.hpp"
 #include "rendering/mesh2splat.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <format>
+#include <fstream>
 #include <iostream>
+#include <istream>
+#include <optional>
 #include <print>
 
 namespace lfs::app {
@@ -21,31 +37,13 @@ namespace lfs::app {
 
     namespace {
 
-        constexpr const char* CONVERT_EXTENSIONS[] = {".ply", ".sog", ".spz", ".usd", ".usda", ".usdc", ".usdz", ".resume", ".rad"};
+        constexpr const char* CONVERT_EXTENSIONS[] = {".ply", ".sog", ".ssog", ".spz", ".usd", ".usda", ".usdc", ".usdz", ".resume", ".rad", ".licht"};
         constexpr const char* MESH_EXTENSIONS[] = {".obj", ".fbx", ".gltf", ".glb", ".stl", ".dae", ".3ds", ".mesh", ".ply"};
-
-        enum class OverwriteChoice { YES,
-                                     NO,
-                                     ALL };
 
         struct OutputTarget {
             param::OutputFormat format;
             std::filesystem::path path;
         };
-
-        OverwriteChoice askOverwrite(const std::filesystem::path& path) {
-            std::print("File exists: {}\nOverwrite? [y]es / [n]o / [a]ll: ", path.filename().string());
-            std::string input;
-            if (!std::getline(std::cin, input) || input.empty()) {
-                return OverwriteChoice::NO;
-            }
-            const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(input[0])));
-            if (c == 'y')
-                return OverwriteChoice::YES;
-            if (c == 'a')
-                return OverwriteChoice::ALL;
-            return OverwriteChoice::NO;
-        }
 
         void truncateSHDegree(SplatData& splat, const int degree) {
             if (degree < 0)
@@ -56,17 +54,23 @@ namespace lfs::app {
         template <size_t N>
         std::vector<std::filesystem::path> getInputFiles(const std::filesystem::path& path, const char* const (&valid_extensions)[N]) {
             std::vector<std::filesystem::path> files;
-            if (std::filesystem::is_directory(path)) {
-                for (const auto& entry : std::filesystem::directory_iterator(path)) {
-                    if (!entry.is_regular_file())
+            if (&valid_extensions[0] == &CONVERT_EXTENSIONS[0] && lfs::io::is_ssog_path(path))
+                return {path};
+            if (lfs::core::native_fs::is_directory(path)) {
+                for (const auto& entry : lfs::core::native_fs::directory_iterator(path)) {
+                    if (&valid_extensions[0] == &CONVERT_EXTENSIONS[0] && lfs::io::is_ssog_path(entry.path())) {
+                        files.push_back(lfs::core::native_fs::entry_path(path, entry.path()));
                         continue;
-                    auto ext = entry.path().extension().string();
+                    }
+                    if (!lfs::core::native_fs::entry_is_regular_file(path, entry))
+                        continue;
+                    auto ext = lfs::core::path_to_utf8(entry.path().extension());
                     std::transform(ext.begin(), ext.end(), ext.begin(), [](const unsigned char c) {
                         return static_cast<char>(std::tolower(c));
                     });
                     for (const auto* valid : valid_extensions) {
                         if (ext == valid) {
-                            files.push_back(entry.path());
+                            files.push_back(lfs::core::native_fs::entry_path(path, entry.path()));
                             break;
                         }
                     }
@@ -77,47 +81,10 @@ namespace lfs::app {
             return files;
         }
 
-        const char* getFormatExtension(const param::OutputFormat format) {
-            switch (format) {
-            case param::OutputFormat::PLY: return ".ply";
-            case param::OutputFormat::SOG: return ".sog";
-            case param::OutputFormat::SPZ: return ".spz";
-            case param::OutputFormat::HTML: return ".html";
-            case param::OutputFormat::USD: return ".usd";
-            case param::OutputFormat::USDA: return ".usda";
-            case param::OutputFormat::USDC: return ".usdc";
-            case param::OutputFormat::RAD: return ".rad";
-            }
-            return ".ply";
-        }
-
-        std::filesystem::path generateOutputPath(
-            const std::filesystem::path& input,
-            const std::filesystem::path& output_template,
-            const param::OutputFormat format,
-            const char* suffix,
-            const bool replace_output_extension = false) {
-
-            const auto ext = getFormatExtension(format);
-            const auto cwd = std::filesystem::current_path();
-            const auto converted_name = input.stem().string() + suffix + ext;
-
-            if (output_template.empty()) {
-                return cwd / converted_name;
-            }
-
-            if (std::filesystem::is_directory(output_template)) {
-                const auto dir = output_template.is_absolute() ? output_template : cwd / output_template;
-                return dir / converted_name;
-            }
-
-            auto out = output_template;
-            if (replace_output_extension) {
-                out.replace_extension(ext);
-            } else if (out.extension().empty()) {
-                out += ext;
-            }
-            return out.is_absolute() ? out : cwd / out;
+        std::uint32_t radChunkSizeForMode(const param::RadExportMode mode) {
+            return mode == param::RadExportMode::Stream
+                       ? lfs::io::kRadStreamableChunkSplats
+                       : lfs::io::kRadNativeChunkSplats;
         }
 
         std::vector<OutputTarget> generateMesh2SplatOutputs(
@@ -129,10 +96,23 @@ namespace lfs::app {
             for (const auto format : params.formats) {
                 targets.push_back({
                     .format = format,
-                    .path = generateOutputPath(input, params.output_path, format, "_splat", multi_format),
+                    .path = generate_converter_output_path(input, params.output_path, format, "_splat", multi_format),
                 });
             }
             return targets;
+        }
+
+        using ConvertProgressBar = TerminalProgressBar;
+
+        template <typename Parameters>
+        lfs::io::SsogSaveOptions ssogOptions(const Parameters& p) {
+            lfs::io::SsogSaveOptions o;
+            o.lod_levels = p.lod_levels;
+            o.lod_ratio = p.lod_ratio;
+            o.chunk_count_k = p.lod_chunk_count;
+            o.chunk_extent = p.lod_chunk_extent;
+            o.chunk_min_k = p.lod_chunk_min;
+            return o;
         }
 
         lfs::io::Result<void> saveSplat(
@@ -140,24 +120,309 @@ namespace lfs::app {
             const std::filesystem::path& output,
             const param::OutputFormat format,
             const int sog_iterations,
-            const std::vector<float>& rad_lod_levels) {
+            const param::RadExportMode rad_export_mode,
+            const int spz_version,
+            const core::ProvenanceStamp& provenance,
+            lfs::io::SsogSaveOptions ssog,
+            const lfs::io::ExportProgressCallback& progress = nullptr) {
             switch (format) {
             case param::OutputFormat::PLY:
-                return lfs::io::save_ply(splat, {.output_path = output, .binary = true});
+                return lfs::io::save_ply(splat, {.output_path = output, .binary = true, .progress_callback = progress, .provenance = provenance});
+            case param::OutputFormat::SSOG:
+                ssog.output_path = output;
+                ssog.kmeans_iterations = sog_iterations;
+                ssog.provenance = provenance;
+                ssog.progress_callback = progress;
+                return lfs::io::save_ssog(splat, ssog);
             case param::OutputFormat::SOG:
-                return lfs::io::save_sog(splat, {.output_path = output, .kmeans_iterations = sog_iterations});
+                return lfs::io::save_sog(splat, {.output_path = output, .kmeans_iterations = sog_iterations, .progress_callback = progress, .provenance = provenance});
             case param::OutputFormat::SPZ:
-                return lfs::io::save_spz(splat, {.output_path = output});
+                return lfs::io::save_spz(splat, {.output_path = output, .version = spz_version, .progress_callback = progress, .provenance = provenance});
+            case param::OutputFormat::GLB:
+                return lfs::io::save_spz(splat, {.output_path = output, .progress_callback = progress, .provenance = provenance, .glb = true});
             case param::OutputFormat::HTML:
-                return lfs::io::export_html(splat, {.output_path = output, .kmeans_iterations = sog_iterations});
+                return lfs::io::export_html(splat, {.output_path = output, .kmeans_iterations = sog_iterations, .progress_callback = progress, .provenance = provenance});
             case param::OutputFormat::USD:
             case param::OutputFormat::USDA:
             case param::OutputFormat::USDC:
-                return lfs::io::save_usd(splat, {.output_path = output});
+                return lfs::io::save_usd(splat, {.output_path = output, .progress_callback = progress, .provenance = provenance});
             case param::OutputFormat::RAD:
-                return lfs::io::save_rad(splat, {.output_path = output, .lod_ratios = rad_lod_levels});
+                return lfs::io::save_rad(splat, {
+                                                    .output_path = output,
+                                                    .chunk_size = radChunkSizeForMode(rad_export_mode),
+                                                    .progress_callback = progress,
+                                                    .provenance = provenance,
+                                                });
             }
-            return lfs::io::save_ply(splat, {.output_path = output, .binary = true});
+            return lfs::io::save_ply(splat, {.output_path = output, .binary = true, .progress_callback = progress, .provenance = provenance});
+        }
+
+        bool isPlyExtension(const std::filesystem::path& path) {
+            auto ext = lfs::core::path_to_utf8(path.extension());
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](const unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return ext == ".ply";
+        }
+
+        bool isRadExtension(const std::filesystem::path& path) {
+            auto ext = lfs::core::path_to_utf8(path.extension());
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](const unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return ext == ".rad";
+        }
+
+        bool isResumeExtension(const std::filesystem::path& path) {
+            auto ext = lfs::core::path_to_utf8(path.extension());
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](const unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return ext == ".resume";
+        }
+
+        bool isLichtExtension(const std::filesystem::path& path) {
+            auto ext = lfs::core::path_to_utf8(path.extension());
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](const unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return ext == ".licht";
+        }
+
+        void fill_stamp_from_checkpoint_stream(
+            core::ProvenanceStamp& stamp,
+            const lfs::io::project::LazyChunkValue& checkpoint) {
+            (void)checkpoint.visit_stream(
+                [&](std::istream& stream, const std::uint64_t bytes) -> lfs::Result<void> {
+                    if (const auto header = core::load_checkpoint_header(stream, bytes)) {
+                        if (header->iteration >= 0)
+                            stamp.iteration = header->iteration;
+                    }
+                    return {};
+                });
+            (void)checkpoint.visit_stream(
+                [&](std::istream& stream, const std::uint64_t bytes) -> lfs::Result<void> {
+                    if (const auto ckpt_params = core::load_checkpoint_params(stream, bytes)) {
+                        const auto strategy = param::canonical_strategy_name(
+                            ckpt_params->optimization.strategy);
+                        if (!strategy.empty())
+                            stamp.strategy = std::string(strategy);
+                    }
+                    return {};
+                });
+        }
+
+        [[nodiscard]] core::ProvenanceStamp make_convert_provenance(
+            const bool include_identifying,
+            const std::filesystem::path& input = {}) {
+            if (!include_identifying)
+                return core::make_minimal_provenance_stamp();
+
+            auto stamp = core::make_provenance_stamp();
+            if (isResumeExtension(input)) {
+                // Splat payload is already loaded by the convert path; peek the
+                // same .resume file only for iteration/strategy (header + params).
+                if (const auto header = core::load_checkpoint_header(input)) {
+                    if (header->iteration >= 0)
+                        stamp.iteration = header->iteration;
+                }
+                if (const auto ckpt_params = core::load_checkpoint_params(input)) {
+                    const auto strategy = param::canonical_strategy_name(
+                        ckpt_params->optimization.strategy);
+                    if (!strategy.empty())
+                        stamp.strategy = std::string(strategy);
+                }
+            } else if (isLichtExtension(input)) {
+                // Cheap peek: header + params from the embedded CKPT stream.
+                lfs::io::project::ProjectDocumentOpenOptions options;
+                options.defer_geometry_payloads = true;
+                if (auto document = lfs::io::project::ProjectDocument::open(input, options)) {
+                    const auto bound = document->bound_checkpoint_uuid();
+                    if (bound && *bound && document->splat_uuids().empty()) {
+                        if (const auto* checkpoint = document->find_checkpoint(**bound)) {
+                            fill_stamp_from_checkpoint_stream(stamp, *checkpoint);
+                        }
+                    }
+                }
+            }
+            return stamp;
+        }
+
+        bool loadSplatFromLichtProject(
+            const std::filesystem::path& input,
+            std::shared_ptr<SplatData>& splat) {
+            auto document = lfs::io::project::ProjectDocument::open(input);
+            if (!document) {
+                LOG_ERROR("Failed to open project: {}", lfs::format_for_developer(document.error()));
+                std::println(stderr, "  Error: {}", document.error().user_message());
+                return false;
+            }
+
+            const auto bound = document->bound_checkpoint_uuid();
+            if (!bound) {
+                LOG_ERROR("Failed to resolve project training checkpoint: {}",
+                          lfs::format_for_developer(bound.error()));
+                return false;
+            }
+            const auto splats = document->splat_uuids();
+            const auto model_count = (bound->has_value() ? 1u : 0u) + splats.size();
+            if (model_count == 0) {
+                LOG_ERROR("Project contains no splat model: {}", path_to_utf8(input));
+                std::println(stderr, "  Error: project contains no splat model");
+                return false;
+            }
+            if (model_count > 1) {
+                LOG_ERROR("Project contains multiple splat models ({} checkpoint(s), {} splat(s)): {}",
+                          bound->has_value() ? 1 : 0, splats.size(), path_to_utf8(input));
+                std::println(stderr,
+                             "  Error: project contains {} checkpoint model(s) and {} splat model(s); export from the LichtFeld Studio GUI instead",
+                             bound->has_value() ? 1 : 0, splats.size());
+                return false;
+            }
+
+            if (bound->has_value()) {
+                const auto* checkpoint = document->find_checkpoint(**bound);
+                if (!checkpoint) {
+                    LOG_ERROR("Project checkpoint handle disappeared: {}", path_to_utf8(input));
+                    std::println(stderr, "  Error: project checkpoint handle disappeared");
+                    return false;
+                }
+
+                std::optional<core::CheckpointSplatDataLoadResult> loaded;
+                auto visited = checkpoint->visit_stream(
+                    [&](std::istream& stream, const std::uint64_t bytes) -> lfs::Result<void> {
+                        loaded = core::load_checkpoint_splat_data(stream, bytes, {});
+                        return {};
+                    });
+                if (!visited) {
+                    LOG_ERROR("Failed to stream project checkpoint: {}",
+                              lfs::format_for_developer(visited.error()));
+                    std::println(stderr, "  Error: {}", visited.error().user_message());
+                    return false;
+                }
+                if (!loaded || !*loaded) {
+                    const auto message = loaded ? loaded->error() : "checkpoint visitor did not run";
+                    LOG_ERROR("Failed to load project checkpoint: {}", message);
+                    std::println(stderr, "  Error: {}", message);
+                    return false;
+                }
+                splat = std::make_shared<SplatData>(std::move(**loaded));
+                return true;
+            }
+
+            const auto* splat_chapter = document->find_splat(splats.front());
+            if (!splat_chapter) {
+                LOG_ERROR("Project splat handle disappeared: {}", path_to_utf8(input));
+                std::println(stderr, "  Error: project splat handle disappeared");
+                return false;
+            }
+            auto hydrated = splat_chapter->hydrate({});
+            if (!hydrated) {
+                LOG_ERROR("Failed to load project splat: {}",
+                          lfs::format_for_developer(hydrated.error()));
+                std::println(stderr, "  Error: {}", hydrated.error().user_message());
+                return false;
+            }
+            splat = std::shared_ptr<SplatData>(std::move(*hydrated));
+            return true;
+        }
+
+        // RAD LOD -> RAD LOD can preserve node order and tree links while
+        // re-encoding only the file chunk profile selected by the caller.
+        bool rechunkRadFile(
+            const std::filesystem::path& input,
+            const std::filesystem::path& output,
+            const std::uint32_t target_chunk_size,
+            const core::ProvenanceStamp& provenance) {
+            std::println("Re-chunking RAD LOD: {} -> {} ({}-splat chunks)",
+                         path_to_utf8(input), path_to_utf8(output), target_chunk_size);
+
+            ConvertProgressBar bar;
+            const auto result = lfs::io::rechunk_rad_lod(
+                input, output, target_chunk_size, [&bar](const float progress) {
+                    return bar.report(progress, "re-chunk");
+                },
+                provenance);
+            if (!result) {
+                bar.abort();
+                LOG_ERROR("RAD re-chunk failed: {}", result.error().format());
+                std::println(stderr, "  Error: {}", result.error().message);
+                return false;
+            }
+            if (const auto sidecar = lfs::io::build_rad_meta_sidecar(output); !sidecar) {
+                bar.abort();
+                LOG_ERROR("Sidecar build failed: {}", sidecar.error().format());
+                std::println(stderr, "  Error: {}", sidecar.error().message);
+                return false;
+            }
+            bar.complete();
+            std::println("  Done");
+            return true;
+        }
+
+        // Streaming path for PLYs where the monolithic in-memory LOD build is
+        // the wrong tool: above one bucket of splats the bucketed converter is
+        // much faster (parallel subtrees, small merge neighborhoods), and it
+        // is mandatory once the workset would not fit in RAM.
+        bool shouldStreamLodConvert(const std::filesystem::path& input) {
+            const auto info = lfs::io::probe_ply_gaussians(input);
+            if (!info) {
+                return false;
+            }
+            if (info->vertex_count > lfs::io::PlyToRadLodOptions{}.target_bucket_splats) {
+                return true;
+            }
+            const int rest_coeffs =
+                info->sh_degree > 0 ? (info->sh_degree + 1) * (info->sh_degree + 1) - 1 : 0;
+            // Full load + Bhattacharyya workset at 1.5x capacity, per splat.
+            const std::uint64_t per_splat = 360 + static_cast<std::uint64_t>(rest_coeffs) * 40;
+            const std::uint64_t estimated = info->vertex_count * per_splat;
+            std::uint64_t budget = 8ull << 30;
+#ifndef _WIN32
+            std::ifstream meminfo(lfs::core::native_fs::native_path("/proc/meminfo"));
+            std::string line;
+            while (std::getline(meminfo, line)) {
+                if (line.starts_with("MemAvailable:")) {
+                    std::uint64_t kb = 0;
+                    std::sscanf(line.c_str(), "MemAvailable: %lu kB", &kb);
+                    budget = kb * 1024;
+                    break;
+                }
+            }
+#endif
+            return estimated > budget * 7 / 10;
+        }
+
+        bool streamLodConvertFile(
+            const std::filesystem::path& input,
+            const std::filesystem::path& output,
+            const param::ConvertParameters& params) {
+            std::println("Converting (out-of-core LOD): {} -> {}",
+                         path_to_utf8(input), path_to_utf8(output));
+
+            ConvertProgressBar bar;
+            lfs::io::PlyToRadLodOptions options;
+            options.tiles_x = params.tiles_x;
+            options.tiles_y = params.tiles_y;
+            options.chunk_size = radChunkSizeForMode(params.rad_export_mode);
+            options.builder = params.lod_builder == param::LodBuilder::OCTREE
+                                  ? lfs::io::LodBuilder::kOctree
+                                  : lfs::io::LodBuilder::kBhatt;
+            options.progress = [&bar](const float progress, const std::string& stage) {
+                return bar.report(progress, stage);
+            };
+            options.provenance = make_convert_provenance(params.include_provenance, input);
+
+            const auto result = lfs::io::convert_ply_to_rad_lod(input, output, options);
+            if (!result) {
+                bar.abort();
+                LOG_ERROR("Streaming LOD conversion failed: {}", result.error().format());
+                std::println(stderr, "  Error: {}", result.error().message);
+                return false;
+            }
+            bar.complete();
+            std::println("  Done");
+            return true;
         }
 
         bool convertFile(
@@ -165,24 +430,59 @@ namespace lfs::app {
             const std::filesystem::path& output,
             const param::ConvertParameters& params) {
 
+            const bool tiled = params.tiles_x > 1 || params.tiles_y > 1;
+            if (tiled && (params.format != param::OutputFormat::RAD || !isPlyExtension(input))) {
+                LOG_ERROR("--tiles requires a PLY input and RAD output: {}", path_to_utf8(input));
+                std::println(stderr, "  Error: --tiles requires a PLY input and RAD output");
+                return false;
+            }
+
+            if (params.format == param::OutputFormat::RAD && isRadExtension(input)) {
+                const auto lod_chunk_size = lfs::io::rad_lod_file_chunk_size(input);
+                if (!lod_chunk_size) {
+                    LOG_ERROR("RAD probe failed: {}", lod_chunk_size.error());
+                    std::println(stderr, "  Error: {}", lod_chunk_size.error());
+                    return false;
+                }
+                if (*lod_chunk_size) {
+                    return rechunkRadFile(input, output, radChunkSizeForMode(params.rad_export_mode),
+                                          make_convert_provenance(params.include_provenance, input));
+                }
+            }
+
+            // An explicit non-default builder always takes the bucketed
+            // converter; the monolithic in-memory path is bhatt-only.
+            if (params.format == param::OutputFormat::RAD && isPlyExtension(input) &&
+                (tiled || params.lod_builder != param::LodBuilder::BHATT ||
+                 shouldStreamLodConvert(input))) {
+                return streamLodConvertFile(input, output, params);
+            }
+
             std::println("Converting: {} -> {}", path_to_utf8(input), path_to_utf8(output));
 
-            const auto loader = lfs::io::Loader::create();
-            auto load_result = loader->load(input);
-            if (!load_result) {
-                LOG_ERROR("Load failed: {}", load_result.error().format());
-                std::println(stderr, "  Error: {}", load_result.error().message);
-                return false;
-            }
+            std::shared_ptr<SplatData> splat;
+            if (isLichtExtension(input)) {
+                if (!loadSplatFromLichtProject(input, splat)) {
+                    return false;
+                }
+            } else {
+                const auto loader = lfs::io::Loader::create();
+                auto load_result = loader->load(input);
+                if (!load_result) {
+                    LOG_ERROR("Load failed: {}", load_result.error().format());
+                    std::println(stderr, "  Error: {}", load_result.error().message);
+                    return false;
+                }
 
-            auto* splat_ptr = std::get_if<std::shared_ptr<SplatData>>(&load_result->data);
-            if (!splat_ptr || !*splat_ptr) {
-                LOG_ERROR("Not a splat file: {}", path_to_utf8(input));
-                std::println(stderr, "  Error: not a splat file");
-                return false;
-            }
+                auto* splat_ptr = std::get_if<std::shared_ptr<SplatData>>(&load_result->data);
+                if (!splat_ptr || !*splat_ptr) {
+                    LOG_ERROR("Not a splat file: {}", path_to_utf8(input));
+                    std::println(stderr, "  Error: not a splat file");
+                    return false;
+                }
 
-            auto splat = std::move(*splat_ptr);
+                splat = std::move(*splat_ptr);
+            }
             std::println("  Loaded {} gaussians, SH degree {}", splat->size(), splat->get_max_sh_degree());
 
             if (params.sh_degree >= 0 && params.sh_degree != splat->get_max_sh_degree()) {
@@ -190,14 +490,23 @@ namespace lfs::app {
                 std::println("  Set SH degree {}", params.sh_degree);
             }
 
-            const auto result = saveSplat(*splat, output, params.format, params.sog_iterations, params.rad_lod_levels);
+            ConvertProgressBar bar;
+            const auto result = saveSplat(
+                *splat, output, params.format, params.sog_iterations,
+                params.rad_export_mode, params.spz_version,
+                make_convert_provenance(params.include_provenance, input), ssogOptions(params),
+                [&bar](const float progress, const std::string& stage) {
+                    return bar.report(progress, stage);
+                });
 
             if (!result) {
+                bar.abort();
                 LOG_ERROR("Save failed: {}", result.error().format());
                 std::println(stderr, "  Error: {}", result.error().message);
                 return false;
             }
 
+            bar.complete();
             std::println("  Done");
             return true;
         }
@@ -245,7 +554,9 @@ namespace lfs::app {
             bool ok = true;
             for (const auto& output : outputs) {
                 std::println("  Saving: {}", path_to_utf8(output.path));
-                const auto result = saveSplat(**splat, output.path, output.format, params.sog_iterations, params.rad_lod_levels);
+                const auto result = saveSplat(**splat, output.path, output.format, params.sog_iterations,
+                                              param::RadExportMode::Stream, params.spz_version,
+                                              make_convert_provenance(params.include_provenance), ssogOptions(params));
                 if (!result) {
                     LOG_ERROR("Save failed: {}", result.error().format());
                     std::println(stderr, "  Error: {}", result.error().message);
@@ -264,7 +575,7 @@ namespace lfs::app {
         const auto files = getInputFiles(params.input_path, CONVERT_EXTENSIONS);
         if (files.empty()) {
             LOG_ERROR("No convertible files in: {}", path_to_utf8(params.input_path));
-            std::println(stderr, "Error: No .ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume, or .rad files found");
+            std::println(stderr, "Error: No .ply, .sog, .ssog, .spz, .usd, .usda, .usdc, .usdz, .resume, .rad, or .licht files found");
             return 1;
         }
 
@@ -274,10 +585,14 @@ namespace lfs::app {
         bool overwrite_all = false;
 
         for (const auto& input : files) {
-            const auto output = generateOutputPath(input, params.output_path, params.format, "_converted");
+            auto output_template = params.output_path;
+            if (params.format == param::OutputFormat::SSOG && files.size() > 1 && !output_template.empty()) {
+                output_template = generate_ssog_batch_output_path(output_template, input);
+            }
+            const auto output = generate_converter_output_path(input, output_template, params.format, "_converted");
 
-            if (std::filesystem::exists(output) && !overwrite_all && !params.overwrite) {
-                const auto choice = askOverwrite(output);
+            if (lfs::core::native_fs::exists(output) && !overwrite_all && !params.overwrite) {
+                const auto choice = ask_overwrite(output, std::cin, std::cout);
                 if (choice == OverwriteChoice::NO) {
                     std::println("  Skipped");
                     ++skipped;
@@ -317,8 +632,8 @@ namespace lfs::app {
 
             bool skip = false;
             for (const auto& output : outputs) {
-                if (std::filesystem::exists(output.path) && !overwrite_all && !params.overwrite) {
-                    const auto choice = askOverwrite(output.path);
+                if (lfs::core::native_fs::exists(output.path) && !overwrite_all && !params.overwrite) {
+                    const auto choice = ask_overwrite(output.path, std::cin, std::cout);
                     if (choice == OverwriteChoice::NO) {
                         skip = true;
                         break;

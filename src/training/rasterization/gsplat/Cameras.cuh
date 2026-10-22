@@ -363,9 +363,10 @@ struct BaseCameraModel {
         auto const q_end = rolling_shutter_parameters.q_end;
 
         // Always perform transformation using start pose
-        auto const [image_point_start, valid_start] =
-            derived->camera_ray_to_image_point(
-                glm::rotate(q_start, world_point) + t_start, margin_factor);
+        auto const projection_start = derived->camera_ray_to_image_point(
+            glm::rotate(q_start, world_point) + t_start, margin_factor);
+        auto const& image_point_start = projection_start.imagePoint;
+        auto const valid_start = projection_start.valid_flag;
 
         if (derived->parameters.shutter_type == ShutterType::GLOBAL) {
             // Exit early if we have a global shutter sensor
@@ -375,9 +376,10 @@ struct BaseCameraModel {
         // Do initial transformations using both start and end poses to
         // determine all candidate points and take union of valid projections as
         // iteration starting points
-        auto const [image_point_end, valid_end] =
-            derived->camera_ray_to_image_point(
-                glm::rotate(q_end, world_point) + t_end, margin_factor);
+        auto const projection_end = derived->camera_ray_to_image_point(
+            glm::rotate(q_end, world_point) + t_end, margin_factor);
+        auto const& image_point_end = projection_end.imagePoint;
+        auto const valid_end = projection_end.valid_flag;
 
         // This selection prefers points at the start-of-frame pose over
         // end-of-frame points
@@ -406,11 +408,9 @@ struct BaseCameraModel {
                    relative_frame_time * t_end;
             q_rs = glm::slerp(q_start, q_end, relative_frame_time);
 
-            auto const [image_point_rs, valid_rs] =
-                derived->camera_ray_to_image_point(
-                    glm::rotate(q_rs, world_point) + t_rs, margin_factor);
-
-            image_points_rs_prev = image_point_rs;
+            auto const projection_rs = derived->camera_ray_to_image_point(
+                glm::rotate(q_rs, world_point) + t_rs, margin_factor);
+            image_points_rs_prev = projection_rs.imagePoint;
         }
 
         return {{image_points_rs_prev.x, image_points_rs_prev.y}, true};
@@ -547,7 +547,10 @@ struct OpenCVPinholeCameraModel
 
         // Evalutate distortion
         auto const uv_normalized = glm::fvec2(cam_ray.x, cam_ray.y) / cam_ray.z;
-        auto const [icD, delta, r2] = compute_distortion(uv_normalized);
+        auto const distortion = compute_distortion(uv_normalized);
+        auto const icD = distortion.icD;
+        auto const& delta = distortion.delta;
+        auto const r2 = distortion.r2;
 
         // auto constexpr k_min_radial_dist = 0.8f, k_max_radial_dist = 1.2f;
         // auto const valid_radial;
@@ -615,7 +618,9 @@ struct OpenCVPinholeCameraModel
         auto uv = uv_0;
         for (auto j = 0; j < N_MAX_UNDISTORTION_ITERATIONS; ++j) {
             // Compute the distortion for the current estimate
-            auto const [icD, delta, r2] = compute_distortion(uv);
+            auto const distortion = compute_distortion(uv);
+            auto const icD = distortion.icD;
+            auto const& delta = distortion.delta;
 
             // Update the estimate using the inverse distortion model
             auto const uv_next = (uv_0 - delta) / icD;
@@ -638,9 +643,21 @@ struct OpenCVPinholeCameraModel
 
     inline __device__ auto compute_residual_and_jacobian(
         float x, float y, float xd, float yd) const -> JacobianReturn {
-        auto const& [k1, k2, k3, k4, k5, k6] = parameters.radial_coeffs;
-        auto const& [p1, p2] = parameters.tangential_coeffs;
-        auto const& [s1, s2, s3, s4] = parameters.thin_prism_coeffs;
+        auto const& radial = parameters.radial_coeffs;
+        auto const k1 = radial[0];
+        auto const k2 = radial[1];
+        auto const k3 = radial[2];
+        auto const k4 = radial[3];
+        auto const k5 = radial[4];
+        auto const k6 = radial[5];
+        auto const& tangential = parameters.tangential_coeffs;
+        auto const p1 = tangential[0];
+        auto const p2 = tangential[1];
+        auto const& thin_prism = parameters.thin_prism_coeffs;
+        auto const s1 = thin_prism[0];
+        auto const s2 = thin_prism[1];
+        auto const s3 = thin_prism[2];
+        auto const s4 = thin_prism[3];
 
         // let r(x, y) = x^2 + y^2;
         //     alpha(x, y) = 1 + k1 * r(x, y) + k2 * r(x, y) ^2 + k3 * r(x,
@@ -717,20 +734,24 @@ struct OpenCVPinholeCameraModel
         int iter = 0;
         while (iter < N_MAX_UNDISTORTION_ITERATIONS) {
             iter++;
-            auto const [fx, fy, fx_x, fx_y, fy_x, fy_y, valid] =
-                compute_residual_and_jacobian(x, y, xd, yd);
-            if (!valid) {
+            auto const residual = compute_residual_and_jacobian(x, y, xd, yd);
+            if (!residual.valid_flag) {
                 break;
             }
 
             // Compute the Jacobian.
-            auto const det = fx_y * fy_x - fx_x * fy_y;
+            auto const det = residual.fx_y * residual.fy_x -
+                             residual.fx_x * residual.fy_y;
             if (fabsf(det) < eps)
                 break;
 
             // Update
-            auto const dx = (fx * fy_y - fy * fx_y) / det;
-            auto const dy = (fy * fx_x - fx * fy_x) / det;
+            auto const dx = (residual.fx * residual.fy_y -
+                             residual.fy * residual.fx_y) /
+                            det;
+            auto const dy = (residual.fy * residual.fx_x -
+                             residual.fx * residual.fy_x) /
+                            det;
             x += dx;
             y += dy;
 
@@ -838,7 +859,11 @@ struct OpenCVFisheyeCameraModel
         // initialize ninth-degree odd-only forward polynomial (mapping angles
         // to normalized distances) theta + k1*theta^3 + k2*theta^5 + k3*theta^7
         // + k4*theta^9
-        auto const& [k1, k2, k3, k4] = parameters.radial_coeffs;
+        auto const& radial = parameters.radial_coeffs;
+        auto const k1 = radial[0];
+        auto const k2 = radial[1];
+        auto const k3 = radial[2];
+        auto const k4 = radial[3];
         forward_poly_odd = {1.f, k1, k2, k3, k4};
 
         // eighth-degree differential of forward polynomial 1 + 3*k1*theta^2 +
@@ -875,16 +900,17 @@ struct OpenCVFisheyeCameraModel
         }
 
         max_angle =
-            min(max_angle,
+            min(min(max_angle, static_cast<float>(PI)),
                 max(max_radius_pixels / parameters.focal_length[0],
                     max_radius_pixels / parameters.focal_length[1]));
 
         // approximate backward poly (mapping normalized distances to angles)
-        // *very crudely* by linear interpolation / equidistant angle model
-        // (also assuming image-centered principal point)
-        auto const max_normalized_dist = std::max(
-            parameters.resolution[0] / 2.f / parameters.focal_length[0],
-            parameters.resolution[1] / 2.f / parameters.focal_length[1]);
+        // *very crudely* by the line through the origin and the radius the
+        // lens reaches at max_angle, so that Newton starts below the turning
+        // point for every radius up to it; a lens whose widest angle lies
+        // beyond half the image width keeps its rim
+        auto const max_normalized_dist =
+            eval_poly_odd_horner(forward_poly_odd, max_angle);
         approx_backward_poly = {0.f, max_angle / max_normalized_dist};
     }
 
@@ -897,7 +923,9 @@ struct OpenCVFisheyeCameraModel
 
     inline __device__ auto camera_ray_to_image_point(
         glm::fvec3 const& cam_ray, float margin_factor) const -> typename Base::ImagePointReturn {
-        if (cam_ray.z <= 0.f)
+        // A fisheye ray may lie behind the camera plane. Only the rear
+        // optical axis has no unique image azimuth.
+        if (cam_ray.z <= 0.f && cam_ray.x == 0.f && cam_ray.y == 0.f)
             return {{0.f, 0.f}, false};
 
         // Make sure norm is non-vanishing (norm vanishes for points along the
@@ -956,8 +984,8 @@ struct OpenCVFisheyeCameraModel
         valid &= image_point_in_image_bounds_margin(
             image_point, parameters.resolution, margin_factor);
         valid &=
-            theta <= max_angle; // explicitly check for strictly smaller angles
-                                // to classify FOV-clamped points as invalid
+            theta_full < max_angle; // explicitly check for strictly smaller angles
+                                    // to classify FOV-clamped points as invalid
 
         return {image_point, valid};
     }
@@ -1057,7 +1085,11 @@ struct ThinPrismFisheyeCameraModel
         Parameters const& parameters, float min_2d_norm = 1e-6f)
         : parameters(parameters),
           min_2d_norm(min_2d_norm) {
-        auto const& [k1, k2, k3, k4] = parameters.radial_coeffs;
+        auto const& radial = parameters.radial_coeffs;
+        auto const k1 = radial[0];
+        auto const k2 = radial[1];
+        auto const k3 = radial[2];
+        auto const k4 = radial[3];
         forward_poly_odd = {1.f, k1, k2, k3, k4};
         dforward_poly_even = {1, 3 * k1, 5 * k2, 7 * k3, 9 * k4};
 
@@ -1087,7 +1119,7 @@ struct ThinPrismFisheyeCameraModel
             }
         }
 
-        max_angle = min(max_angle,
+        max_angle = min(min(max_angle, static_cast<float>(PI)),
                         max(max_radius_pixels / parameters.focal_length[0],
                             max_radius_pixels / parameters.focal_length[1]));
 
@@ -1106,7 +1138,9 @@ struct ThinPrismFisheyeCameraModel
 
     inline __device__ auto camera_ray_to_image_point(
         glm::fvec3 const& cam_ray, float margin_factor) const -> typename Base::ImagePointReturn {
-        if (cam_ray.z <= 0.f)
+        // A fisheye ray may lie behind the camera plane. Only the rear
+        // optical axis has no unique image azimuth.
+        if (cam_ray.z <= 0.f && cam_ray.x == 0.f && cam_ray.y == 0.f)
             return {{0.f, 0.f}, false};
 
         auto cam_ray_xy_norm = numerically_stable_norm2(cam_ray.x, cam_ray.y);
@@ -1121,16 +1155,13 @@ struct ThinPrismFisheyeCameraModel
         if (thetad <= 0.f)
             return {{0.f, 0.f}, false};
 
-        auto const scale = thetad / cam_ray_xy_norm;
-        auto const dx = scale * cam_ray.x;
-        auto const dy = scale * cam_ray.y;
-
-        // Tangential and thin prism distortion
-        auto const& [p1, p2, sx1, sy1] = parameters.thin_prism_coeffs;
-        auto const dr2 = dx * dx + dy * dy;
-
-        auto const x_dist = dx + 2.f * p1 * dx * dy + p2 * (dr2 + 2.f * dx * dx) + sx1 * dr2;
-        auto const y_dist = dy + p1 * (dr2 + 2.f * dy * dy) + 2.f * p2 * dx * dy + sy1 * dr2;
+        // As in COLMAP, the tangential and prism terms act on the theta-scaled point, not on the
+        // radially distorted one.
+        auto const theta_point = glm::fvec2{cam_ray.x, cam_ray.y} * (theta / cam_ray_xy_norm);
+        auto const prism = thin_prism_terms(theta_point);
+        auto const radial_scale = thetad / cam_ray_xy_norm;
+        auto const x_dist = radial_scale * cam_ray.x + prism.x;
+        auto const y_dist = radial_scale * cam_ray.y + prism.y;
 
         auto const image_point = glm::fvec2{
             parameters.focal_length[0] * x_dist + parameters.principal_point[0],
@@ -1139,7 +1170,7 @@ struct ThinPrismFisheyeCameraModel
         auto valid = true;
         valid &= image_point_in_image_bounds_margin(
             image_point, parameters.resolution, margin_factor);
-        valid &= theta <= max_angle;
+        valid &= theta_full < max_angle;
 
         return {image_point, valid};
     }
@@ -1149,35 +1180,43 @@ struct ThinPrismFisheyeCameraModel
                                             parameters.principal_point[1]}) /
                   glm::fvec2{parameters.focal_length[0], parameters.focal_length[1]};
 
-        // Iteratively remove tangential and thin prism distortion
-        auto const& [p1, p2, sx1, sy1] = parameters.thin_prism_coeffs;
-        for (size_t i = 0; i < N_UNDISTORT_ITERATIONS; ++i) {
-            auto const dr2 = uv.x * uv.x + uv.y * uv.y;
-            auto const dx = 2.f * p1 * uv.x * uv.y + p2 * (dr2 + 2.f * uv.x * uv.x) + sx1 * dr2;
-            auto const dy = p1 * (dr2 + 2.f * uv.y * uv.y) + 2.f * p2 * uv.x * uv.y + sy1 * dr2;
-            uv.x -= dx;
-            uv.y -= dy;
+        // Fixed point on the theta-scaled point p: uv = radial(p) + prism(p).
+        auto radially_distorted = uv;
+        auto theta_point = glm::fvec2{0.f, 0.f};
+        float theta = 0.f;
+        for (size_t i = 0; i <= N_UNDISTORT_ITERATIONS; ++i) {
+            if (i > 0)
+                radially_distorted = uv - thin_prism_terms(theta_point);
+            auto const thetad = length(radially_distorted);
+            bool converged = false;
+            theta = eval_poly_inverse_horner_newton<N_NEWTON_ITERATIONS>(
+                PolynomialProxy<PolynomialType::ODD, 5>{forward_poly_odd},
+                PolynomialProxy<PolynomialType::EVEN, 5>{dforward_poly_even},
+                PolynomialProxy<PolynomialType::FULL, 2>{approx_backward_poly},
+                thetad, converged);
+            if (theta < 0.f || theta >= max_angle || !converged) {
+                return {glm::fvec3{0.f, 0.f, 1.f}, false};
+            }
+            theta_point = thetad >= min_2d_norm ? radially_distorted * (theta / thetad) : glm::fvec2{0.f, 0.f};
         }
-
-        auto const delta = length(uv);
-
-        bool converged = false;
-        auto const theta = eval_poly_inverse_horner_newton<N_NEWTON_ITERATIONS>(
-            PolynomialProxy<PolynomialType::ODD, 5>{forward_poly_odd},
-            PolynomialProxy<PolynomialType::EVEN, 5>{dforward_poly_even},
-            PolynomialProxy<PolynomialType::FULL, 2>{approx_backward_poly},
-            delta, converged);
-
-        if (theta < 0.f || theta >= max_angle || !converged) {
-            return {glm::fvec3{0.f, 0.f, 1.f}, false};
-        }
-
-        if (delta >= min_2d_norm) {
-            auto const scale_factor = std::sin(theta) / delta;
-            return {glm::fvec3{scale_factor * uv.x, scale_factor * uv.y, std::cos(theta)}, true};
+        if (theta >= min_2d_norm) {
+            auto const scale_factor = std::sin(theta) / theta;
+            return {glm::fvec3{scale_factor * theta_point.x, scale_factor * theta_point.y, std::cos(theta)}, true};
         } else {
             return {glm::fvec3{0.f, 0.f, 1.f}, true};
         }
+    }
+
+    // COLMAP ThinPrismFisheyeCameraModel tangential and prism terms of a theta-scaled point.
+    inline __device__ glm::fvec2 thin_prism_terms(glm::fvec2 const& point) const {
+        auto const& thin_prism = parameters.thin_prism_coeffs;
+        auto const p1 = thin_prism[0];
+        auto const p2 = thin_prism[1];
+        auto const sx1 = thin_prism[2];
+        auto const sy1 = thin_prism[3];
+        auto const r2 = point.x * point.x + point.y * point.y;
+        return {2.f * p1 * point.x * point.y + p2 * (r2 + 2.f * point.x * point.x) + sx1 * r2,
+                p1 * (r2 + 2.f * point.y * point.y) + 2.f * p2 * point.x * point.y + sy1 * r2};
     }
 };
 
@@ -1293,13 +1332,13 @@ world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
     auto image_covariance = glm::fmat2{0};
 #pragma unroll
     for (auto i = 0u; i < std::size(image_points); ++i) {
-        auto const [image_point, point_valid] =
-            // annotate with 'template' to avoid warnings: #174-D: expression
-            // has no effect
+        // Annotate with 'template' to avoid warning #174-D: expression has no effect.
+        auto const projection =
             camera_model.template world_point_to_image_point_shutter_pose<>(
-                sigma_points.points[i],
-                rolling_shutter_parameters,
+                sigma_points.points[i], rolling_shutter_parameters,
                 unscented_transform_parameters.in_image_margin_factor);
+        auto const& image_point = projection.imagePoint;
+        auto const point_valid = projection.valid_flag;
 
         if (unscented_transform_parameters.require_all_sigma_points_valid) {
             valid &= point_valid; // all have to be valid

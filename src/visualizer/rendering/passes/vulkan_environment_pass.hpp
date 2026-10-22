@@ -6,6 +6,7 @@
 
 #include "core/export.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <glm/glm.hpp>
 #include <memory>
@@ -17,7 +18,8 @@ namespace lfs::vis {
 
     struct VulkanEnvironmentParams {
         bool enabled = false;
-        std::filesystem::path map_path;
+        // Shared with settings snapshots and captures; copying pane metadata never copies the path.
+        std::shared_ptr<const std::filesystem::path> map_path;
         glm::mat3 camera_to_world{1.0f};
         glm::vec4 intrinsics{0.0f}; // focal_x, focal_y, cx, cy
         glm::vec2 viewport_size{0.0f};
@@ -42,17 +44,18 @@ namespace lfs::vis {
 
         // Loads / re-uploads the equirect texture if the path changed. Cheap when path
         // is unchanged.
-        void prepare(const VulkanEnvironmentParams& params);
+        void prepare(const VulkanEnvironmentParams& params, std::size_t frame_slot);
 
-        // Records a full-screen quad draw that fills the color attachment with the
+        // Records a quad draw that fills the viewport rect with the
         // ACES-tonemapped equirect background. Caller is mid-render.
         void record(VkCommandBuffer command_buffer,
-                    VkExtent2D framebuffer_extent,
-                    const VulkanEnvironmentParams& params);
+                    VkRect2D framebuffer_rect,
+                    const VulkanEnvironmentParams& params,
+                    std::size_t frame_slot);
 
         void shutdown();
 
-        [[nodiscard]] bool hasTexture() const;
+        [[nodiscard]] bool hasTexture(std::size_t frame_slot) const;
 
     private:
         struct Impl;

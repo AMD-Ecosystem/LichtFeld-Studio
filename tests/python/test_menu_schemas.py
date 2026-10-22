@@ -21,34 +21,147 @@ def _source_python_path(monkeypatch):
 def _install_lichtfeld_stub(monkeypatch):
     state = {
         "theme": "dark",
+        "theme_family": "lichtfeld",
+        "theme_mode": "dark",
+        "supports_system_theme": True,
+        "theme_family_calls": [],
         "ui_scale": 1.0,
         "python_console_shown": 0,
         "undo_called": False,
         "redo_called": False,
+        "copy_called": False,
+        "cut_called": False,
+        "paste_called": False,
+        "invert_called": False,
+        "select_all_called": False,
+        "deselect_all_called": False,
+        "can_edit_gaussian_selection": True,
+        "has_gaussian_selection": True,
+        "has_gaussian_clipboard": False,
+        "active_tool": "builtin.select",
+        "panel_enabled": [],
+        "panels": {},
+        "main_panel_active_tab": None,
     }
 
     ui = SimpleNamespace(
         tr=lambda key: f"tr:{key}",
         themes=lambda: [
-            {"id": "dark", "name": "Dark", "label_key": "menu.view.theme.dark", "order": 0},
-            {"id": "light", "name": "Light", "label_key": "menu.view.theme.light", "order": 1},
+            {
+                "id": "lichtfeld_dark",
+                "name": "LichtFeld Dark",
+                "family_id": "lichtfeld",
+                "family_name": "LichtFeld",
+                "variant_name": "Dark",
+                "mode": "dark",
+                "order": 0,
+            },
+            {
+                "id": "lichtfeld_light",
+                "name": "LichtFeld Light",
+                "family_id": "lichtfeld",
+                "family_name": "LichtFeld",
+                "variant_name": "Light",
+                "mode": "light",
+                "order": 1,
+            },
+            {
+                "id": "signal_night",
+                "name": "Signal Night",
+                "family_id": "signal",
+                "family_name": "Signal",
+                "variant_name": "Night",
+                "mode": "dark",
+                "order": 10,
+            },
+            {
+                "id": "signal_day",
+                "name": "Signal Day",
+                "family_id": "signal",
+                "family_name": "Signal",
+                "variant_name": "Day",
+                "mode": "light",
+                "order": 11,
+            },
+            {
+                "id": "gruvbox_dark",
+                "name": "Gruvbox",
+                "family_id": "gruvbox",
+                "family_name": "Gruvbox",
+                "variant_name": "Dark",
+                "mode": "dark",
+                "order": 20,
+            },
         ],
         get_theme=lambda: state["theme"],
         set_theme=lambda theme: state.__setitem__("theme", theme),
+        get_theme_family=lambda: state["theme_family"],
+        get_theme_mode=lambda: state["theme_mode"],
+        supports_system_theme=lambda: state["supports_system_theme"],
+        set_theme_family=lambda family, mode: (
+            state.__setitem__("theme_family", family),
+            state.__setitem__("theme_mode", mode),
+            state["theme_family_calls"].append((family, mode)),
+        ),
         get_ui_scale_preference=lambda: state["ui_scale"],
         set_ui_scale=lambda scale: state.__setitem__("ui_scale", scale),
         show_python_console=lambda: state.__setitem__("python_console_shown", state["python_console_shown"] + 1),
         toggle_system_console=lambda: state.__setitem__("python_console_shown", state["python_console_shown"] + 1),
-        set_panel_enabled=lambda _panel_id, _enabled: None,
+        toggle_vram_hud=lambda: state.__setitem__("vram_hud_toggled", True),
+        is_perf_hud_visible=lambda: False,
+        is_panel_enabled=lambda panel_id: False,
+        set_panel_enabled=lambda panel_id, enabled: state["panel_enabled"].append((panel_id, enabled)),
+        get_panel_object=lambda panel_id: state["panels"].get(panel_id),
+        set_main_panel_active_tab=lambda panel_id: state.__setitem__("main_panel_active_tab", panel_id),
         is_windows_platform=lambda: False,
         are_file_associations_registered=lambda: False,
+        can_edit_gaussian_selection=lambda: state["can_edit_gaussian_selection"],
+        has_gaussian_selection=lambda: state["has_gaussian_selection"],
+        has_gaussian_clipboard=lambda: state["has_gaussian_clipboard"],
+        get_split_view_mode=lambda: "independent_dual",
+        get_active_tool=lambda: state["active_tool"],
+        copy_gaussian_selection=lambda: state.__setitem__("copy_called", True),
+        cut_gaussian_selection=lambda: state.__setitem__("cut_called", True),
+        paste_gaussian_selection=lambda: state.__setitem__("paste_called", True),
+        invert_gaussian_selection=lambda: state.__setitem__("invert_called", True),
+        select_all_gaussians=lambda: state.__setitem__("select_all_called", True),
+        deselect_all_gaussians=lambda: state.__setitem__("deselect_all_called", True),
     )
     keymap = SimpleNamespace(
-        Action=SimpleNamespace(UNDO="undo", REDO="redo"),
+        Action=SimpleNamespace(
+            UNDO="undo",
+            REDO="redo",
+            COPY_SELECTION="copy_selection",
+            CUT_SELECTION="cut_selection",
+            PASTE_SELECTION="paste_selection",
+            INVERT_SELECTION="invert_selection",
+            SELECT_ALL="select_all",
+            DESELECT_ALL="deselect_all",
+            OPEN_PREFERENCES="open_preferences",
+            TOGGLE_PERFORMANCE_HUD="toggle_performance_hud",
+            TOGGLE_UI="toggle_ui",
+            TOGGLE_PYTHON_CONSOLE="toggle_python_console",
+            CAMERA_RESET_HOME="camera_reset_home",
+            CAMERA_SET_HOME="camera_set_home",
+            CAMERA_RESTORE_HOME="camera_restore_home",
+        ),
         ToolMode=SimpleNamespace(GLOBAL="global"),
+        is_bound=lambda _action, _mode: True,
         get_trigger_description=lambda action, _mode: {
             "undo": "Ctrl+Z",
             "redo": "Ctrl+Shift+Z",
+            "copy_selection": "Ctrl+C",
+            "cut_selection": "Ctrl+X",
+            "paste_selection": "Ctrl+V",
+            "invert_selection": "Ctrl+I",
+            "select_all": "Ctrl+A",
+            "deselect_all": "Ctrl+D",
+            "open_preferences": "Ctrl+,",
+            "toggle_performance_hud": "F10",
+            "toggle_python_console": "Ctrl+`",
+            "camera_reset_home": "H",
+            "camera_set_home": "Shift+H",
+            "camera_restore_home": "Ctrl+H",
         }.get(action, "Unbound"),
     )
 
@@ -56,6 +169,11 @@ def _install_lichtfeld_stub(monkeypatch):
     lf_stub.ui = ui
     lf_stub.keymap = keymap
     lf_stub.reset_camera = lambda: None
+    lf_stub.go_home = lambda: state.setdefault("home_calls", []).append("go")
+    lf_stub.set_home = lambda: state.setdefault("home_calls", []).append("set")
+    lf_stub.reset_home = lambda: state.setdefault("home_calls", []).append("reset")
+    lf_stub.toggle_ui = lambda: state.__setitem__("ui_toggled", True)
+    lf_stub.toggle_independent_split_view = lambda: state.__setitem__("split_toggled", True)
     lf_stub.undo = SimpleNamespace(
         can_undo=lambda: True,
         can_redo=lambda: False,
@@ -66,16 +184,49 @@ def _install_lichtfeld_stub(monkeypatch):
     return state
 
 
+def test_keymap_shortcut_bound_unbound_and_unavailable(monkeypatch):
+    _install_lichtfeld_stub(monkeypatch)
+    monkeypatch.delitem(sys.modules, "lfs_plugins.layouts.menus", raising=False)
+    package_stub = ModuleType("lfs_plugins")
+    package_stub.__path__ = [str(PROJECT_ROOT / "src" / "python" / "lfs_plugins")]
+    package_stub.__package__ = "lfs_plugins"
+    monkeypatch.setitem(sys.modules, "lfs_plugins", package_stub)
+
+    menus_mod = import_module("lfs_plugins.layouts.menus")
+    keymap = sys.modules["lichtfeld"].keymap
+    assert menus_mod.keymap_shortcut(keymap.Action.UNDO) == "Ctrl+Z"
+
+    keymap.is_bound = lambda _action, _mode: False
+    assert menus_mod.keymap_shortcut(keymap.Action.UNDO) == ""
+
+    del sys.modules["lichtfeld"].keymap
+    assert menus_mod.keymap_shortcut("undo") == ""
+
+
 def test_menu_helpers_and_builtin_schemas(monkeypatch):
     monkeypatch.delitem(sys.modules, "lfs_plugins", raising=False)
+    monkeypatch.delitem(sys.modules, "lfs_plugins.layouts", raising=False)
     monkeypatch.delitem(sys.modules, "lfs_plugins.layouts.menus", raising=False)
     monkeypatch.delitem(sys.modules, "lfs_plugins.edit_menu", raising=False)
+    monkeypatch.delitem(sys.modules, "lfs_plugins.select_menu", raising=False)
+    monkeypatch.delitem(sys.modules, "lfs_plugins.tools_menu", raising=False)
     monkeypatch.delitem(sys.modules, "lfs_plugins.view_menu", raising=False)
 
     state = _install_lichtfeld_stub(monkeypatch)
 
+    # These are schema-only tests. Import the menu modules without executing
+    # lfs_plugins.__init__, which initializes the plugin manager and its HTTPS
+    # stack. On Windows that unrelated path can load OpenSSL DLLs from the C++
+    # build directory before Python's _ssl extension resolves its own runtime.
+    package_stub = ModuleType("lfs_plugins")
+    package_stub.__path__ = [str(PROJECT_ROOT / "src" / "python" / "lfs_plugins")]
+    package_stub.__package__ = "lfs_plugins"
+    monkeypatch.setitem(sys.modules, "lfs_plugins", package_stub)
+
     menus_mod = import_module("lfs_plugins.layouts.menus")
     edit_mod = import_module("lfs_plugins.edit_menu")
+    select_mod = import_module("lfs_plugins.select_menu")
+    tools_mod = import_module("lfs_plugins.tools_menu")
     view_mod = import_module("lfs_plugins.view_menu")
 
     class _OperatorStub:
@@ -93,22 +244,225 @@ def test_menu_helpers_and_builtin_schemas(monkeypatch):
     }
 
     edit_items = edit_mod.EditMenu().menu_items()
-    assert len(edit_items) == 4
-    assert edit_items[0]["type"] == "item"
-    assert edit_items[0]["label"] == "Undo"
+    assert [item.get("label") for item in edit_items] == [
+        "Undo", "Redo", None, "tr:menu.select.cut_selection",
+        "tr:menu.select.copy_selection", "tr:menu.select.paste_selection",
+        None, "tr:menu.edit.preferences",
+    ]
     edit_items[0]["callback"]()
-    assert state["undo_called"] is True
-    assert edit_items[1]["type"] == "item"
-    assert edit_items[1]["label"] == "Redo"
-    assert edit_items[1]["enabled"] is False
-    assert edit_items[2]["type"] == "separator"
-    assert edit_items[3]["label"] == "tr:menu.edit.input_settings"
+    assert state["undo_called"]
+    assert not edit_items[1]["enabled"]
+    for item, flag in [(edit_items[3], "cut_called"), (edit_items[4], "copy_called")]:
+        assert item["enabled"]
+        item["callback"]()
+        assert state[flag]
+    assert not edit_items[5]["enabled"]
+    assert edit_items[3]["shortcut"] == "Ctrl+X"
+    assert edit_items[4]["shortcut"] == "Ctrl+C"
+    assert edit_items[5]["shortcut"] == "Ctrl+V"
+    assert edit_mod.EditMenu.order < select_mod.SelectMenu.order < view_mod.ViewMenu.order < tools_mod.ToolsMenu.order
+
+    tools_items = tools_mod.ToolsMenu().menu_items()
+    python_console = tools_items[4]["items"][0]
+    assert python_console["shortcut"] == "Ctrl+`"
+    python_console["callback"]()
+    assert state["python_console_shown"] == 1
+
+    select_items = select_mod.SelectMenu().menu_items()
+    assert [item.get("label") for item in select_items] == [
+        "tr:menu.select.select_all", "tr:menu.select.deselect_all",
+        "tr:menu.select.invert_selection", None, "tr:menu.select.selection_groups",
+    ]
+    for index, flag in [(0, "select_all_called"), (1, "deselect_all_called"), (2, "invert_called")]:
+        select_items[index]["callback"]()
+        assert state[flag]
+    revealed = []
+    state["panels"]["lfs.rendering"] = SimpleNamespace(
+        reveal_selection_groups=lambda: revealed.append(True) or True
+    )
+    assert select_items[4]["callback"]()
+    assert state["main_panel_active_tab"] == "lfs.rendering"
+    assert revealed == [True]
+    state["has_gaussian_selection"] = False
+    state["has_gaussian_clipboard"] = True
+    edit_items = edit_mod.EditMenu().menu_items()
+    assert not edit_items[3]["enabled"] and not edit_items[4]["enabled"]
+    assert edit_items[5]["enabled"]
+    edit_items[5]["callback"]()
+    assert state["paste_called"]
+    assert not select_mod.SelectMenu().menu_items()[1]["enabled"]
+    state["active_tool"] = "builtin.translate"
+    assert not select_mod.SelectMenu().menu_items()[0]["enabled"]
+    assert select_mod.SelectMenu().menu_items()[2]["enabled"]
+    state["can_edit_gaussian_selection"] = False
+    assert all(not item["enabled"] for item in select_mod.SelectMenu().menu_items() if item["type"] == "item")
+    assert all(not item["enabled"] for item in edit_mod.EditMenu().menu_items()[3:6])
 
     view_items = view_mod.ViewMenu().menu_items()
-    assert view_items[0]["type"] == "submenu"
-    assert view_items[1]["type"] == "submenu"
-    assert view_items[0]["items"][0]["selected"] is True
-    assert view_items[1]["items"][1]["label"] == "100%"
-    assert view_items[4]["label"] == "tr:main_panel.console"
+    logging = next(item for item in view_items if item.get("label") == "tr:scene.logging")
+    assert logging["selected"] is False
+    logging["callback"]()
+    assert state["panel_enabled"][-1] == ("lfs.logging", True)
+    appearance = view_items[-1]["items"]
+    assert appearance[0]["type"] == "submenu"
+    assert appearance[0]["label"] == "tr:menu.view.theme · LichtFeld · Dark"
+    assert appearance[1]["type"] == "submenu"
+    theme_families = appearance[0]["items"]
+    assert [item["label"] for item in theme_families] == [
+        "LichtFeld · Dark",
+        "Signal",
+        "Gruvbox",
+    ]
+    assert theme_families[0]["type"] == "submenu"
+    assert [item["label"] for item in theme_families[0]["items"]] == [
+        "Dark",
+        "Light",
+        "tr:menu.view.theme.auto",
+    ]
+    assert theme_families[0]["items"][0]["selected"] is True
+    assert theme_families[1]["type"] == "submenu"
+    assert [item["label"] for item in theme_families[1]["items"]] == [
+        "Night",
+        "Day",
+        "tr:menu.view.theme.auto",
+    ]
+    theme_families[1]["items"][0]["callback"]()
+    theme_families[1]["items"][2]["callback"]()
+    assert state["theme_family_calls"][-2:] == [("signal", "dark"), ("signal", "auto")]
+    assert theme_families[2]["type"] == "toggle"
+
+    state["supports_system_theme"] = False
+    updated_appearance = view_mod.ViewMenu().menu_items()[-1]["items"]
+    assert updated_appearance[0]["label"] == (
+        "tr:menu.view.theme · Signal · tr:menu.view.theme.auto"
+    )
+    theme_families = updated_appearance[0]["items"]
+    assert [item["label"] for item in theme_families] == [
+        "LichtFeld",
+        "Signal · tr:menu.view.theme.auto",
+        "Gruvbox",
+    ]
+    assert [item["label"] for item in theme_families[0]["items"]] == ["Dark", "Light"]
+    assert [item["label"] for item in theme_families[1]["items"]] == ["Night", "Day"]
+    assert appearance[1]["items"][1]["label"] == "100%"
+    # theme, ui_scale, separator, performance_hud, reset_view, console
+    assert view_items[7]["label"] == "tr:menu.view.performance_hud"
+    assert view_items[7]["shortcut"] == "F10"
+    view_items[7]["callback"]()
+    assert state.get("vram_hud_toggled") is True
+    assert [(item["label"], item["shortcut"]) for item in view_items[:3]] == [
+        ("tr:menu.view.home_view", "H"),
+        ("tr:input_settings.action.camera_set_home", "Shift+H"),
+        ("tr:toolbar.reset_home", "Ctrl+H"),
+    ]
+    for item in view_items[:3]:
+        item["callback"]()
+    assert state["home_calls"] == ["go", "set", "reset"]
+    assert view_items[4]["selected"]
     view_items[4]["callback"]()
+    view_items[5]["callback"]()
+    assert state["split_toggled"] and state["ui_toggled"]
+
+    keymap = sys.modules["lichtfeld"].keymap
+    keymap.get_trigger_description = lambda action, _mode: {
+        "toggle_performance_hud": "Ctrl+F10",
+        "open_preferences": "Alt+P",
+        "copy_selection": "Alt+C",
+    }.get(action, "")
+    assert view_mod.ViewMenu().menu_items()[7]["shortcut"] == "Ctrl+F10"
+    assert edit_mod.EditMenu().menu_items()[7]["shortcut"] == "Alt+P"
+    assert edit_mod.EditMenu().menu_items()[4]["shortcut"] == "Alt+C"
+    keymap.is_bound = lambda _action, _mode: False
+    assert view_mod.ViewMenu().menu_items()[7]["shortcut"] == ""
+    assert edit_mod.EditMenu().menu_items()[7]["shortcut"] == ""
+    assert edit_mod.EditMenu().menu_items()[4]["shortcut"] == ""
+
+
+def _import_tools_menu(monkeypatch):
+    monkeypatch.delitem(sys.modules, "lfs_plugins", raising=False)
+    monkeypatch.delitem(sys.modules, "lfs_plugins.layouts", raising=False)
+    monkeypatch.delitem(sys.modules, "lfs_plugins.layouts.menus", raising=False)
+    monkeypatch.delitem(sys.modules, "lfs_plugins.tools_menu", raising=False)
+
+    package_stub = ModuleType("lfs_plugins")
+    package_stub.__path__ = [str(PROJECT_ROOT / "src" / "python" / "lfs_plugins")]
+    package_stub.__package__ = "lfs_plugins"
+    monkeypatch.setitem(sys.modules, "lfs_plugins", package_stub)
+    return import_module("lfs_plugins.tools_menu")
+
+
+def test_tools_menu_contains_processing_and_python_tools(monkeypatch):
+    state = _install_lichtfeld_stub(monkeypatch)
+    tools_mod = _import_tools_menu(monkeypatch)
+
+    items = tools_mod.ToolsMenu().menu_items()
+    labels = [item.get("label") for item in items]
+    assert labels == ["tr:menu.file.mesh_to_splat", "tr:menu.file.extract_video_frames",
+                      "tr:rendering_panel.section_simplify", None, "tr:menu.tools.developer", "tr:menu.tools.plugin_marketplace"]
+    items[4]["items"][0]["callback"]()
+    items[2]["callback"]()
+
     assert state["python_console_shown"] == 1
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux", "darwin"])
+def test_developer_system_console_is_windows_only(monkeypatch, platform):
+    state = _install_lichtfeld_stub(monkeypatch)
+    monkeypatch.setattr(sys, "platform", platform)
+    tools_mod = _import_tools_menu(monkeypatch)
+    items = tools_mod.ToolsMenu().menu_items()[4]["items"]
+    assert items[0]["label"] == "tr:menu.tools.python_console"
+    assert len(items) == (2 if platform == "win32" else 1)
+    if platform == "win32":
+        assert items[1]["label"] == "tr:menu.tools.system_console"
+        items[1]["callback"]()
+        assert state["python_console_shown"] == 1
+
+
+def test_tools_menu_projects_selects_scope_when_available(monkeypatch):
+    state = _install_lichtfeld_stub(monkeypatch)
+    selected = []
+    state["panels"]["lfs.asset_manager"] = SimpleNamespace(
+        select_projects_scope=lambda: selected.append(True),
+    )
+    tools_mod = _import_tools_menu(monkeypatch)
+
+    items = tools_mod.ToolsMenu().menu_items()
+    tools_mod._open_projects_scope()
+    assert state["panel_enabled"] == [("lfs.asset_manager", True)]
+    assert selected == [True]
+
+
+def test_tools_menu_projects_skips_missing_select_projects_scope(monkeypatch):
+    state = _install_lichtfeld_stub(monkeypatch)
+    state["panels"]["lfs.asset_manager"] = SimpleNamespace()
+    tools_mod = _import_tools_menu(monkeypatch)
+
+    items = tools_mod.ToolsMenu().menu_items()
+    tools_mod._open_projects_scope()
+    assert state["panel_enabled"] == [("lfs.asset_manager", True)]
+
+
+
+def test_tools_menu_gallery_selects_scope_when_available(monkeypatch):
+    state = _install_lichtfeld_stub(monkeypatch)
+    selected = []
+    state["panels"]["lfs.asset_manager"] = SimpleNamespace(
+        select_gallery_scope=lambda: selected.append(True),
+    )
+    tools_mod = _import_tools_menu(monkeypatch)
+
+    items = tools_mod.ToolsMenu().menu_items()
+    tools_mod._open_gallery_scope()
+    assert state["panel_enabled"] == [("lfs.asset_manager", True)]
+    assert selected == [True]
+
+
+def test_tools_menu_gallery_skips_missing_select_gallery_scope(monkeypatch):
+    state = _install_lichtfeld_stub(monkeypatch)
+    state["panels"]["lfs.asset_manager"] = SimpleNamespace()
+    tools_mod = _import_tools_menu(monkeypatch)
+
+    items = tools_mod.ToolsMenu().menu_items()
+    tools_mod._open_gallery_scope()
+    assert state["panel_enabled"] == [("lfs.asset_manager", True)]

@@ -2,8 +2,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/tensor.hpp"
+#include <cmath>
 #include <cuda_runtime.h>
+#include <expected>
 #include <gtest/gtest.h>
+#include <limits>
 #include <random>
 #include <torch/torch.h>
 
@@ -415,9 +418,9 @@ TEST_F(TensorBasicTest, MoveConstructor) {
     Tensor tensor2(std::move(tensor1));
 
     EXPECT_EQ(tensor2.data_ptr(), original_ptr);
-    EXPECT_EQ(tensor1.data_ptr(), nullptr); // tensor1 should be cleared
     EXPECT_TRUE(tensor2.is_valid());
     EXPECT_FALSE(tensor1.is_valid());
+    EXPECT_THROW((void)tensor1.data_ptr(), std::runtime_error);
 }
 
 TEST_F(TensorBasicTest, MoveAssignment) {
@@ -425,14 +428,25 @@ TEST_F(TensorBasicTest, MoveAssignment) {
     void* original_ptr = tensor1.data_ptr();
 
     auto tensor2 = Tensor::zeros({2, 2}, Device::CUDA);
-    void* tensor2_original = tensor2.data_ptr();
 
     tensor2 = std::move(tensor1);
 
     EXPECT_EQ(tensor2.data_ptr(), original_ptr);
-    EXPECT_EQ(tensor1.data_ptr(), nullptr);
     EXPECT_TRUE(tensor2.is_valid());
     EXPECT_FALSE(tensor1.is_valid());
+    EXPECT_THROW((void)tensor1.data_ptr(), std::runtime_error);
+}
+
+TEST_F(TensorBasicTest, SelfMoveAssignmentPreservesStorage) {
+    auto tensor = Tensor::from_vector(
+        std::vector<float>{1.0f, 2.0f, 3.0f}, {3}, Device::CUDA);
+    const auto* original_data = tensor.ptr<float>();
+
+    tensor = std::move(tensor);
+
+    EXPECT_TRUE(tensor.is_valid());
+    EXPECT_EQ(tensor.ptr<float>(), original_data);
+    EXPECT_EQ(tensor.cpu().to_vector(), (std::vector<float>{1.0f, 2.0f, 3.0f}));
 }
 
 // ============= Properties Tests =============
@@ -478,12 +492,8 @@ TEST_F(TensorBasicTest, InvalidTensor) {
     EXPECT_TRUE(invalid_tensor.is_empty());
     EXPECT_EQ(invalid_tensor.numel(), 0);
 
-    // These should not crash but return invalid tensors
-    auto result = invalid_tensor.clone();
-    EXPECT_FALSE(result.is_valid());
-
-    result = invalid_tensor.add(1.0f);
-    EXPECT_FALSE(result.is_valid());
+    EXPECT_THROW((void)invalid_tensor.clone(), std::runtime_error);
+    EXPECT_THROW((void)invalid_tensor.add(1.0f), std::runtime_error);
 }
 
 TEST_F(TensorBasicTest, EmptyTensor) {
@@ -553,6 +563,40 @@ TEST_F(TensorBasicTest, ItemTemplate) {
     auto torch_int = torch::full({1}, 42,
                                  torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
     EXPECT_EQ(tensor_int.item<int>(), torch_int.item<int>());
+}
+
+TEST_F(TensorBasicTest, ItemTemplateRejectsDtypeMismatch) {
+    const auto value = Tensor::ones_bool({1}, Device::CUDA);
+
+    EXPECT_THROW((void)value.item<int>(), std::runtime_error);
+}
+
+TEST_F(TensorBasicTest, FullPreservesNonFiniteFloatingValues) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        EXPECT_TRUE(std::isnan(Tensor::full({1}, nan, device).item<float>()));
+        EXPECT_EQ(Tensor::full({1}, infinity, device).item<float>(), infinity);
+        EXPECT_EQ(Tensor::full({1}, -infinity, device).item<float>(), -infinity);
+
+        const auto half_nan = Tensor::full({1}, nan, device, DataType::Float16)
+                                  .to(DataType::Float32);
+        EXPECT_TRUE(std::isnan(half_nan.item<float>()));
+        EXPECT_EQ(Tensor::full({1}, infinity, device, DataType::Float16)
+                      .to(DataType::Float32)
+                      .item<float>(),
+                  infinity);
+        EXPECT_EQ(Tensor::full({1}, -infinity, device, DataType::Float16)
+                      .to(DataType::Float32)
+                      .item<float>(),
+                  -infinity);
+    }
+
+    EXPECT_THROW(Tensor::full({1}, nan, Device::CPU, DataType::Int32),
+                 std::runtime_error);
+    EXPECT_THROW(Tensor::full({1}, infinity, Device::CUDA, DataType::Bool),
+                 std::runtime_error);
 }
 
 // ============= Data Type Tests =============
@@ -693,4 +737,127 @@ TEST_F(TensorBasicTest, ComprehensiveWorkflow) {
 
     // Values should be preserved through CPU transfer
     compare_tensors(cpu_custom, cpu_torch, 1e-5f, 1e-6f, "Comprehensive_CPU");
+}
+
+TEST_F(TensorBasicTest, MoveLeavesConsistentEmptyMetadata) {
+    auto source = Tensor::from_vector(
+        std::vector<float>{1.0f, 2.0f, 3.0f}, {3}, Device::CUDA);
+    const auto* original_data = source.ptr<float>();
+
+    auto destination = std::move(source);
+
+    EXPECT_TRUE(destination.is_valid());
+    EXPECT_EQ(destination.ptr<float>(), original_data);
+    EXPECT_EQ(destination.cpu().to_vector(), (std::vector<float>{1.0f, 2.0f, 3.0f}));
+    EXPECT_FALSE(source.is_valid());
+    EXPECT_EQ(source.numel(), 0u);
+    EXPECT_EQ(source.ndim(), 0u);
+    EXPECT_THROW((void)source.ptr<float>(), std::runtime_error);
+    EXPECT_THROW((void)source.shape()[0], std::out_of_range);
+}
+
+TEST_F(TensorBasicTest, MoveThroughExpectedAndConstructorPreservesTensor) {
+    struct Wrapper {
+        Tensor data;
+        explicit Wrapper(Tensor tensor) : data(std::move(tensor)) {}
+    };
+
+    const auto create_wrapped = []() -> std::expected<Wrapper, std::string> {
+        return Wrapper(Tensor::from_vector(
+            std::vector<float>{1.0f, 2.0f, 3.0f}, {3}, Device::CUDA));
+    };
+
+    auto result = create_wrapped();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->data.is_valid());
+    EXPECT_EQ(result->data.shape(), TensorShape({3}));
+    EXPECT_EQ(result->data.cpu().to_vector(), (std::vector<float>{1.0f, 2.0f, 3.0f}));
+}
+
+TEST(TensorAssignmentTest, CopyRebindsViewsAndSharesSourceStorage) {
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        for (const bool strided : {false, true}) {
+            auto backing = Tensor::zeros({4, 4}, device);
+            auto destination = strided ? backing.slice(1, 1, 3) : backing.slice(0, 1, 3);
+            const auto source = Tensor::ones(destination.shape(), device);
+            destination = source;
+            EXPECT_EQ(destination.storage_ptr(), source.storage_ptr());
+            EXPECT_NE(destination.storage_ptr(), backing.storage_ptr());
+            EXPECT_EQ(backing.to_vector(), std::vector<float>(16, 0.0f));
+            destination.fill_(7.0f);
+            EXPECT_EQ(source.to_vector(), std::vector<float>(8, 7.0f));
+        }
+    }
+}
+
+TEST(TensorAssignmentTest, MoveIntoViewStealsSourceAndEmptiesIt) {
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        auto backing = Tensor::zeros({4, 4}, device);
+        auto destination = backing.slice(1, 1, 3);
+        const auto source_backing = Tensor::ones({4, 6}, device);
+        auto source = source_backing.slice(1, 2, 4);
+        const auto source_offset = source.storage_offset();
+        const auto source_strides = source.strides();
+        destination = std::move(source);
+        EXPECT_EQ(destination.storage_ptr(), source_backing.storage_ptr());
+        EXPECT_EQ(destination.storage_offset(), source_offset);
+        EXPECT_EQ(destination.strides(), source_strides);
+        EXPECT_FALSE(source.is_valid());
+        EXPECT_EQ(source.ndim(), 0u);
+        EXPECT_EQ(backing.to_vector(), std::vector<float>(16, 0.0f));
+        EXPECT_EQ(destination.to_vector(), std::vector<float>(8, 1.0f));
+    }
+}
+
+TEST(TensorAssignmentTest, CopyFromWritesIntoContiguousAndStridedViews) {
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        for (const bool strided : {false, true}) {
+            auto backing = Tensor::zeros({4, 4}, device);
+            auto destination = strided ? backing.slice(1, 1, 3) : backing.slice(0, 1, 3);
+            const auto source = Tensor::ones(destination.shape(), device);
+            destination.copy_from(source);
+            EXPECT_EQ(destination.storage_ptr(), backing.storage_ptr());
+            EXPECT_NE(destination.storage_ptr(), source.storage_ptr());
+            const auto values = backing.to_vector();
+            for (size_t row = 0; row < 4; ++row) {
+                for (size_t column = 0; column < 4; ++column) {
+                    const bool selected = strided ? column == 1 || column == 2 : row == 1 || row == 2;
+                    EXPECT_FLOAT_EQ(values[row * 4 + column], selected ? 1.0f : 0.0f);
+                }
+            }
+        }
+    }
+}
+
+TEST(TensorAssignmentTest, CopyPreservesSourceViewMetadataAndSelfAssignment) {
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        auto backing = Tensor::zeros({4, 4}, device);
+        auto destination = backing.slice(1, 1, 3);
+        const auto source_backing = Tensor::ones({4, 6}, device);
+        const auto source = source_backing.slice(1, 2, 4);
+        destination = source;
+        EXPECT_EQ(destination.storage_ptr(), source_backing.storage_ptr());
+        EXPECT_EQ(destination.storage_offset(), source.storage_offset());
+        EXPECT_EQ(destination.strides(), source.strides());
+        EXPECT_EQ(destination.is_view(), source.is_view());
+        auto& alias = destination;
+        destination = alias;
+        destination = std::move(alias);
+        EXPECT_EQ(destination.storage_ptr(), source_backing.storage_ptr());
+        EXPECT_EQ(destination.to_vector(), std::vector<float>(8, 1.0f));
+        EXPECT_EQ(backing.to_vector(), std::vector<float>(16, 0.0f));
+    }
+}
+
+TEST(TensorAssignmentTest, CrossDeviceAssignmentRebindsWithoutCopyingIntoHostView) {
+    auto backing = Tensor::zeros({4}, Device::CPU);
+    auto destination = backing.slice(0, 0, 4);
+    const auto source = Tensor::ones({4}, Device::CUDA);
+    destination = source;
+    EXPECT_EQ(destination.device(), source.device());
+    EXPECT_EQ(destination.storage_ptr(), source.storage_ptr());
+    EXPECT_EQ(backing.to_vector(), std::vector<float>(4, 0.0f));
+    destination = Tensor{};
+    EXPECT_FALSE(destination.is_valid());
+    EXPECT_TRUE(source.is_valid());
 }

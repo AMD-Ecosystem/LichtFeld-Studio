@@ -4,6 +4,8 @@
 
 #include "gui/rmlui/rml_panel_host.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
+#include "core/path_utils.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
 #include "gui/rmlui/rml_input_utils.hpp"
@@ -11,14 +13,19 @@
 #include "gui/rmlui/rml_theme.hpp"
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
-#include "gui/ui_widgets.hpp"
+#include "input/sdl_coordinate_utils.hpp"
 #include "internal/resource_paths.hpp"
 #include "theme/theme.hpp"
+#include "visualizer/app_store.hpp"
+#include "visualizer/preferences.hpp"
+#include "window/window_state_utils.hpp"
+#include <SDL3/SDL.h>
 
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
+#include <RmlUi/Core/Elements/ElementFormControlSelect.h>
 #include <RmlUi/Core/Input.h>
 #include <SDL3/SDL_keyboard.h>
 #include <algorithm>
@@ -28,7 +35,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <format>
-#include <imgui_internal.h>
+#include <limits>
 #include <string_view>
 #include <unordered_set>
 
@@ -84,17 +91,51 @@ namespace lfs::vis::gui {
                                  h - bottom_left);
         }
 
-        float maxCornerRadius(const Rml::CornerSizes& radii) {
-            return std::max({radii[0], radii[1], radii[2], radii[3]});
+        bool pointInRmlRect(const RmlRect& rect, const float x, const float y) {
+            return x >= rect.x1 && y >= rect.y1 && x < rect.x2 && y < rect.y2;
+        }
+
+        std::optional<RmlRect> elementBorderRect(Rml::Element* const element) {
+            if (!element)
+                return std::nullopt;
+
+            const auto size = element->GetBox().GetSize(Rml::BoxArea::Border);
+            if (size.x <= 0.0f || size.y <= 0.0f)
+                return std::nullopt;
+
+            const auto pos = element->GetAbsoluteOffset(Rml::BoxArea::Border);
+            return RmlRect{
+                .x1 = pos.x,
+                .y1 = pos.y,
+                .x2 = pos.x + size.x,
+                .y2 = pos.y + size.y,
+            };
+        }
+
+        Rml::Element* selectboxElement(Rml::ElementFormControlSelect* const select) {
+            if (!select)
+                return nullptr;
+
+            for (int i = 0; i < select->GetNumChildren(true); ++i) {
+                auto* const child = select->GetChild(i);
+                if (child && child->GetTagName() == "selectbox")
+                    return child;
+            }
+            return nullptr;
+        }
+
+        Rml::ElementFormControlSelect* asOpenSelect(Rml::Element* const element) {
+            auto* const select = dynamic_cast<Rml::ElementFormControlSelect*>(element);
+            return (select && select->IsSelectBoxVisible()) ? select : nullptr;
         }
 
         std::filesystem::path resolveDocumentPath(const std::string& rml_path) {
-            const auto requested_path = std::filesystem::path(rml_path);
+            const auto requested_path = lfs::core::utf8_to_path(rml_path);
             return requested_path.is_absolute() ? requested_path : lfs::vis::getAssetPath(rml_path);
         }
 
         bool isThemeProvidedStaticStylesheet(const std::filesystem::path& rcss_path) {
-            const auto filename = rcss_path.filename().string();
+            const auto filename = lfs::core::path_to_utf8(rcss_path.filename());
             return filename == "components.rcss" || filename == "font_fallback.rcss";
         }
 
@@ -106,14 +147,14 @@ namespace lfs::vis::gui {
 
             const auto normalized_path = rcss_path.lexically_normal();
             std::error_code ec;
-            if (!std::filesystem::exists(normalized_path, ec))
+            if (!lfs::core::native_fs::exists(normalized_path, ec))
                 return;
 
-            const std::string key = normalized_path.generic_string();
+            const std::string key = lfs::core::path_to_generic_utf8(normalized_path);
             if (!loaded_paths.insert(key).second)
                 return;
 
-            const std::string rcss = rml_theme::loadBaseRCSS(normalized_path.string());
+            const std::string rcss = rml_theme::loadBaseRCSS(lfs::core::path_to_utf8(normalized_path));
             if (rcss.empty())
                 return;
 
@@ -140,6 +181,24 @@ namespace lfs::vis::gui {
         }
         rml_context_ = nullptr;
         document_ = nullptr;
+    }
+
+    void RmlPanelHost::releaseRendererResources() {
+        if (manager_ && manager_->isInitialized())
+            manager_->releaseCachedVulkanContext(direct_cache_);
+        direct_cache_dirty_ = true;
+    }
+
+    void RmlPanelHost::setFloating(const bool floating) {
+        if (floating_ == floating)
+            return;
+
+        floating_ = floating;
+        last_layout_padding_ = -1;
+        render_needed_ = true;
+        content_dirty_ = true;
+        direct_cache_dirty_ = true;
+        applyPanelSpaceClass();
     }
 
     bool RmlPanelHost::syncThemeProperties() {
@@ -181,15 +240,16 @@ namespace lfs::vis::gui {
             auto theme_path = resolveDocumentPath(rml_path_);
             theme_path.replace_extension(".theme.rcss");
             std::error_code ec;
-            if (std::filesystem::exists(theme_path, ec)) {
+            if (lfs::core::native_fs::exists(theme_path, ec)) {
                 if (!panel_theme.empty())
                     panel_theme += "\n";
-                panel_theme += rml_theme::loadBaseRCSS(theme_path.string());
+                panel_theme += rml_theme::loadBaseRCSS(lfs::core::path_to_utf8(theme_path));
             }
         } catch (const std::exception&) {
             // Sibling theme files are optional; missing ones should not produce startup noise.
         }
 
+        LOG_TIMER_THRESHOLD(context_name_ + ".rml_theme_apply", 2.0);
         rml_theme::applyTheme(document_, base_rcss_, panel_theme);
         content_dirty_ = true;
         direct_cache_dirty_ = true;
@@ -199,12 +259,63 @@ namespace lfs::vis::gui {
     bool RmlPanelHost::ensureContext() {
         if (rml_context_)
             return true;
-        rml_context_ = manager_->createContext(context_name_, 100, 100);
+        rml_context_ = manager_->createContext(context_name_, 100, 100, desktop_requested_);
+        if (auto* native = nativeWindow()) {
+            SDL_SetWindowPosition(native, static_cast<int>(desktop_bounds_[0]), static_cast<int>(desktop_bounds_[1]));
+            SDL_SetWindowSize(native, static_cast<int>(desktop_bounds_[2]), static_cast<int>(desktop_bounds_[3]));
+        }
         return rml_context_ != nullptr;
     }
 
+    bool RmlPanelHost::configureExternal(float x, float y, float w, float h, bool desktop_coordinates) {
+        if (rml_context_ || !externalAllowed() || w <= 0 || h <= 0)
+            return false;
+        if (!desktop_coordinates) {
+            auto* main = manager_->mainWindow();
+            int px = 0, py = 0;
+            SDL_GetWindowPosition(main, &px, &py);
+            const auto scale = input::windowPixelScale(main);
+            x = px + x / scale.x;
+            y = py + y / scale.y;
+            w /= scale.x;
+            h /= scale.y;
+        }
+        desktop_bounds_[0] = x;
+        desktop_bounds_[1] = y;
+        desktop_bounds_[2] = w;
+        desktop_bounds_[3] = h;
+        desktop_requested_ = true;
+        return true;
+    }
+
     bool RmlPanelHost::ensureDocumentLoaded() {
-        return ensureContext() && loadDocument();
+        if (!ensureContext() || !loadDocument())
+            return false;
+        syncLocalizedContent();
+        return true;
+    }
+
+    SDL_Window* RmlPanelHost::nativeWindow() const {
+        return manager_ ? manager_->nativeWindow(rml_context_) : nullptr;
+    }
+
+    bool RmlPanelHost::nativeDragActive() const {
+        auto* window = nativeWindow();
+        return window && SDL_GetBooleanProperty(SDL_GetWindowProperties(window), "lfs.drag_handoff", false);
+    }
+
+    // The cached panel texture survives a language switch, so the document has to be
+    // re-translated and re-rendered from the host that owns that texture.
+    void RmlPanelHost::syncLocalizedContent() {
+        const auto generation = app_store().language_generation.get();
+        if (generation == localized_language_generation_)
+            return;
+
+        localized_language_generation_ = generation;
+        rml_documents::refreshLocalizedContent(document_);
+        content_dirty_ = true;
+        direct_cache_dirty_ = true;
+        render_needed_ = true;
     }
 
     bool RmlPanelHost::reloadDocument() {
@@ -212,6 +323,12 @@ namespace lfs::vis::gui {
             return false;
 
         const float scroll_top = scroll_el_ ? scroll_el_->GetScrollTop() : 0.0f;
+        // Element pointers belong to the current document. Never retain them
+        // across UnloadDocument(), where they immediately become dangling.
+        live_inspector_resize_target_ = nullptr;
+        close_button_ = nullptr;
+        close_button_bound_ = false;
+        resize_cursor_override_.clear();
         if (document_) {
             rml_context_->UnloadDocument(document_);
             rml_context_->Update();
@@ -234,9 +351,14 @@ namespace lfs::vis::gui {
             manager_->releaseCachedVulkanContext(direct_cache_);
         last_forwarded_mx_ = -1;
         last_forwarded_my_ = -1;
+        last_forwarded_mods_ = 0;
         last_hovered_ = false;
+        manual_dropdown_hover_ = nullptr;
+        manual_dropdown_mouse_captured_ = false;
         for (auto& captured : mouse_captured_)
             captured = false;
+        for (auto& pressed : pointer_press_target_)
+            pressed.reset();
 
         if (!loadDocument())
             return false;
@@ -250,21 +372,23 @@ namespace lfs::vis::gui {
         if (document_)
             return true;
         try {
-            const auto requested_path = std::filesystem::path(rml_path_);
+            const auto requested_path = lfs::core::utf8_to_path(rml_path_);
             const auto full_path = requested_path.is_absolute()
                                        ? requested_path
                                        : lfs::vis::getAssetPath(rml_path_);
+            LOG_TIMER_THRESHOLD(context_name_ + ".rml_document_load", 2.0);
             document_ = rml_documents::loadDocument(rml_context_, full_path);
             if (document_) {
                 syncThemeProperties();
                 document_->Show();
                 cacheContentElements();
+                applyPanelSpaceClass();
                 render_needed_ = true;
             } else {
                 LOG_ERROR("RmlUI: failed to load {}", rml_path_);
             }
         } catch (const std::exception& e) {
-            LOG_ERROR("RmlUI: resource not found: {}", e.what());
+            LOG_ERROR("RmlUI: failed to load {}: {}", rml_path_, e.what());
         }
         return document_ != nullptr;
     }
@@ -275,6 +399,21 @@ namespace lfs::vis::gui {
         content_wrap_el_ = frame_el_ ? frame_el_ : document_->GetElementById("content-wrap");
         content_el_ = document_->GetElementById("content");
         scroll_el_ = document_->GetElementById("content-wrap");
+    }
+
+    int RmlPanelHost::renderPadding() const {
+        if (!floating_ || !manager_ || nativeWindow())
+            return 0;
+        return static_cast<int>(std::ceil(
+            rml_theme::layeredShadowPadding(lfs::vis::theme(), 4) *
+            manager_->getDpRatio()));
+    }
+
+    void RmlPanelHost::applyPanelSpaceClass() {
+        if (document_)
+            document_->SetClass("floating-panel", floating_);
+        if (document_)
+            document_->SetClass("native-panel", nativeWindow() != nullptr);
     }
 
     float RmlPanelHost::computeScrollHeightCap() const {
@@ -305,9 +444,12 @@ namespace lfs::vis::gui {
 
     float RmlPanelHost::computeContentHeight() const {
         if (content_el_) {
+            const float root_y = frame_el_
+                                     ? frame_el_->GetAbsoluteOffset(Rml::BoxArea::Border).y
+                                     : document_->GetAbsoluteOffset(Rml::BoxArea::Border).y;
             const float chrome_above =
                 content_el_->GetAbsoluteOffset(Rml::BoxArea::Border).y -
-                document_->GetAbsoluteOffset(Rml::BoxArea::Border).y;
+                root_y;
             float chrome_below = 0.0f;
             if (scroll_el_)
                 chrome_below = scroll_el_->GetBox().GetEdge(Rml::BoxArea::Padding, Rml::BoxEdge::Bottom);
@@ -317,7 +459,7 @@ namespace lfs::vis::gui {
             if (scroll_height_cap > 0.0f && scroll_el_) {
                 const float chrome_above_scroll =
                     scroll_el_->GetAbsoluteOffset(Rml::BoxArea::Border).y -
-                    document_->GetAbsoluteOffset(Rml::BoxArea::Border).y;
+                    root_y;
                 measured = std::min(measured, chrome_above_scroll + scroll_height_cap);
             }
 
@@ -347,6 +489,18 @@ namespace lfs::vis::gui {
     }
 
     void RmlPanelHost::syncDirectLayout(float w, float h) {
+        if (auto* native = nativeWindow()) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(native, &pw, &ph);
+            w = static_cast<float>(pw);
+            h = static_cast<float>(ph);
+            const float preference = SDL_GetFloatProperty(SDL_GetWindowProperties(native), "lfs.ui_scale", 0.0f);
+            const float ratio = preference > 0 ? preference : std::max(1.0f, SDL_GetWindowDisplayScale(native));
+            if (rml_context_->GetDensityIndependentPixelRatio() != ratio) {
+                rml_context_->SetDensityIndependentPixelRatio(ratio);
+                markContentDirty();
+            }
+        }
         if (w <= 0 || h <= 0)
             return;
 
@@ -360,9 +514,11 @@ namespace lfs::vis::gui {
         float display_h = 0.0f;
         resolveDirectRenderHeight(h, ph, display_h);
 
-        const bool size_dirty = (pw != last_layout_w_ || ph != last_layout_h_);
+        const bool size_dirty =
+            pw != last_layout_w_ || ph != last_layout_h_ ||
+            renderPadding() != last_layout_padding_;
         const bool need_layout =
-            theme_dirty || size_dirty || content_dirty_ || render_needed_ || animation_active_;
+            theme_dirty || size_dirty || content_dirty_ || render_needed_ || animation_active_ || scheduledUpdateDue();
         if (!need_layout)
             return;
 
@@ -383,10 +539,17 @@ namespace lfs::vis::gui {
     }
 
     bool RmlPanelHost::updateContextLayout(const int pw, const int ph) {
-        const bool dims_changed = (pw != last_layout_w_ || ph != last_layout_h_);
-        if (dims_changed)
-            rml_context_->SetDimensions(Rml::Vector2i(pw, ph));
-        if (!dims_changed && !content_dirty_ && !render_needed_ && !animation_active_)
+        const int padding = renderPadding();
+        const bool dims_changed =
+            pw != last_layout_w_ || ph != last_layout_h_ ||
+            padding != last_layout_padding_;
+        if (dims_changed) {
+            rml_context_->SetDimensions(
+                Rml::Vector2i(pw + 2 * padding, ph + 2 * padding));
+            applyPanelSpaceClass();
+            last_layout_padding_ = padding;
+        }
+        if (!dims_changed && !content_dirty_ && !render_needed_ && !animation_active_ && !scheduledUpdateDue())
             return false;
         rml_context_->Update();
         last_layout_w_ = pw;
@@ -399,21 +562,27 @@ namespace lfs::vis::gui {
             return;
 
         const bool theme_dirty = syncThemeProperties();
-        const bool size_dirty = (pw != last_fbo_w_ || ph != last_fbo_h_);
+        const int padding = renderPadding();
+        const bool size_dirty =
+            pw != last_fbo_w_ || ph != last_fbo_h_ ||
+            padding != last_fbo_padding_;
         const bool externally_clipped =
             (clip_y_min_ >= 0.0f && clip_y_max_ > clip_y_min_);
 
         const bool dirty = render_needed_ || content_dirty_ || theme_dirty ||
-                           size_dirty || animation_active_;
+                           size_dirty || animation_active_ || scheduledUpdateDue();
         if (!dirty)
             return;
         direct_cache_dirty_ = true;
+        const bool needs_post_layout_update =
+            content_dirty_ || render_needed_ || theme_dirty || size_dirty;
 
         const bool need_content_measure =
             height_mode_ == PanelHeightMode::Content &&
             (pw != last_measure_w_ || ph != last_layout_h_ || content_dirty_ ||
              last_content_height_ <= 0.0f);
         const float saved_scroll = scroll_el_ ? scroll_el_->GetScrollTop() : 0.0f;
+        float converged_content_h = last_content_height_;
 
         if (need_content_measure) {
             last_measure_w_ = pw;
@@ -429,11 +598,18 @@ namespace lfs::vis::gui {
             layout_h = std::clamp(layout_h, 1, kMaxFboSize);
 
             float content_h = 0.0f;
-            for (int pass = 0; pass < 3; ++pass) {
+            float previous_content_h = -1.0f;
+            bool content_height_settled = false;
+            for (int pass = 0; pass < 8; ++pass) {
                 const bool dims_changed =
-                    (pw != last_layout_w_ || layout_h != last_layout_h_);
-                if (dims_changed)
-                    rml_context_->SetDimensions(Rml::Vector2i(pw, layout_h));
+                    pw != last_layout_w_ || layout_h != last_layout_h_ ||
+                    padding != last_layout_padding_;
+                if (dims_changed) {
+                    rml_context_->SetDimensions(
+                        Rml::Vector2i(pw + 2 * padding, layout_h + 2 * padding));
+                    applyPanelSpaceClass();
+                    last_layout_padding_ = padding;
+                }
                 rml_context_->Update();
                 last_layout_w_ = pw;
                 last_layout_h_ = layout_h;
@@ -441,13 +617,17 @@ namespace lfs::vis::gui {
 
                 const int measured = std::clamp(
                     static_cast<int>(std::ceil(content_h)), 1, kMaxFboSize);
-                if (measured <= layout_h || layout_h == kMaxFboSize)
+                content_height_settled = previous_content_h >= 0.0f &&
+                                         std::abs(content_h - previous_content_h) <= 2.0f;
+                if (content_height_settled || layout_h == kMaxFboSize)
                     break;
 
+                previous_content_h = content_h;
                 layout_h = measured;
             }
 
             last_content_height_ = content_h;
+            converged_content_h = content_h;
             if (content_el_)
                 last_content_el_height_ = content_el_->GetOffsetHeight();
             const int measured = std::clamp(
@@ -473,29 +653,79 @@ namespace lfs::vis::gui {
             restoreScrollTop(saved_scroll);
         }
 
+        // A data-model update can move a resize handle without any physical
+        // mouse motion. Re-hit-test the settled layout so RmlUi republishes the
+        // cursor belonging to the element now under the pointer.
+        if (last_hovered_ && last_forwarded_mx_ >= 0 && last_forwarded_my_ >= 0)
+            rml_context_->ProcessMouseMove(last_forwarded_mx_, last_forwarded_my_,
+                                           last_forwarded_mods_);
+
+        if (needs_post_layout_update)
+            rml_context_->Update();
+
         content_dirty_ = false;
         if (height_mode_ != PanelHeightMode::Content)
             last_content_height_ = display_h;
 
-        animation_active_ = (rml_context_->GetNextUpdateDelay() == 0);
+        const double next_delay = rml_context_->GetNextUpdateDelay();
+        next_update_delay_ = next_delay;
+        next_update_at_.reset();
+        if (std::isfinite(next_delay) && next_delay > 0.0) {
+            next_update_at_ = std::chrono::steady_clock::now() +
+                              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                  std::chrono::duration<double>(next_delay));
+        }
+        animation_active_ = (next_delay == 0.0);
         last_fbo_w_ = pw;
         last_fbo_h_ = ph;
+        last_fbo_padding_ = padding;
         render_needed_ = false;
 
         if (height_mode_ == PanelHeightMode::Content) {
-            const float prev_content_h = last_content_height_;
             const float actual_content_h = computeContentHeight();
             last_content_height_ = actual_content_h;
 
             if (content_el_)
                 last_content_el_height_ = content_el_->GetOffsetHeight();
 
-            if (std::abs(actual_content_h - prev_content_h) > 2.0f) {
-                content_dirty_ = true;
-                direct_cache_dirty_ = true;
-                last_measure_w_ = 0;
+            if (std::abs(actual_content_h - converged_content_h) > 2.0f) {
+                ++content_height_rearm_count_;
+                if (content_height_rearm_count_ > 8) {
+                    if (!content_height_rearm_warned_) {
+                        content_height_rearm_warned_ = true;
+                        LOG_WARN("RmlPanelHost '{}': content-height settle exceeded 8 re-arms "
+                                 "(pw={}, ph={}, prev_h={:.1f}, actual_h={:.1f}); skipping re-arm",
+                                 context_name_, pw, ph, converged_content_h, actual_content_h);
+                    }
+                } else {
+                    content_dirty_ = true;
+                    direct_cache_dirty_ = true;
+                    last_measure_w_ = 0;
+                    content_height_settling_ = true;
+                }
+            } else {
+                content_height_rearm_count_ = 0;
+                content_height_rearm_warned_ = false;
+                content_height_settling_ = false;
             }
         }
+    }
+
+    std::optional<double> RmlPanelHost::nextScheduledUpdateDelay() const {
+        if (next_update_at_)
+            return std::max(0.0, std::chrono::duration<double>(
+                                     *next_update_at_ - std::chrono::steady_clock::now())
+                                     .count());
+        return std::nullopt;
+    }
+
+    std::string RmlPanelHost::animationDemandDescription() const {
+        if (!document_ || !needsAnimationFrame())
+            return {};
+        return std::format(
+            "document={},content_dirty={},render_needed={},animation_active={},tooltip_due={},rml_delay={}",
+            rml_path_, content_dirty_, render_needed_, animation_active_,
+            tooltip_.revealDue(), next_update_delay_);
     }
 
     void RmlPanelHost::draw(const PanelDrawContext& ctx) {
@@ -530,47 +760,36 @@ namespace lfs::vis::gui {
         applyHoverTooltip(w, pos_y, display_h);
 
         renderIfDirty(w, h, display_h);
+        trackFrame(pos_x, pos_y);
 
-        const ImVec2 panel_screen_pos = ImGui::GetCursorScreenPos();
         if (!manager_ || !manager_->getVulkanRenderInterface())
             return;
 
-        const auto* vp = ImGui::GetMainViewport();
-        const float screen_x = vp ? vp->Pos.x : 0.0f;
-        const float screen_y = vp ? vp->Pos.y : 0.0f;
-        const ImVec2 clip_min = ImGui::GetWindowDrawList()->GetClipRectMin();
-        const ImVec2 clip_max = ImGui::GetWindowDrawList()->GetClipRectMax();
-        const float clip_x1 = std::max(clip_min.x, panel_screen_pos.x);
-        const float clip_y1 = std::max(clip_min.y, panel_screen_pos.y);
-        const float clip_x2 = std::min(clip_max.x, panel_screen_pos.x + avail_w);
-        const float clip_y2 = std::min(clip_max.y, panel_screen_pos.y + display_h);
-        ImGui::Dummy(ImVec2(avail_w, display_h));
+        const float screen_origin_x = input_ ? input_->screen_x : 0.0f;
+        const float screen_origin_y = input_ ? input_->screen_y : 0.0f;
+        const float clip_x1 = pos_x;
+        const float clip_y1 = pos_y;
+        const float clip_x2 = pos_x + avail_w;
+        const float clip_y2 = pos_y + display_h;
         if (clip_x2 <= clip_x1 || clip_y2 <= clip_y1)
             return;
         manager_->queueVulkanContext(rml_context_,
-                                     panel_screen_pos.x - screen_x,
-                                     panel_screen_pos.y - screen_y,
+                                     pos_x - screen_origin_x,
+                                     pos_y - screen_origin_y,
                                      foreground_,
                                      true,
-                                     clip_x1 - screen_x,
-                                     clip_y1 - screen_y,
-                                     clip_x2 - screen_x,
-                                     clip_y2 - screen_y);
-        if (auto* popup_vp = ImGui::GetMainViewport()) {
-            const auto popup_shadow =
-                collectVisibleColorPickerPopupShadow(panel_screen_pos.x, panel_screen_pos.y);
-            if (popup_shadow) {
-                const auto& shadow = *popup_shadow;
-                auto* fg = ImGui::GetForegroundDrawList(popup_vp);
-                widgets::DrawPopoverShadowOverlay(fg,
-                                                  {shadow.x, shadow.y},
-                                                  {shadow.w, shadow.h},
-                                                  shadow.rounding);
-            }
-        }
+                                     clip_x1 - screen_origin_x,
+                                     clip_y1 - screen_origin_y,
+                                     clip_x2 - screen_origin_x,
+                                     clip_y2 - screen_origin_y);
     }
 
     void RmlPanelHost::resolveDirectRenderHeight(float requested_h, int& ph, float& display_h) const {
+        if (nativeWindow()) {
+            ph = std::clamp(static_cast<int>(requested_h), 1, kMaxFboSize);
+            display_h = static_cast<float>(ph);
+            return;
+        }
         if (height_mode_ == PanelHeightMode::Content) {
             const float ch = last_content_height_;
             if (ch > 0 && requested_h < ch) {
@@ -610,6 +829,15 @@ namespace lfs::vis::gui {
         if (!ensureDocumentLoaded())
             return;
 
+        auto* native = nativeWindow();
+        if (native) {
+            const float density = SDL_GetWindowPixelDensity(native);
+            const auto properties = SDL_GetWindowProperties(native);
+            SDL_SetNumberProperty(properties, "lfs.default_width", static_cast<int>(std::ceil(w / density)));
+            SDL_SetNumberProperty(properties, "lfs.default_height", static_cast<int>(std::ceil(h / density)));
+            syncDirectLayout(w, h);
+        }
+
         const int pw = static_cast<int>(w);
         int ph = 0;
         float display_h = 0.0f;
@@ -624,6 +852,10 @@ namespace lfs::vis::gui {
 
         if (!ensureDocumentLoaded())
             return;
+        if (nativeWindow()) {
+            syncDirectLayout(w, h);
+            manager_->showNativeWindow(rml_context_);
+        }
 
         const int pw = static_cast<int>(w);
         int ph;
@@ -635,17 +867,27 @@ namespace lfs::vis::gui {
         applyHoverTooltip(pw, y, display_h);
 
         renderIfDirty(pw, ph, display_h);
+        trackFrame(x, y);
         compositeDirectToScreen(x, y, w, display_h);
     }
 
     bool RmlPanelHost::drawDirectCached(float x, float y, float w, float h) {
         if (w <= 0 || h <= 0)
             return false;
+        if (nativeWindow())
+            syncDirectLayout(w, h);
         if (!document_ || !rml_context_ || last_fbo_w_ <= 0 || last_fbo_h_ <= 0)
+            return false;
+        forwardInput(x, y);
+        if (render_needed_ || content_dirty_ || animation_active_ || scheduledUpdateDue() || tooltip_.revealDue())
+            return false;
+        if (!has_theme_signature_ || rml_theme::currentThemeSignature() != last_theme_signature_)
             return false;
 
         const int pw = static_cast<int>(w);
         if (pw != last_fbo_w_)
+            return false;
+        if (renderPadding() != last_fbo_padding_)
             return false;
 
         int ph = 0;
@@ -654,71 +896,207 @@ namespace lfs::vis::gui {
         if (ph <= 0 || display_h <= 0.0f || ph > last_fbo_h_)
             return false;
 
+        trackFrame(x, y);
+
+        if (input_ &&
+            rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()) &&
+            (input_->mouse_clicked[0] || input_->viewport_keyboard_focus)) {
+            return false;
+        }
+
+        if (input_ && manager_ &&
+            manager_->activeOverlayOccludesContext(rml_context_, input_->mouse_x, input_->mouse_y)) {
+            compositeDirectToScreen(x, y, w, display_h);
+            return true;
+        }
+
+        const auto dropdown_bounds = openDropdownBounds();
+        if ((tooltip_.hasActiveState() || dropdown_bounds) && input_) {
+            const float local_x = input_->mouse_x - x + last_fbo_padding_;
+            const float local_y = input_->mouse_y - y + last_fbo_padding_;
+            const bool dropdown_hovered =
+                dropdown_bounds && pointInRmlRect(*dropdown_bounds, local_x, local_y);
+            bool hovered = dropdown_hovered ||
+                           hitTestPanelShape(local_x, local_y,
+                                             static_cast<float>(last_fbo_w_),
+                                             static_cast<float>(last_fbo_h_));
+
+            if (!dropdown_hovered &&
+                hovered && clip_y_min_ >= 0.0f && clip_y_max_ > clip_y_min_) {
+                if (input_->mouse_y < clip_y_min_ || input_->mouse_y > clip_y_max_)
+                    hovered = false;
+            }
+
+            const bool any_capture =
+                manual_dropdown_mouse_captured_ ||
+                mouse_captured_[0] || mouse_captured_[1] || mouse_captured_[2];
+            const bool effective_hovered = hovered || any_capture;
+            const int rml_mx = static_cast<int>(local_x);
+            const int rml_my = static_cast<int>(local_y);
+            const bool pointer_event =
+                input_->mouse_clicked[0] || input_->mouse_released[0] ||
+                input_->mouse_clicked[1] || input_->mouse_released[1] ||
+                input_->mouse_wheel != 0.0f;
+
+            if (pointer_event ||
+                effective_hovered != last_hovered_ ||
+                (effective_hovered &&
+                 (rml_mx != last_forwarded_mx_ || rml_my != last_forwarded_my_))) {
+                return false;
+            }
+        }
+
         compositeDirectToScreen(x, y, w, display_h);
         return true;
     }
 
-    std::optional<RmlPanelHost::ShadowRect> RmlPanelHost::collectVisibleColorPickerPopupShadow(
-        const float panel_screen_x, const float panel_screen_y) const {
+    std::optional<RmlRect> RmlPanelHost::openDropdownBounds() const {
         if (!document_)
             return std::nullopt;
 
-        auto* popup = document_->GetElementById("color-picker-popup");
-        if (!popup || !popup->IsClassSet("visible"))
-            return std::nullopt;
+        Rml::ElementList selects;
+        document_->GetElementsByTagName(selects, "select");
+        for (auto* const element : selects) {
+            auto* const select = asOpenSelect(element);
+            if (!select)
+                continue;
 
-        float popup_x = 0.0f;
-        float popup_y = 0.0f;
-        float popup_w = 0.0f;
-        float popup_h = 0.0f;
+            if (auto bounds = elementBorderRect(selectboxElement(select)))
+                return bounds;
+        }
 
-        if (auto* picker = popup->GetElementById("color-picker-el")) {
-            const auto picker_size = picker->GetBox().GetSize(Rml::BoxArea::Border);
-            if (picker_size.x > 0.0f && picker_size.y > 0.0f) {
-                const auto picker_pos = picker->GetAbsoluteOffset(Rml::BoxArea::Border);
-                const auto& popup_box = popup->GetBox();
-                const float extra_left =
-                    popup_box.GetEdge(Rml::BoxArea::Padding, Rml::BoxEdge::Left) +
-                    popup_box.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Left);
-                const float extra_top =
-                    popup_box.GetEdge(Rml::BoxArea::Padding, Rml::BoxEdge::Top) +
-                    popup_box.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Top);
-                const float extra_right =
-                    popup_box.GetEdge(Rml::BoxArea::Padding, Rml::BoxEdge::Right) +
-                    popup_box.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Right);
-                const float extra_bottom =
-                    popup_box.GetEdge(Rml::BoxArea::Padding, Rml::BoxEdge::Bottom) +
-                    popup_box.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Bottom);
+        return std::nullopt;
+    }
 
-                popup_x = picker_pos.x - extra_left;
-                popup_y = picker_pos.y - extra_top;
-                popup_w = picker_size.x + extra_left + extra_right;
-                popup_h = picker_size.y + extra_top + extra_bottom;
+    bool RmlPanelHost::openDropdownContainsPoint(const float local_x,
+                                                 const float local_y) const {
+        const auto bounds = openDropdownBounds();
+        return bounds && pointInRmlRect(*bounds, local_x, local_y);
+    }
+
+    Rml::Element* RmlPanelHost::openDropdownOptionAtPoint(const float local_x,
+                                                          const float local_y) const {
+        if (!document_)
+            return nullptr;
+
+        Rml::ElementList selects;
+        document_->GetElementsByTagName(selects, "select");
+        for (auto* const element : selects) {
+            auto* const select = asOpenSelect(element);
+            if (!select)
+                continue;
+
+            auto* const selectbox = selectboxElement(select);
+            const auto box_rect = elementBorderRect(selectbox);
+            if (!box_rect || !pointInRmlRect(*box_rect, local_x, local_y))
+                continue;
+
+            for (int i = select->GetNumOptions() - 1; i >= 0; --i) {
+                auto* const option = select->GetOption(i);
+                const auto option_rect = elementBorderRect(option);
+                if (!option_rect)
+                    continue;
+
+                if (pointInRmlRect(*option_rect, local_x, local_y))
+                    return option;
             }
+
+            return selectbox;
         }
 
-        if (popup_w <= 0.0f || popup_h <= 0.0f) {
-            const auto popup_size = popup->GetBox().GetSize(Rml::BoxArea::Border);
-            if (popup_size.x <= 0.0f || popup_size.y <= 0.0f)
-                return std::nullopt;
+        return nullptr;
+    }
 
-            const auto popup_pos = popup->GetAbsoluteOffset(Rml::BoxArea::Border);
-            popup_x = popup_pos.x;
-            popup_y = popup_pos.y;
-            popup_w = popup_size.x;
-            popup_h = popup_size.y;
+    void RmlPanelHost::setManualDropdownHover(Rml::Element* const option) {
+        if (manual_dropdown_hover_ == option)
+            return;
+
+        if (manual_dropdown_hover_)
+            manual_dropdown_hover_->SetPseudoClass("hover", false);
+        manual_dropdown_hover_ = option;
+        if (manual_dropdown_hover_)
+            manual_dropdown_hover_->SetPseudoClass("hover", true);
+    }
+
+    void RmlPanelHost::updateResizeCursorOverride(const bool pointer_over_panel) {
+        // RmlPanelHost can reuse a cached render while the pointer is still.
+        // Persist the resize request explicitly so the frame-level cursor reset
+        // cannot erase it after the single hover transition that selected it.
+        if (mouse_captured_[0] && !resize_cursor_override_.empty())
+            return;
+
+        resize_cursor_override_.clear();
+        if (!pointer_over_panel || !rml_context_)
+            return;
+
+        for (auto* element = rml_context_->GetHoverElement(); element;
+             element = element->GetParentNode()) {
+            const auto region = element->GetAttribute<Rml::String>("data-resize", "");
+            if (region.empty())
+                continue;
+            resize_cursor_override_ = region == "inspector-height"
+                                          ? "resize-vertical"
+                                          : "resize-horizontal";
+            return;
         }
+    }
 
-        if (popup_w <= 0.0f || popup_h <= 0.0f)
-            return std::nullopt;
+    void RmlPanelHost::beginLiveInspectorResize(const float mouse_y) {
+        if (!rml_context_)
+            return;
+        for (auto* element = rml_context_->GetHoverElement(); element;
+             element = element->GetParentNode()) {
+            if (element->GetAttribute<Rml::String>("data-resize", "") != "inspector-height")
+                continue;
+            live_inspector_resize_target_ = document_
+                                                ? document_->GetElementById("asset-inspector")
+                                                : nullptr;
+            if (!live_inspector_resize_target_)
+                return;
+            live_inspector_resize_start_y_ = mouse_y;
+            live_inspector_resize_start_height_ =
+                live_inspector_resize_target_->GetBox().GetSize(Rml::BoxArea::Border).y;
+            return;
+        }
+    }
 
-        return ShadowRect{
-            .x = panel_screen_x + popup_x,
-            .y = panel_screen_y + popup_y,
-            .w = popup_w,
-            .h = popup_h,
-            .rounding = maxCornerRadius(popup->GetComputedValues().border_radius()),
-        };
+    void RmlPanelHost::updateLiveInspectorResize(const float mouse_y,
+                                                 const bool mouse_down,
+                                                 const bool mouse_released) {
+        if (!live_inspector_resize_target_ || !rml_context_)
+            return;
+        if (mouse_down || mouse_released) {
+            const float dp_ratio = std::max(
+                rml_context_->GetDensityIndependentPixelRatio(), 0.01f);
+            const float minimum = 180.0f * dp_ratio;
+            const float maximum = std::max(minimum, rml_context_->GetDimensions().y * 0.5f);
+            const float height = std::clamp(
+                live_inspector_resize_start_height_ -
+                    (mouse_y - live_inspector_resize_start_y_),
+                minimum, maximum);
+            live_inspector_resize_target_->SetProperty(
+                "height", std::format("{:.1f}px", height));
+            render_needed_ = true;
+            direct_cache_dirty_ = true;
+        }
+        if (mouse_released || !mouse_down)
+            live_inspector_resize_target_ = nullptr;
+    }
+
+    void RmlPanelHost::trackFrame(const float panel_x, const float panel_y) {
+        if (!manager_ || !rml_context_ || !input_)
+            return;
+
+        manager_->trackContextFrame(rml_context_,
+                                    static_cast<int>(panel_x - input_->screen_x -
+                                                     last_fbo_padding_),
+                                    static_cast<int>(panel_y - input_->screen_y -
+                                                     last_fbo_padding_),
+                                    openDropdownBounds());
+        if (!resize_cursor_override_.empty()) {
+            if (auto* const system_interface = Rml::GetSystemInterface())
+                system_interface->SetMouseCursor(resize_cursor_override_);
+        }
     }
 
     void RmlPanelHost::applyHoverTooltip(const int pw, const float panel_y,
@@ -735,11 +1113,16 @@ namespace lfs::vis::gui {
         if (manager_)
             manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_,
                                                             tooltip_.hasActiveState());
-        if (tooltip_.apply(body, last_forwarded_mx_, last_forwarded_my_, pw, clamp_h))
+        if (tooltip_.apply(body,
+                           last_forwarded_mx_ - last_fbo_padding_,
+                           last_forwarded_my_ - last_fbo_padding_,
+                           pw, clamp_h))
             render_needed_ = true;
-        if (manager_)
+        if (manager_) {
             manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_,
                                                             tooltip_.hasActiveState());
+            manager_->setContextTooltipRevealDeadline(rml_context_, tooltip_.revealDeadline());
+        }
     }
 
     void RmlPanelHost::compositeDirectToScreen(const float x, const float y,
@@ -748,10 +1131,11 @@ namespace lfs::vis::gui {
             w <= 0.0f || h <= 0.0f)
             return;
 
-        float clip_x1 = x;
-        float clip_y1 = y;
-        float clip_x2 = x + w;
-        float clip_y2 = y + h;
+        const float padding = static_cast<float>(last_fbo_padding_);
+        float clip_x1 = x - padding;
+        float clip_y1 = y - padding;
+        float clip_x2 = x + w + padding;
+        float clip_y2 = y + h + padding;
 
         if (clip_y_min_ >= 0.0f && clip_y_max_ > clip_y_min_) {
             clip_y1 = std::max(clip_y1, clip_y_min_);
@@ -761,8 +1145,8 @@ namespace lfs::vis::gui {
         if (clip_x2 <= clip_x1 || clip_y2 <= clip_y1)
             return;
 
-        const float screen_x = x - input_->screen_x;
-        const float screen_y = y - input_->screen_y;
+        const float screen_x = std::round(x - input_->screen_x - padding);
+        const float screen_y = std::round(y - input_->screen_y - padding);
         const float screen_clip_x1 = clip_x1 - input_->screen_x;
         const float screen_clip_y1 = clip_y1 - input_->screen_y;
         const float screen_clip_x2 = clip_x2 - input_->screen_x;
@@ -779,13 +1163,19 @@ namespace lfs::vis::gui {
                                          screen_clip_y2);
             direct_cache_dirty_ = true;
         } else {
-            const float draw_w = last_fbo_w_ > 0 ? static_cast<float>(last_fbo_w_) : w;
-            const float draw_h = last_fbo_h_ > 0 ? static_cast<float>(last_fbo_h_) : h;
+            const float draw_w =
+                last_fbo_w_ > 0
+                    ? static_cast<float>(last_fbo_w_ + 2 * last_fbo_padding_)
+                    : w;
+            const float draw_h =
+                last_fbo_h_ > 0
+                    ? static_cast<float>(last_fbo_h_ + 2 * last_fbo_padding_)
+                    : h;
             manager_->queueCachedVulkanContext({
                 .context = rml_context_,
                 .cache = &direct_cache_,
-                .cache_width = last_fbo_w_,
-                .cache_height = last_fbo_h_,
+                .cache_width = last_fbo_w_ + 2 * last_fbo_padding_,
+                .cache_height = last_fbo_h_ + 2 * last_fbo_padding_,
                 .offset_x = screen_x,
                 .offset_y = screen_y,
                 .draw_width = draw_w,
@@ -803,19 +1193,14 @@ namespace lfs::vis::gui {
             });
             direct_cache_dirty_ = false;
         }
-
-        if (const auto popover_shadow = collectVisibleColorPickerPopupShadow(screen_x, screen_y)) {
-            const auto& shadow = *popover_shadow;
-            widgets::DrawPopoverShadowOverlay(ImGui::GetForegroundDrawList(),
-                                              {shadow.x, shadow.y},
-                                              {shadow.w, shadow.h},
-                                              shadow.rounding);
-        }
     }
 
     bool RmlPanelHost::hitTestPanelShape(const float local_x, const float local_y,
                                          const float logical_w, const float logical_h) const {
-        if (local_x < 0.0f || local_y < 0.0f || local_x >= logical_w || local_y >= logical_h)
+        const float panel_x = local_x - static_cast<float>(last_fbo_padding_);
+        const float panel_y = local_y - static_cast<float>(last_fbo_padding_);
+        if (panel_x < 0.0f || panel_y < 0.0f ||
+            panel_x >= logical_w || panel_y >= logical_h)
             return false;
 
         if (!frame_el_)
@@ -831,20 +1216,36 @@ namespace lfs::vis::gui {
                                   frame_el_->GetComputedValues().border_radius());
     }
 
+    void RmlPanelHost::CloseButtonListener::ProcessEvent(Rml::Event&) {
+        PanelRegistry::instance().set_panel_enabled(host_->context_name_, false);
+    }
+
+    void RmlPanelHost::bindCloseButton() {
+        if (close_button_bound_ || !document_)
+            return;
+        close_button_bound_ = true;
+        close_button_ = document_->GetElementById("close-btn");
+        if (close_button_)
+            close_button_->AddEventListener("click", &close_listener_);
+    }
+
     bool RmlPanelHost::forwardInput(float panel_x, float panel_y) {
         assert(rml_context_);
 
         if (!input_ || !manager_ || !manager_->getVulkanRenderInterface())
             return false;
 
+        if (manager_->routeInput(rml_context_, *input_, [this, panel_x, panel_y](const PanelInputState& event) {
+                const auto* saved = input_;
+                input_ = &event;
+                render_needed_ |= forwardInput(panel_x, panel_y);
+                input_ = saved; }, false, [this](float x, float y) { return !floating_ && PanelRegistry::instance().isPositionOverFloatingPanel(x, y); }))
+            return false;
+        bindCloseButton();
         bool had_input = false;
         const auto& input = *input_;
         auto* const text_input_handler = manager_ ? manager_->getTextInputHandler() : nullptr;
-        if (manager_) {
-            manager_->trackContextFrame(rml_context_,
-                                        static_cast<int>(panel_x - input.screen_x),
-                                        static_cast<int>(panel_y - input.screen_y));
-        }
+        trackFrame(panel_x, panel_y);
         const float mouse_x = input.mouse_x;
         const float mouse_y = input.mouse_y;
         const auto sync_text_focus = [&]() {
@@ -854,67 +1255,71 @@ namespace lfs::vis::gui {
 
             has_text_focus_ = want_text;
         };
-        const auto flush_pending_text_input = [&]() {
-            if (!has_text_focus_)
+        const auto replay_keyboard_event = [&](const FrameInputEvent& event) {
+            if (!rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()))
                 return;
-
-            auto* const focused = rml_context_->GetFocusElement();
-            const bool focused_editable = rml_input::isTextEditableElement(focused);
-
-            if (focused_editable && text_input_handler && input.has_text_editing) {
-                had_input |= text_input_handler->handleTextEditing(
-                    input.text_editing, input.text_editing_start, input.text_editing_length);
-            }
-
-            bool forward_text_codepoints = input.text_inputs.empty();
-            for (const auto& text_input : input.text_inputs) {
+            if (keyboard_handler_ && keyboard_handler_(event)) {
+                if (event.dispatch)
+                    event.dispatch->consumed = true;
                 had_input = true;
-                if (focused_editable && text_input_handler &&
-                    text_input_handler->handleTextInput(text_input)) {
-                    continue;
-                }
-                if (focused && rml_input::isCustomTextInputElement(focused)) {
-                    rml_context_->ProcessTextInput(text_input);
-                } else {
-                    forward_text_codepoints = true;
+                return;
+            }
+            const bool composing = text_input_handler && text_input_handler->isComposing();
+            if (event.kind == FrameInputEventKind::KeyDown &&
+                event.scancode == SDL_SCANCODE_ESCAPE &&
+                rml_input::shouldCancelOnEscape(rml_context_->GetFocusElement(), composing)) {
+                had_input |= rml_input::cancelFocusedElement(*rml_context_);
+            } else {
+                // Enter ends an edit in a single-line input that already had focus.
+                // An input this key press focused (a scrub field opening its
+                // editor) stays open.
+                auto* const focused_before = rml_context_->GetFocusElement();
+                had_input |= rml_input::processKeyboardEvent(*rml_context_, event, text_input_handler);
+                if (!composing && event.kind == FrameInputEventKind::KeyDown &&
+                    (event.scancode == SDL_SCANCODE_RETURN || event.scancode == SDL_SCANCODE_KP_ENTER) &&
+                    rml_context_->GetFocusElement() == focused_before &&
+                    rml_input::isSingleLineTextInput(focused_before)) {
+                    focused_before->Blur();
                 }
             }
-
-            if (forward_text_codepoints) {
-                if (!input.text_codepoints.empty())
-                    had_input = true;
-                for (const uint32_t cp : input.text_codepoints)
-                    rml_context_->ProcessTextInput(static_cast<Rml::Character>(cp));
-            }
+            sync_text_focus();
         };
         const auto blur_focused_element = [&]() -> bool {
             auto* const focused = rml_context_->GetFocusElement();
             if (!focused)
                 return false;
 
-            if (rml_input::wantsTextInput(focused))
-                flush_pending_text_input();
             focused->Blur();
             sync_text_focus();
             return true;
         };
 
-        float local_x = mouse_x - panel_x;
-        float local_y = mouse_y - panel_y;
+        float local_x = mouse_x - panel_x + last_fbo_padding_;
+        float local_y = mouse_y - panel_y + last_fbo_padding_;
+
+        updateLiveInspectorResize(mouse_y, input.mouse_down[0], input.mouse_released[0]);
 
         const float logical_w = static_cast<float>(last_fbo_w_);
         const float logical_h = static_cast<float>(last_fbo_h_);
 
-        bool hovered = hitTestPanelShape(local_x, local_y, logical_w, logical_h);
+        const bool blocked_by_other_overlay =
+            manager_ && manager_->activeOverlayOccludesContext(rml_context_, mouse_x, mouse_y);
+        const bool dropdown_hovered =
+            !blocked_by_other_overlay && openDropdownContainsPoint(local_x, local_y);
+        bool hovered =
+            !blocked_by_other_overlay &&
+            (dropdown_hovered || hitTestPanelShape(local_x, local_y, logical_w, logical_h));
 
-        if (hovered && clip_y_min_ >= 0 && clip_y_max_ > clip_y_min_) {
+        if (!dropdown_hovered && hovered && clip_y_min_ >= 0 && clip_y_max_ > clip_y_min_) {
             if (mouse_y < clip_y_min_ || mouse_y > clip_y_max_)
                 hovered = false;
         }
 
         // While a button is captured the panel stays active for input
         // forwarding so an in-progress drag survives the cursor leaving.
-        const bool any_capture = mouse_captured_[0] || mouse_captured_[1] || mouse_captured_[2];
+        const bool any_capture =
+            manual_dropdown_mouse_captured_ ||
+            mouse_captured_[0] || mouse_captured_[1] || mouse_captured_[2];
         const bool effective_hovered = hovered || any_capture;
 
         const bool hover_changed = (effective_hovered != last_hovered_);
@@ -924,6 +1329,9 @@ namespace lfs::vis::gui {
             if (!effective_hovered) {
                 last_forwarded_mx_ = -1;
                 last_forwarded_my_ = -1;
+                last_forwarded_mods_ = 0;
+                setManualDropdownHover(nullptr);
+                manual_dropdown_mouse_captured_ = false;
                 rml_context_->ProcessMouseLeave();
             }
         }
@@ -945,34 +1353,155 @@ namespace lfs::vis::gui {
 
         const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
                                       input.key_alt, input.key_super);
+        last_forwarded_mods_ = mods;
+
+        const bool manual_dropdown_route = dropdown_hovered || manual_dropdown_mouse_captured_;
+        Rml::Element* manual_dropdown_target =
+            manual_dropdown_route ? openDropdownOptionAtPoint(local_x, local_y) : nullptr;
+        Rml::Element* manual_dropdown_option =
+            (manual_dropdown_target && manual_dropdown_target->GetTagName() == "option")
+                ? manual_dropdown_target
+                : nullptr;
+        Rml::Element* manual_dropdown_box = nullptr;
+        if (manual_dropdown_target) {
+            if (manual_dropdown_target->GetTagName() == "selectbox")
+                manual_dropdown_box = manual_dropdown_target;
+            else if (auto* const parent = manual_dropdown_target->GetParentNode();
+                     parent && parent->GetTagName() == "selectbox") {
+                manual_dropdown_box = parent;
+            }
+        }
+        const bool manual_dropdown_option_route =
+            manual_dropdown_option != nullptr || manual_dropdown_mouse_captured_;
 
         if (mouse_moved) {
-            auto* const prev_hover = rml_context_->GetHoverElement();
             last_forwarded_mx_ = rml_mx;
             last_forwarded_my_ = rml_my;
-            rml_context_->ProcessMouseMove(rml_mx, rml_my, mods);
-            auto* const next_hover = rml_context_->GetHoverElement();
-            if (pointer_active || next_hover != prev_hover)
+            if (manual_dropdown_option_route) {
+                if (rml_context_->GetHoverElement())
+                    rml_context_->ProcessMouseLeave();
+                setManualDropdownHover(manual_dropdown_option);
+                had_input = true;
+            } else {
+                auto* const prev_hover = rml_context_->GetHoverElement();
+                rml_context_->ProcessMouseMove(rml_mx, rml_my, mods);
+                auto* const next_hover = rml_context_->GetHoverElement();
+                if (pointer_active || next_hover != prev_hover)
+                    had_input = true;
+            }
+        } else if (manual_dropdown_option_route) {
+            if (rml_context_->GetHoverElement())
+                rml_context_->ProcessMouseLeave();
+            setManualDropdownHover(manual_dropdown_option);
+            if (pointer_active)
                 had_input = true;
         }
 
+        if (manual_dropdown_option_route) {
+            setManualDropdownHover(manual_dropdown_option);
+            had_input = true;
+        } else {
+            setManualDropdownHover(nullptr);
+        }
+
         const auto deliver_button_down = [&](const int button) {
+            auto* const pressed = rml_context_->GetHoverElement();
+            pointer_press_target_[button] =
+                pressed ? pressed->GetObserverPtr() : Rml::ObserverPtr<Rml::Element>{};
             rml_context_->ProcessMouseButtonDown(button, mods);
             mouse_captured_[button] = true;
         };
-        const auto deliver_button_up = [&](const int button) {
+        const auto deliver_button_up = [&](const int button, const int x, const int y) {
+            auto pressed = pointer_press_target_[button];
+            pointer_press_target_[button].reset();
+            // Mouseup goes to the hover element, and a click only when that hover
+            // is still the pressed element. Outside the panel the hover is empty,
+            // so deliver mouseup to the pressed element and leave the click out.
+            if (pressed && rml_context_->GetHoverElement() == nullptr) {
+                Rml::Dictionary parameters;
+                parameters["mouse_x"] = x;
+                parameters["mouse_y"] = y;
+                parameters["button"] = button;
+                parameters["ctrl_key"] = static_cast<int>((mods & Rml::Input::KM_CTRL) != 0);
+                parameters["shift_key"] = static_cast<int>((mods & Rml::Input::KM_SHIFT) != 0);
+                parameters["alt_key"] = static_cast<int>((mods & Rml::Input::KM_ALT) != 0);
+                parameters["meta_key"] = static_cast<int>((mods & Rml::Input::KM_META) != 0);
+                parameters["caps_lock_key"] = static_cast<int>((mods & Rml::Input::KM_CAPSLOCK) != 0);
+                parameters["num_lock_key"] = static_cast<int>((mods & Rml::Input::KM_NUMLOCK) != 0);
+                parameters["scroll_lock_key"] = static_cast<int>((mods & Rml::Input::KM_SCROLLLOCK) != 0);
+                pressed->DispatchEvent(Rml::EventId::Mouseup, parameters);
+            }
             rml_context_->ProcessMouseButtonUp(button, mods);
             mouse_captured_[button] = false;
             had_input = true;
         };
 
-        if (hovered) {
-            if (input.mouse_clicked[0])
-                deliver_button_down(0);
+        // SDL can deliver multiple button transitions before the next frame.
+        // Replay each transition at its recorded position so a fast double click
+        // is not collapsed onto the final cursor position.
+        bool replayed_button_events = !input.mouse_button_events.empty();
+        const auto replay_button_event = [&](const FrameMouseButtonEvent& event) {
+            if (event.button >= 3)
+                return;
+            const float event_x = event.x - panel_x + last_fbo_padding_;
+            const float event_y = event.y - panel_y + last_fbo_padding_;
+            const bool event_hovered =
+                !manager_->activeOverlayOccludesContext(rml_context_, event.x, event.y) &&
+                (clip_y_min_ < 0 || clip_y_max_ <= clip_y_min_ ||
+                 (event.y >= clip_y_min_ && event.y <= clip_y_max_)) &&
+                hitTestPanelShape(event_x, event_y, logical_w, logical_h);
+            if (!event_hovered) {
+                if (event.down && event.button == 0) {
+                    had_input |= blur_focused_element();
+                    had_input |= rml_input::hideOpenSelectBoxes(*rml_context_);
+                }
+                if (!mouse_captured_[event.button])
+                    return;
+            }
+            rml_context_->ProcessMouseMove(static_cast<int>(event_x), static_cast<int>(event_y), mods);
+            if (event.down)
+                deliver_button_down(event.button);
+            else
+                deliver_button_up(event.button, static_cast<int>(event_x), static_cast<int>(event_y));
+            sync_text_focus();
+            had_input = true;
+        };
+        rml_input::replayInputEvents(input.input_events, input.mouse_button_events, [&](const FrameMouseButtonEvent& event) {
+                                        if (!manual_dropdown_option_route)
+                                            replay_button_event(event); }, replay_keyboard_event);
+        // Synthetic pointer-only callers can still supply canonical button events.
+        if (input.input_events.empty() && !manual_dropdown_option_route) {
+            for (const auto& event : input.mouse_button_events)
+                replay_button_event(event);
+        }
+
+        if (manual_dropdown_option_route) {
+            if (input.mouse_clicked[0]) {
+                manual_dropdown_mouse_captured_ = true;
+                had_input = true;
+            }
             if (input.mouse_clicked[1])
+                had_input = true;
+            if (input.mouse_wheel != 0.0f) {
+                if (manual_dropdown_box) {
+                    const float max_scroll = std::max(
+                        0.0f,
+                        manual_dropdown_box->GetScrollHeight() - manual_dropdown_box->GetClientHeight());
+                    manual_dropdown_box->SetScrollTop(std::clamp(
+                        manual_dropdown_box->GetScrollTop() - input.mouse_wheel * 30.0f,
+                        0.0f,
+                        max_scroll));
+                }
+                had_input = true;
+            }
+        } else if (hovered) {
+            if (!replayed_button_events && input.mouse_clicked[0])
+                deliver_button_down(0);
+            if (!replayed_button_events && input.mouse_clicked[1])
                 deliver_button_down(1);
             if (input.mouse_wheel != 0.0f) {
-                rml_context_->ProcessMouseWheel(Rml::Vector2f(0, -input.mouse_wheel), mods);
+                rml_context_->ProcessMouseWheel(
+                    Rml::Vector2f(-input.mouse_wheel_x, -input.mouse_wheel), mods);
                 // Re-resolve hover against the new scroll offset so row text
                 // doesn't render against a stale layout for one frame.
                 rml_context_->ProcessMouseMove(rml_mx, rml_my, mods);
@@ -980,8 +1509,27 @@ namespace lfs::vis::gui {
             }
             if (input.mouse_clicked[0])
                 sync_text_focus();
-        } else if (input.mouse_clicked[0]) {
+            if (input.mouse_clicked[0])
+                beginLiveInspectorResize(mouse_y);
+        } else if (!replayed_button_events && input.mouse_clicked[0]) {
             had_input |= blur_focused_element();
+            had_input |= rml_input::hideOpenSelectBoxes(*rml_context_);
+        }
+
+        if (manual_dropdown_mouse_captured_ &&
+            (input.mouse_released[0] || !input.mouse_down[0])) {
+            auto* click_option = manual_dropdown_option;
+            if (!click_option) {
+                auto* const target = openDropdownOptionAtPoint(local_x, local_y);
+                if (target && target->GetTagName() == "option")
+                    click_option = target;
+            }
+            if (click_option)
+                click_option->Click();
+            manual_dropdown_mouse_captured_ = false;
+            setManualDropdownHover(nullptr);
+            sync_text_focus();
+            had_input = true;
         }
 
         // Forward release regardless of hover so a drag begun on the scrollbar
@@ -989,90 +1537,23 @@ namespace lfs::vis::gui {
         for (int button = 0; button < 2; ++button) {
             if (mouse_captured_[button] &&
                 (input.mouse_released[button] || !input.mouse_down[button])) {
-                deliver_button_up(button);
+                deliver_button_up(button, rml_mx, rml_my);
             }
         }
+
+        updateResizeCursorOverride(hovered);
 
         if (hovered) {
             if (auto* const hover = rml_context_->GetHoverElement())
                 tooltip_.setHover(resolveRmlTooltip(hover), hover);
+            else
+                tooltip_.setHover({}, nullptr);
+        } else {
+            tooltip_.setHover({}, nullptr);
         }
 
-        if (input.viewport_keyboard_focus)
+        if (input.viewport_keyboard_focus && !replayed_button_events)
             had_input |= blur_focused_element();
-
-        bool forward_keys =
-            rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()) &&
-            !input.viewport_keyboard_focus;
-        bool commit_requested = false;
-        bool escape_requested = false;
-        const bool composing = text_input_handler && text_input_handler->isComposing();
-        auto isNumpadTextKey = [](int sc) {
-            return (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) ||
-                   sc == SDL_SCANCODE_KP_PERIOD;
-        };
-
-        if (forward_keys) {
-            const auto process_key_down = [&](const int sc) {
-                if (!composing && sc == SDL_SCANCODE_ESCAPE) {
-                    if (auto* const focused = rml_context_->GetFocusElement();
-                        focused && (rml_input::isTextEditableElement(focused) ||
-                                    rml_input::isSelectRelatedElement(focused))) {
-                        escape_requested = true;
-                        had_input = true;
-                        return;
-                    }
-                }
-                const bool is_submit_key =
-                    (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER);
-                if (composing && (is_submit_key || sc == SDL_SCANCODE_ESCAPE))
-                    return;
-                if (has_text_focus_ && isNumpadTextKey(sc))
-                    return;
-                auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN) {
-                    if (text_input_handler && text_input_handler->handleKeyDown(rml_key, mods)) {
-                        had_input = true;
-                        return;
-                    }
-                    rml_context_->ProcessKeyDown(rml_key, mods);
-                    had_input = true;
-                }
-                if (is_submit_key)
-                    commit_requested = true;
-            };
-
-            for (int sc : input.keys_pressed)
-                process_key_down(sc);
-            for (int sc : input.keys_repeated)
-                process_key_down(sc);
-            for (int sc : input.keys_released) {
-                if (escape_requested && sc == SDL_SCANCODE_ESCAPE)
-                    continue;
-                if (composing && (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER ||
-                                  sc == SDL_SCANCODE_ESCAPE))
-                    continue;
-                if (has_text_focus_ && isNumpadTextKey(sc))
-                    continue;
-                auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN) {
-                    rml_context_->ProcessKeyUp(rml_key, mods);
-                    had_input = true;
-                }
-            }
-        }
-
-        if (!composing && escape_requested) {
-            if (rml_input::cancelFocusedElement(*rml_context_)) {
-                sync_text_focus();
-                had_input = true;
-            }
-        }
-
-        if (!composing && commit_requested &&
-            rml_input::isSingleLineTextInput(rml_context_->GetFocusElement())) {
-            blur_focused_element();
-        }
 
         sync_text_focus();
 
@@ -1083,7 +1564,6 @@ namespace lfs::vis::gui {
 
         if (has_text_focus_) {
             s_frame_wants_text_input = true;
-            flush_pending_text_input();
         }
 
         return had_input;

@@ -5,6 +5,10 @@ import utils;
 static const uint SELECTION_MODE_BRUSH = 0;
 static const uint SELECTION_MODE_RECTANGLE = 1;
 static const uint SELECTION_MODE_POLYGON_MASK = 2;
+static const uint SELECTION_MODE_RING = 3;
+static const uint RING_PICK_PHASE_NONE = 0;
+static const uint RING_PICK_PHASE_FIND_MIN = 1;
+static const uint RING_PICK_PHASE_WRITE_PICK = 2;
 
 struct SelectionUniforms
 {
@@ -18,7 +22,7 @@ struct SelectionUniforms
     uint image_height;
     uint image_width;
     uint camera_model;
-    uint pad0;
+    uint deleted_mask_enabled;
     uint pad1;
     float fx;
     float fy;
@@ -30,6 +34,10 @@ struct SelectionUniforms
     uint aabb_y0;
     uint aabb_w;
     uint aabb_h;
+    float ring_width;
+    uint mip_filter;
+    uint ring_pick_phase;
+    uint pad2;
 }
 
 layout(binding=0) StructuredBuffer<float> xyz_ws;
@@ -41,14 +49,21 @@ layout(binding=5) StructuredBuffer<float4> rotations;
 layout(binding=6) StructuredBuffer<float> scaling_raw;
 layout(binding=7) RWByteAddressBuffer selection_out;
 layout(binding=8) ByteAddressBuffer polygon_mask;
+layout(binding=9) StructuredBuffer<float> opacity_raw;
+layout(binding=10) RWByteAddressBuffer ring_pick_out;
+layout(binding=11) ByteAddressBuffer deleted_mask;
+
+static const uint RING_PICK_NO_HIT = 0xFFFFFFFFu;
 
 [ForceInline]
 bool node_visible(uint splat_idx, SelectionUniforms uniforms)
 {
-    if (uniforms.transform_indices_enabled == 0 || uniforms.node_visibility_enabled == 0)
+    if (uniforms.deleted_mask_enabled != 0u && read_byte(deleted_mask, splat_idx) != 0u)
+        return false;
+    if (uniforms.node_visibility_enabled == 0)
         return true;
 
-    int node_idx = read_int32(transform_indices, splat_idx);
+    int node_idx = uniforms.transform_indices_enabled != 0 ? read_int32(transform_indices, splat_idx) : 0;
     if (node_idx < 0 || uint(node_idx) >= uniforms.node_visibility_count)
         return false;
 
@@ -143,11 +158,118 @@ bool project_gut_splat(
         mean2d += weight * image_points[i];
     }
     if (is_equirectangular_camera(cam)) {
+        // Near a pole the unscented mean leaves the sigma-point box and no
+        // longer sits on the band that is drawn. Use the projected center.
+        float2 lo = image_points[0];
+        float2 hi = image_points[0];
+        for (uint i = 1u; i < NUM_SIGMA_POINTS; ++i) {
+            lo.x = min(lo.x, image_points[i].x);
+            lo.y = min(lo.y, image_points[i].y);
+            hi.x = max(hi.x, image_points[i].x);
+            hi.y = max(hi.y, image_points[i].y);
+        }
+        if (mean2d.x < lo.x || mean2d.x > hi.x || mean2d.y < lo.y || mean2d.y > hi.y)
+            mean2d = image_points[0];
         mean2d.x = wrap_image_x(mean2d.x, cam);
     }
 
     position = mean2d - 0.5f;
     return true;
+}
+
+[ForceInline]
+bool project_gut_ring_splat(
+    uint splat_idx,
+    SelectionUniforms uniforms,
+    Camera cam,
+    float3 mean_ws,
+    uint transform_base,
+    bool transform_enabled,
+    out float2 position,
+    out float3 inv_cov_vs,
+    out float opacity,
+    out float depth)
+{
+    position = float2(0.0);
+    inv_cov_vs = float3(0.0);
+    opacity = 0.0f;
+    depth = 0.0f;
+
+    float3 mean_vs = project_point(mean_ws, cam);
+    if (mean_vs.z <= NEAR_CLIP || !isfinite(dot(mean_vs, mean_vs)))
+        return false;
+    depth = mean_vs.z;
+
+    static const uint D = 3u;
+    static const uint NUM_SIGMA_POINTS = 7u;
+    static const float UT_ALPHA = 0.1f;
+    static const float UT_BETA = 2.0f;
+    static const float UT_KAPPA = 0.0f;
+    float lambda = UT_ALPHA * UT_ALPHA * (float(D) + UT_KAPPA) - float(D);
+    float sigma_scale = sqrt(float(D) + lambda);
+    float weight_mean_0 = lambda / (float(D) + lambda);
+    float weight_cov_0 = weight_mean_0 + (1.0f - UT_ALPHA * UT_ALPHA + UT_BETA);
+    float weight_sigma = 1.0f / (2.0f * (float(D) + lambda));
+
+    float3 source_mean = read_t3_float3(splat_idx, xyz_ws);
+    float3 raw_scaling = min(read_t3_float3(splat_idx, scaling_raw), float3(MAX_RAW_SCALE));
+    float3 scales = exp(raw_scaling);
+    float3x3 rotation = quat_to_rotmat(safe_quat_normalize(rotations[splat_idx]));
+
+    float3 sigma_points[NUM_SIGMA_POINTS];
+    sigma_points[0] = mean_ws;
+    for (uint i = 0u; i < D; ++i) {
+        float scale_i = i == 0u ? scales.x : (i == 1u ? scales.y : scales.z);
+        float3 delta = sigma_scale * scale_i * selection_rotation_column(rotation, i);
+        float3 source_plus = source_mean + delta;
+        float3 source_minus = source_mean - delta;
+        sigma_points[1u + i] = transform_enabled
+                                    ? transform_point_rows(model_transforms, transform_base, source_plus)
+                                    : source_plus;
+        sigma_points[1u + D + i] = transform_enabled
+                                        ? transform_point_rows(model_transforms, transform_base, source_minus)
+                                        : source_minus;
+    }
+
+    float2 image_points[NUM_SIGMA_POINTS];
+    for (uint i = 0u; i < NUM_SIGMA_POINTS; ++i) {
+        float3 projected = project_point(sigma_points[i], cam);
+        if (!valid_gut_selection_point(projected, cam))
+            return false;
+        image_points[i] = projected.xy;
+    }
+
+    unwrap_image_points_x(image_points, cam);
+
+    float2 mean2d = float2(0.0);
+    for (uint i = 0u; i < NUM_SIGMA_POINTS; ++i) {
+        float weight = i == 0u ? weight_mean_0 : weight_sigma;
+        mean2d += weight * image_points[i];
+    }
+    float2 covariance_mean2d = mean2d;
+    if (is_equirectangular_camera(cam)) {
+        mean2d.x = wrap_image_x(mean2d.x, cam);
+    }
+
+    float3 cov2d = float3(0.0);
+    for (uint i = 0u; i < NUM_SIGMA_POINTS; ++i) {
+        float2 d = image_points[i] - covariance_mean2d;
+        float weight = i == 0u ? weight_cov_0 : weight_sigma;
+        cov2d += weight * float3(d.x * d.x, d.x * d.y, d.y * d.y);
+    }
+
+    float4 cov_vs = add_blur_to_covariance2d(cov2d, (uniforms.mip_filter & 1u) != 0u, false);
+    float det = compute_det(cov_vs.xyz);
+    if (det <= 0.0f || !isfinite(det))
+        return false;
+
+    opacity = sigmoid_activation(opacity_raw[splat_idx]) * cov_vs.w;
+    if (opacity <= ALPHA_THRESHOLD)
+        return false;
+
+    position = mean2d - 0.5f;
+    inv_cov_vs = compute_inverse(cov_vs.xyz);
+    return isfinite(dot(inv_cov_vs, inv_cov_vs));
 }
 
 [ForceInline]
@@ -183,19 +305,223 @@ bool project_splat(uint splat_idx, SelectionUniforms uniforms, out float2 positi
 }
 
 [ForceInline]
-bool primitive_hit(float2 position, float4 primitive, uint mode)
+bool project_ring_splat(
+    uint splat_idx,
+    SelectionUniforms uniforms,
+    out float2 position,
+    out float3 inv_cov_vs,
+    out float opacity,
+    out float depth)
 {
-    if (mode == SELECTION_MODE_RECTANGLE) {
-        return position.x >= primitive.x && position.x <= primitive.z &&
-               position.y >= primitive.y && position.y <= primitive.w;
+    position = float2(0.0);
+    inv_cov_vs = float3(0.0);
+    opacity = 0.0f;
+    depth = 0.0f;
+    if (!node_visible(splat_idx, uniforms))
+        return false;
+
+    Camera cam = load_camera(uniforms.world_view_transform,
+        uniforms.fx, uniforms.fy, uniforms.cx, uniforms.cy,
+        int(base_camera_model(uniforms.camera_model)), uniforms.dist_coeffs,
+        uniforms.image_height, uniforms.image_width);
+    float3 mean = read_t3_float3(splat_idx, xyz_ws);
+    uint transform_base = model_transform_base(splat_idx, uniforms);
+    bool transform_enabled = uniforms.num_model_transforms > 0;
+    if (transform_enabled) {
+        mean = transform_point_rows(model_transforms, transform_base, mean);
+    }
+
+    if (is_gut_projection_mode(uniforms.camera_model)) {
+        return project_gut_ring_splat(
+            splat_idx, uniforms, cam, mean, transform_base, transform_enabled, position, inv_cov_vs, opacity, depth);
+    }
+
+    float3 projected = project_point(mean, cam);
+    if (projected.z <= NEAR_CLIP ||
+        !isfinite(dot(projected, projected)) ||
+        !image_point_in_image_bounds_margin(projected.xy, cam, 0.2f)) {
+        return false;
+    }
+    if (is_equirectangular_camera(cam)) {
+        projected.x = wrap_image_x(projected.x, cam);
+    }
+    position = projected.xy - 0.5f;
+    depth = projected.z;
+
+    float3 raw_scaling = min(read_t3_float3(splat_idx, scaling_raw), float3(MAX_RAW_SCALE));
+    float3 scales = exp(raw_scaling);
+    float3x3 cov_ws = get_covariance_from_quat_scales(
+        safe_quat_normalize(rotations[splat_idx]), scales);
+    if (transform_enabled) {
+        cov_ws = transform_covariance_rows(model_transforms, transform_base, cov_ws);
+    }
+    float4 cov_vs = covariance_3d_to_2d(cam, mean, cov_ws, (uniforms.mip_filter & 1u) != 0u, false);
+    opacity = sigmoid_activation(opacity_raw[splat_idx]) * cov_vs.w;
+    if (opacity <= ALPHA_THRESHOLD) {
+        return false;
+    }
+
+    float3 cov_projected = clamp_covariance_2d_extent(cov_vs.xyz, opacity);
+    float det = compute_det(cov_projected);
+    if (det <= 0.0f || !isfinite(det)) {
+        return false;
+    }
+    inv_cov_vs = compute_inverse(cov_projected);
+    return isfinite(dot(inv_cov_vs, inv_cov_vs));
+}
+
+[ForceInline]
+bool x_in_range(float x, float x0, float x1)
+{
+    return x >= x0 && x <= x1;
+}
+
+// Circle hits already wrap longitude. Rectangle and lasso must test the same
+// seam copies. The pixel-center shift stores that sample half a pixel outside
+// x=0, so a strip that covers the left edge includes it.
+[ForceInline]
+bool equirect_seam_x(float x, float x0, float x1, float width)
+{
+    if (x0 <= 0.0f)
+        x0 -= 0.5f;
+    return x_in_range(x, x0, x1) || x_in_range(x - width, x0, x1) || x_in_range(x + width, x0, x1);
+}
+
+[ForceInline]
+bool primitive_hit(float2 position, float4 primitive, SelectionUniforms uniforms)
+{
+    if (uniforms.mode == SELECTION_MODE_RECTANGLE) {
+        const bool equirect = base_camera_model(uniforms.camera_model) == uint(CameraModel::EQUIRECTANGULAR);
+        float y0 = primitive.y;
+        float y1 = primitive.w;
+        // The pole sample is stored half a pixel outside y=0 after the
+        // pixel-center shift. A strip covering that edge includes it.
+        if (equirect && uniforms.image_height > 0u) {
+            if (y0 <= 0.0f)
+                y0 -= 0.5f;
+            if (y1 >= float(uniforms.image_height))
+                y1 += 0.5f;
+        }
+        if (position.y < y0 || position.y > y1)
+            return false;
+        if (equirect && uniforms.image_width > 0u)
+            return equirect_seam_x(position.x, primitive.x, primitive.z, float(uniforms.image_width));
+        return x_in_range(position.x, primitive.x, primitive.z);
     }
 
     float2 delta = position - primitive.xy;
+    if (base_camera_model(uniforms.camera_model) == uint(CameraModel::EQUIRECTANGULAR)) {
+        const float width = float(uniforms.image_width);
+        delta.x -= round(delta.x / width) * width;
+    }
     return dot(delta, delta) <= primitive.z;
 }
 
 [ForceInline]
-bool polygon_mask_hit(float2 position, SelectionUniforms uniforms)
+float ring_sample_line_distance(
+    float2 sample,
+    float2 position,
+    float3 inv_cov,
+    float opacity,
+    SelectionUniforms uniforms,
+    out bool hit)
+{
+    hit = false;
+    float2 delta = sample - position;
+    float sigma_over_2 =
+        0.5f * (inv_cov.x * delta.x * delta.x + inv_cov.z * delta.y * delta.y) +
+        inv_cov.y * delta.x * delta.y;
+    if (sigma_over_2 < 0.0f || !isfinite(sigma_over_2)) {
+        return 1.0e20f;
+    }
+
+    float gaussian = exp(-sigma_over_2);
+    float boundary_gaussian = ALPHA_THRESHOLD / max(opacity, eps);
+    float ring_band = max(uniforms.ring_width, 0.0f) * 10.0f;
+    float ring_outer = boundary_gaussian * (1.0f + ring_band);
+    float ring_inner = boundary_gaussian * max(0.0f, 1.0f - ring_band);
+    hit = gaussian < ring_outer && gaussian > ring_inner;
+    return abs(sigma_over_2 + log(max(boundary_gaussian, eps)));
+}
+
+[ForceInline]
+bool ring_primitive_hit(
+    float2 position,
+    float3 inv_cov,
+    float opacity,
+    float4 primitive,
+    SelectionUniforms uniforms)
+{
+    bool sample_hit;
+    float2 sample = primitive.xy;
+    ring_sample_line_distance(sample, position, inv_cov, opacity, uniforms, sample_hit);
+    if (sample_hit) {
+        return true;
+    }
+
+    float padding = max(primitive.z, 0.0f);
+    if (padding > 0.0f) {
+        ring_sample_line_distance(sample + float2(padding, 0.0f), position, inv_cov, opacity, uniforms, sample_hit);
+        if (sample_hit) {
+            return true;
+        }
+        ring_sample_line_distance(sample - float2(padding, 0.0f), position, inv_cov, opacity, uniforms, sample_hit);
+        if (sample_hit) {
+            return true;
+        }
+        ring_sample_line_distance(sample + float2(0.0f, padding), position, inv_cov, opacity, uniforms, sample_hit);
+        if (sample_hit) {
+            return true;
+        }
+        ring_sample_line_distance(sample - float2(0.0f, padding), position, inv_cov, opacity, uniforms, sample_hit);
+        if (sample_hit) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+[ForceInline]
+uint ring_depth_pick_key(float depth)
+{
+    if (!isfinite(depth) || depth <= 0.0f) {
+        return RING_PICK_NO_HIT;
+    }
+    return asuint(depth);
+}
+
+[ForceInline]
+bool update_ring_pick(uint depth_key, uint splat_idx, SelectionUniforms uniforms)
+{
+    if (depth_key == RING_PICK_NO_HIT) {
+        return false;
+    }
+
+    if (uniforms.ring_pick_phase == RING_PICK_PHASE_NONE) {
+        return true;
+    }
+
+    if (uniforms.ring_pick_phase == RING_PICK_PHASE_FIND_MIN) {
+        uint old_key;
+        ring_pick_out.InterlockedMin(0u, depth_key, old_key);
+        return false;
+    }
+
+    if (uniforms.ring_pick_phase == RING_PICK_PHASE_WRITE_PICK) {
+        if (ring_pick_out.Load(0u) != depth_key) {
+            return false;
+        }
+        uint old_id;
+        ring_pick_out.InterlockedMin(4u, splat_idx, old_id);
+        return true;
+    }
+
+    return false;
+}
+
+[ForceInline]
+bool polygon_mask_contains(float2 position, SelectionUniforms uniforms)
 {
     int ix = int(floor(position.x)) - int(uniforms.aabb_x0);
     int iy = int(floor(position.y)) - int(uniforms.aabb_y0);
@@ -203,6 +529,31 @@ bool polygon_mask_hit(float2 position, SelectionUniforms uniforms)
         return false;
     uint idx = uint(iy) * uniforms.aabb_w + uint(ix);
     return read_byte(polygon_mask, idx) != 0u;
+}
+
+[ForceInline]
+bool polygon_mask_hit(float2 position, SelectionUniforms uniforms)
+{
+    if (polygon_mask_contains(position, uniforms))
+        return true;
+    if (base_camera_model(uniforms.camera_model) != uint(CameraModel::EQUIRECTANGULAR) ||
+        uniforms.image_width == 0u)
+        return false;
+
+    // A pole sample sits half a pixel above row 0 after the pixel-center shift.
+    float2 sample = position;
+    if (sample.y >= -0.5f && sample.y < 0.0f) {
+        sample.y = 0.0f;
+        if (polygon_mask_contains(sample, uniforms))
+            return true;
+    }
+    const float width = float(uniforms.image_width);
+    if (polygon_mask_contains(sample + float2(width, 0.0f), uniforms) ||
+        polygon_mask_contains(sample - float2(width, 0.0f), uniforms))
+        return true;
+    if (sample.x >= -0.5f && sample.x < 0.0f)
+        return polygon_mask_contains(float2(0.0f, sample.y), uniforms);
+    return false;
 }
 
 [shader("compute")]
@@ -222,16 +573,34 @@ void main(
         if (splat_idx >= uniforms.num_splats)
             break;
 
-        float2 position;
         bool selected = false;
-        if (project_splat(splat_idx, uniforms, position)) {
-            if (uniforms.mode == SELECTION_MODE_POLYGON_MASK) {
-                selected = polygon_mask_hit(position, uniforms);
-            } else {
+        if (uniforms.mode == SELECTION_MODE_RING) {
+            float2 position;
+            float3 inv_cov_vs;
+            float opacity;
+            float depth;
+            if (project_ring_splat(splat_idx, uniforms, position, inv_cov_vs, opacity, depth)) {
                 for (uint primitive_idx = 0u; primitive_idx < uniforms.primitive_count; ++primitive_idx) {
-                    if (primitive_hit(position, primitives[primitive_idx], uniforms.mode)) {
+                    if (ring_primitive_hit(position, inv_cov_vs, opacity, primitives[primitive_idx], uniforms)) {
                         selected = true;
                         break;
+                    }
+                }
+                if (selected) {
+                    selected = update_ring_pick(ring_depth_pick_key(depth), splat_idx, uniforms);
+                }
+            }
+        } else {
+            float2 position;
+            if (project_splat(splat_idx, uniforms, position)) {
+                if (uniforms.mode == SELECTION_MODE_POLYGON_MASK) {
+                    selected = polygon_mask_hit(position, uniforms);
+                } else {
+                    for (uint primitive_idx = 0u; primitive_idx < uniforms.primitive_count; ++primitive_idx) {
+                        if (primitive_hit(position, primitives[primitive_idx], uniforms)) {
+                            selected = true;
+                            break;
+                        }
                     }
                 }
             }

@@ -5,18 +5,57 @@
 #include "rml_python_panel_adapter.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
+#include "gui/vulkan_ui_texture.hpp"
 #include "py_rml.hpp"
 #include "py_ui.hpp"
 #include "python/gil.hpp"
 #include "python/python_runtime.hpp"
+#include "python_panel_chrome.hpp"
+#include <SDL3/SDL.h>
 
+#include <RmlUi/Core/Context.h>
 #include <algorithm>
 #include <cassert>
+#include <format>
 #include <nanobind/stl/string.h>
-#include <imgui.h>
 
 namespace lfs::vis::gui {
     namespace {
+        constexpr const char* IMMEDIATE_INPUT_PENDING_ATTRIBUTE =
+            "data-immediate-input-pending";
+
+        lfs::python::MouseState makeMouseState(const std::optional<PanelInputState>& input,
+                                               float prev_mouse_x, float prev_mouse_y,
+                                               bool have_prev_mouse,
+                                               bool& have_left_click_time,
+                                               std::chrono::steady_clock::time_point& last_left_click_at) {
+            lfs::python::MouseState mouse;
+            if (!input) {
+                mouse.pos_x = prev_mouse_x;
+                mouse.pos_y = prev_mouse_y;
+                return mouse;
+            }
+
+            mouse.pos_x = input->mouse_x;
+            mouse.pos_y = input->mouse_y;
+            if (have_prev_mouse) {
+                mouse.delta_x = mouse.pos_x - prev_mouse_x;
+                mouse.delta_y = mouse.pos_y - prev_mouse_y;
+            }
+            mouse.wheel = input->mouse_wheel;
+            mouse.right_clicked = input->mouse_clicked[1];
+            if (input->mouse_clicked[0]) {
+                constexpr auto kDoubleClickWindow = std::chrono::milliseconds(350);
+                const auto now = std::chrono::steady_clock::now();
+                mouse.double_clicked =
+                    have_left_click_time && (now - last_left_click_at) <= kDoubleClickWindow;
+                last_left_click_at = now;
+                have_left_click_time = true;
+            }
+            mouse.dragging = input->mouse_down[0];
+            return mouse;
+        }
+
         bool panelHookDirtyResult(const nb::object& result,
                                   const bool none_is_dirty,
                                   bool& warned_non_bool,
@@ -92,6 +131,8 @@ namespace lfs::vis::gui {
             ops.set_height_mode(host_, height_mode_);
         if (foreground_ && ops.set_foreground)
             ops.set_foreground(host_, true);
+        if (ops.set_floating)
+            ops.set_floating(host_, floating_);
         return true;
     }
 
@@ -103,13 +144,20 @@ namespace lfs::vis::gui {
         if (!has_update_interval_) {
             has_update_interval_ = true;
             try {
-                if (nb::hasattr(panel_instance_, "update_interval_ms"))
+                if (nb::hasattr(panel_instance_, "update_interval_ms") &&
+                    !panel_instance_.attr("update_interval_ms").is_none())
                     update_interval_ms_ = std::max(0, nb::cast<int>(panel_instance_.attr("update_interval_ms")));
                 if (nb::hasattr(panel_instance_, "update_policy")) {
                     const auto policy = nb::cast<std::string>(panel_instance_.attr("update_policy"));
                     dirty_driven_updates_ = policy == "dirty" || policy == "reactive";
+                    if (policy == "interval" &&
+                        (!nb::hasattr(panel_instance_, "update_interval_ms") ||
+                         panel_instance_.attr("update_interval_ms").is_none())) {
+                        throw nb::value_error("interval panels must declare update_interval_ms");
+                    }
                 }
             } catch (const std::exception& e) {
+                dirty_driven_updates_ = true;
                 LOG_ERROR("Panel update policy error: {}", e.what());
             }
         }
@@ -135,12 +183,34 @@ namespace lfs::vis::gui {
 
         auto* rml_ctx = static_cast<Rml::Context*>(ops.get_context(host_));
         assert(rml_ctx);
+        const ScopedVulkanUiTextureContext textures(ops.native_graphics ? static_cast<VulkanContext*>(ops.native_graphics(host_)) : nullptr);
         try {
             auto py_ctx = lfs::python::PyRmlContext(rml_ctx);
+            LOG_TIMER_THRESHOLD(context_name_ + ".on_bind_model", 2.0);
             panel_instance_.attr("on_bind_model")(py_ctx);
             setLifecycleState(LifecycleState::ModelBound);
         } catch (const std::exception& e) {
             LOG_ERROR("Panel on_bind_model error: {}", e.what());
+        }
+    }
+
+    bool RmlPythonPanelAdapter::onViewportDrop(const std::string& type, const std::string& data) {
+        if ((type != "application/x-lichtfeld-gallery-scene" &&
+             type != "application/x-lichtfeld-project-file") ||
+            !isMounted() ||
+            !lfs::python::can_acquire_gil())
+            return false;
+        const lfs::python::GilAcquire gil;
+        try {
+            const char* hook = type == "application/x-lichtfeld-project-file"
+                                   ? "native_file_drop"
+                                   : "gallery_viewport_drop";
+            if (!nb::hasattr(panel_instance_, hook))
+                return false;
+            return nb::cast<bool>(panel_instance_.attr(hook)(data));
+        } catch (const std::exception& e) {
+            LOG_ERROR("Gallery viewport drop failed: {}", e.what());
+            return false;
         }
     }
 
@@ -170,6 +240,7 @@ namespace lfs::vis::gui {
         lfs::python::RmlDocumentRegistry::instance().register_document(context_name_, doc);
         try {
             auto py_doc = lfs::python::PyRmlDocument(doc);
+            LOG_TIMER_THRESHOLD(context_name_ + ".on_mount", 2.0);
             panel_instance_.attr("on_mount")(py_doc);
             content_dirty_ = true;
             setLifecycleState(LifecycleState::Mounted);
@@ -192,6 +263,8 @@ namespace lfs::vis::gui {
         if (!doc)
             return nullptr;
 
+        const ScopedVulkanUiTextureContext textures(ops.native_graphics ? static_cast<VulkanContext*>(ops.native_graphics(host_)) : nullptr);
+
         if (!isMounted()) {
             assert(isModelBound());
             callOnLoad(doc);
@@ -199,6 +272,8 @@ namespace lfs::vis::gui {
 
         if (isMounted() && last_language_.empty())
             last_language_ = lfs::event::LocalizationManager::getInstance().getCurrentLanguage();
+        last_language_generation_ =
+            lfs::event::LocalizationManager::getInstance().getCurrentLanguageGeneration();
 
         return doc;
     }
@@ -282,12 +357,35 @@ namespace lfs::vis::gui {
     }
 
     void RmlPythonPanelAdapter::syncDirectLayout(float w, float h) {
-        if (!ensureDocumentInitialized())
+        auto* doc = ensureDocumentInitialized();
+        if (!doc)
             return;
+        if (auto* native = nativeWindow()) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(native, &pw, &ph);
+            w = static_cast<float>(pw);
+            h = static_cast<float>(ph);
+        }
 
         const auto& ops = lfs::python::get_rml_panel_host_ops();
         if (ops.prepare_layout)
             ops.prepare_layout(host_, w, h);
+        const float scale = doc->GetContext()->GetDensityIndependentPixelRatio();
+        if (w != layout_width_ || h != layout_height_ || scale != layout_scale_) {
+            on_layout_changed();
+            if (!lfs::python::can_acquire_gil())
+                return;
+            const lfs::python::GilAcquire gil;
+            try {
+                if (nb::hasattr(panel_instance_, "on_host_geometry_changed"))
+                    panel_instance_.attr("on_host_geometry_changed")(w, h, scale);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Panel on_host_geometry_changed error: {}", e.what());
+            }
+            layout_width_ = w;
+            layout_height_ = h;
+            layout_scale_ = scale;
+        }
     }
 
     void RmlPythonPanelAdapter::drawImmediateLayout(Rml::ElementDocument* doc,
@@ -295,39 +393,17 @@ namespace lfs::vis::gui {
         if (!has_draw_ || !doc || !lfs::python::can_acquire_gil())
             return;
 
+        const auto& texture_ops = lfs::python::get_rml_panel_host_ops();
+        const ScopedVulkanUiTextureContext textures(texture_ops.native_graphics ? static_cast<VulkanContext*>(texture_ops.native_graphics(host_)) : nullptr);
+
         assert(isMounted());
 
         if (lfs::python::bridge().prepare_ui)
             lfs::python::bridge().prepare_ui();
 
-        lfs::python::MouseState mouse;
-        if (current_input_) {
-            mouse.pos_x = current_input_->mouse_x;
-            mouse.pos_y = current_input_->mouse_y;
-            if (have_prev_mouse_) {
-                mouse.delta_x = mouse.pos_x - prev_mouse_x_;
-                mouse.delta_y = mouse.pos_y - prev_mouse_y_;
-            }
-            mouse.wheel = current_input_->mouse_wheel;
-            if (current_input_->mouse_clicked[0]) {
-                constexpr auto kDoubleClickWindow = std::chrono::milliseconds(350);
-                const auto now = std::chrono::steady_clock::now();
-                mouse.double_clicked =
-                    have_left_click_time_ && (now - last_left_click_at_) <= kDoubleClickWindow;
-                last_left_click_at_ = now;
-                have_left_click_time_ = true;
-            }
-            mouse.dragging = current_input_->mouse_down[0];
-        } else {
-            auto& io = ImGui::GetIO();
-            mouse.pos_x = io.MousePos.x;
-            mouse.pos_y = io.MousePos.y;
-            mouse.delta_x = io.MouseDelta.x;
-            mouse.delta_y = io.MouseDelta.y;
-            mouse.wheel = io.MouseWheel;
-            mouse.double_clicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-            mouse.dragging = ImGui::IsMouseDragging(ImGuiMouseButton_Left);
-        }
+        const lfs::python::MouseState mouse = makeMouseState(
+            current_input_, prev_mouse_x_, prev_mouse_y_, have_prev_mouse_,
+            have_left_click_time_, last_left_click_at_);
         prev_mouse_x_ = mouse.pos_x;
         prev_mouse_y_ = mouse.pos_y;
         have_prev_mouse_ = true;
@@ -358,6 +434,7 @@ namespace lfs::vis::gui {
             return doc;
 
         const auto& ops = lfs::python::get_rml_panel_host_ops();
+        const ScopedVulkanUiTextureContext textures(ops.native_graphics ? static_cast<VulkanContext*>(ops.native_graphics(host_)) : nullptr);
         const auto& current_language =
             lfs::event::LocalizationManager::getInstance().getCurrentLanguage();
         if (!current_language.empty() && current_language != last_language_) {
@@ -372,7 +449,8 @@ namespace lfs::vis::gui {
         if (frame_serial != 0 && last_prepare_frame_ == frame_serial)
             return doc;
 
-        bool pending_dirty = content_dirty_ || lfs::python::consume_document_dirty(doc);
+        const bool was_content_dirty = content_dirty_;
+        bool pending_dirty = was_content_dirty || lfs::python::consume_document_dirty(doc);
         bool update_requested = lfs::python::consume_document_update_request(doc);
         const bool scene_changed = ctx && ctx->scene && ctx->scene_generation != last_scene_gen_;
         const auto now = std::chrono::steady_clock::now();
@@ -407,6 +485,7 @@ namespace lfs::vis::gui {
 
             if (run_update) {
                 try {
+                    const lfs::python::DocumentUpdateScope update_scope(doc);
                     nb::object result = panel_instance_.attr("on_update")(py_doc);
                     pending_dirty |= panelHookDirtyResult(
                         result, false, warned_non_bool_update_, "on_update");
@@ -421,10 +500,24 @@ namespace lfs::vis::gui {
 
         pending_dirty |= lfs::python::consume_document_dirty(doc);
 
+        const bool immediate_input_pending =
+            has_draw_ && doc->HasAttribute(IMMEDIATE_INPUT_PENDING_ATTRIBUTE);
+
         if (pending_dirty && ops.mark_content_dirty)
             ops.mark_content_dirty(host_);
 
-        drawImmediateLayout(doc, ctx);
+        // A retained panel is clean when neither its host nor its Python model
+        // requested work in this frame. In that state the cached Rml surface is
+        // already authoritative, so avoid reacquiring the GIL and calling draw().
+        const bool draw_required = was_content_dirty || pending_dirty ||
+                                   update_requested || should_run_update ||
+                                   immediate_input_pending ||
+                                   last_prepare_frame_ == 0;
+        if (draw_required) {
+            if (immediate_input_pending)
+                doc->RemoveAttribute(IMMEDIATE_INPUT_PENDING_ATTRIBUTE);
+            drawImmediateLayout(doc, ctx);
+        }
 
         if (frame_serial != 0)
             last_prepare_frame_ = frame_serial;
@@ -436,7 +529,7 @@ namespace lfs::vis::gui {
                                                  const std::string& context_name,
                                                  const std::string& rml_path,
                                                  const std::string& style, bool has_poll,
-                                                 const int height_mode, const bool has_draw)
+                                                 const int height_mode, const bool has_draw, const bool floating)
         : manager_(manager),
           context_name_(context_name),
           rml_path_(rml_path),
@@ -444,7 +537,8 @@ namespace lfs::vis::gui {
           panel_instance_(std::move(panel_instance)),
           has_poll_(has_poll),
           has_draw_(has_draw),
-          height_mode_(height_mode) {
+          height_mode_(height_mode),
+          floating_(floating) {
     }
 
     RmlPythonPanelAdapter::~RmlPythonPanelAdapter() {
@@ -470,17 +564,70 @@ namespace lfs::vis::gui {
         ops.draw(host_, &ctx);
     }
 
+    PanelDirectRenderResult RmlPythonPanelAdapter::renderDirect(
+        const PanelDirectRenderRequest& request,
+        const PanelDrawContext& ctx) {
+        setPanelSpace(request.space);
+        if (request.mode == PanelDirectRenderMode::Measure)
+            return {.handled = true, .height = getDirectDrawHeight()};
+
+        setInputClipY(request.clip_y_min, request.clip_y_max);
+        setInput(request.input);
+        if (request.forced_height != layout_forced_height_) {
+            layout_forced_height_ = request.forced_height;
+            on_layout_changed();
+        }
+        setForcedHeight(request.forced_height);
+
+        bool handled = true;
+        try {
+            // Even a cached draw must observe the host bounds before deciding
+            // whether Python has work. Preload can otherwise consume the frame
+            // with old dimensions and leave a resized panel stale until input.
+            syncDirectLayout(request.width, request.height);
+            switch (request.mode) {
+            case PanelDirectRenderMode::Measure:
+                break;
+            case PanelDirectRenderMode::Draw:
+                drawDirect(request.x, request.y, request.width, request.height, ctx);
+                break;
+            case PanelDirectRenderMode::Cached:
+                handled = drawDirectCached(request.x, request.y, request.width,
+                                           request.height, ctx);
+                break;
+            case PanelDirectRenderMode::Preload:
+                preloadDirect(request.width, request.height, ctx,
+                              request.clip_y_min, request.clip_y_max, request.input);
+                break;
+            }
+        } catch (...) {
+            setForcedHeight(0.0f);
+            setInput(nullptr);
+            setInputClipY(-1.0f, -1.0f);
+            throw;
+        }
+
+        const float height = getDirectDrawHeight();
+        setForcedHeight(0.0f);
+        setInput(nullptr);
+        setInputClipY(-1.0f, -1.0f);
+        return {.handled = handled, .height = height};
+    }
+
     void RmlPythonPanelAdapter::drawDirect(float x, float y, float w, float h,
                                            const PanelDrawContext& ctx) {
         const auto& ops = lfs::python::get_rml_panel_host_ops();
         assert(ops.create && ops.draw_direct && ops.get_document && ops.is_loaded);
 
-        if (ctx.frame_serial == 0 || last_prepare_frame_ != ctx.frame_serial)
-            syncDirectLayout(w, h);
-
-        if (!prepareForRender(&ctx))
+        auto* document = prepareForRender(&ctx);
+        if (!document)
             return;
 
+        if (desktop_reopen_scroll_) {
+            if (auto* content = document->GetElementById("content-wrap"))
+                content->SetScrollTop(*desktop_reopen_scroll_);
+            desktop_reopen_scroll_.reset();
+        }
         ops.draw_direct(host_, x, y, w, h);
     }
 
@@ -489,27 +636,139 @@ namespace lfs::vis::gui {
         (void)ctx;
         if (!host_)
             return false;
+        if (needsAnimationFrame())
+            return false;
 
         const auto& ops = lfs::python::get_rml_panel_host_ops();
         return ops.draw_direct_cached ? ops.draw_direct_cached(host_, x, y, w, h) : false;
     }
 
+    SDL_Window* RmlPythonPanelAdapter::nativeWindow() const {
+        const auto& ops = lfs::python::get_rml_panel_host_ops();
+        return host_ && ops.native_window ? static_cast<SDL_Window*>(ops.native_window(host_)) : nullptr;
+    }
+
+    bool RmlPythonPanelAdapter::detachHost(float x, float y, float w, float h, bool desktop_coordinates) {
+        const auto& ops = lfs::python::get_rml_panel_host_ops();
+        if (!host_ || nativeWindow() || !ops.external_allowed || !ops.external_allowed(host_) ||
+            !ops.configure_external || !lfs::python::can_acquire_gil())
+            return false;
+        const lfs::python::GilAcquire gil;
+        auto* document = static_cast<Rml::ElementDocument*>(ops.get_document(host_));
+        float scroll = 0;
+        if (document) {
+            if (auto* focused = document->GetContext()->GetFocusElement())
+                focused->Blur();
+            if (auto* content = document->GetElementById("content-wrap"))
+                scroll = content->GetScrollTop();
+            callOnUnload(document);
+        }
+        lfs::python::RmlDocumentRegistry::instance().unregister_document(context_name_);
+        layout_.release_elements();
+        ops.destroy(host_);
+        host_ = nullptr;
+        resetLifecycle();
+        if (!ensureHost() || !ops.configure_external(host_, x, y, w, h, desktop_coordinates))
+            return false;
+        if (auto* reloaded = prepareForRender(nullptr)) {
+            if (auto* content = reloaded->GetElementById("content-wrap"))
+                content->SetScrollTop(scroll);
+        }
+        return nativeWindow() != nullptr;
+    }
+
+    bool RmlPythonPanelAdapter::detachToDesktop(float x, float y, float w, float h) {
+        return detachHost(x, y, w, h, false);
+    }
+
+    bool RmlPythonPanelAdapter::restoreDesktopWindow() {
+        if (desktop_restore_checked_ || !ensureHost())
+            return false;
+        desktop_restore_checked_ = true;
+        if (desktop_reopen_bounds_) {
+            const auto bounds = *desktop_reopen_bounds_;
+            desktop_reopen_bounds_.reset();
+            return detachHost(bounds[0], bounds[1], bounds[2], bounds[3], true);
+        }
+        const auto& ops = lfs::python::get_rml_panel_host_ops();
+        float bounds[4]{};
+        return ops.restored_external_bounds && ops.restored_external_bounds(host_, bounds) &&
+               detachHost(bounds[0], bounds[1], bounds[2], bounds[3], true);
+    }
+
+    void RmlPythonPanelAdapter::releaseDesktopWindow() {
+        auto* native = nativeWindow();
+        if (!native || !lfs::python::can_acquire_gil())
+            return;
+        int x = 0, y = 0, w = 0, h = 0;
+        SDL_GetWindowPosition(native, &x, &y);
+        SDL_GetWindowSize(native, &w, &h);
+        desktop_reopen_bounds_ = std::array<float, 4>{float(x), float(y), float(w), float(h)};
+        const lfs::python::GilAcquire gil;
+        const auto& ops = lfs::python::get_rml_panel_host_ops();
+        auto* document = static_cast<Rml::ElementDocument*>(ops.get_document(host_));
+        if (document) {
+            if (auto* focused = document->GetContext()->GetFocusElement())
+                focused->Blur();
+            if (auto* content = document->GetElementById("content-wrap"))
+                desktop_reopen_scroll_ = content->GetScrollTop();
+            callOnUnload(document);
+        }
+        lfs::python::RmlDocumentRegistry::instance().unregister_document(context_name_);
+        layout_.release_elements();
+        ops.destroy(host_);
+        host_ = nullptr;
+        desktop_restore_checked_ = false;
+        resetLifecycle();
+    }
+
     bool RmlPythonPanelAdapter::poll(const PanelDrawContext& ctx) {
         (void)ctx;
-        if (!has_poll_)
+        if (!has_poll_) {
+            poll_visible_ = true;
             return true;
-        if (!lfs::python::can_acquire_gil())
+        }
+        if (!lfs::python::can_acquire_gil()) {
+            poll_visible_ = false;
             return false;
+        }
         if (lfs::python::bridge().prepare_ui)
             lfs::python::bridge().prepare_ui();
 
         const lfs::python::GilAcquire gil;
         try {
-            return nb::cast<bool>(panel_instance_.attr("poll")(lfs::python::get_app_context()));
+            const bool result =
+                nb::cast<bool>(panel_instance_.attr("poll")(lfs::python::get_app_context()));
+            poll_visible_ = result;
+            return result;
         } catch (const std::exception& e) {
             LOG_ERROR("Panel poll error: {}", e.what());
+            poll_visible_ = false;
             return false;
         }
+    }
+
+    void RmlPythonPanelAdapter::setPollVisibility(const bool visible) {
+        poll_visible_ = visible;
+    }
+
+    bool RmlPythonPanelAdapter::isVisibleForAnimation() const {
+        return enabled_visible_ && poll_visible_;
+    }
+
+    void RmlPythonPanelAdapter::on_visibility_changed(const bool visible) {
+        enabled_visible_ = visible;
+        if (visible)
+            content_dirty_ = true;
+    }
+
+    void RmlPythonPanelAdapter::on_layout_changed() {
+        content_dirty_ = true;
+        last_prepare_frame_ = 0;
+    }
+
+    void RmlPythonPanelAdapter::on_content_changed() {
+        content_dirty_ = true;
     }
 
     void RmlPythonPanelAdapter::preload(const PanelDrawContext& ctx) {
@@ -577,25 +836,132 @@ namespace lfs::vis::gui {
         }
     }
 
-    bool RmlPythonPanelAdapter::wantsKeyboard() const {
-        return false;
-    }
-
     bool RmlPythonPanelAdapter::needsAnimationFrame() const {
+        if (auto* native = nativeWindow(); native && SDL_GetBooleanProperty(SDL_GetWindowProperties(native), "lfs.drag_handoff", false))
+            return true;
         if (content_dirty_)
             return true;
         if (!host_)
             return false;
 
         const auto& ops = lfs::python::get_rml_panel_host_ops();
+        if (has_draw_ && ops.get_document) {
+            auto* doc = static_cast<Rml::ElementDocument*>(ops.get_document(host_));
+            if (doc && doc->HasAttribute(IMMEDIATE_INPUT_PENDING_ATTRIBUTE))
+                return true;
+        }
+
+        const auto language_generation =
+            lfs::event::LocalizationManager::getInstance().getCurrentLanguageGeneration();
+        if (language_generation != last_language_generation_)
+            return true;
+
+        if (!dirty_driven_updates_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (next_update_at_ == std::chrono::steady_clock::time_point{} ||
+                now >= next_update_at_) {
+                return true;
+            }
+        }
+
         if (ops.get_document) {
             auto* doc = static_cast<Rml::ElementDocument*>(ops.get_document(host_));
-            if (lfs::python::is_document_dirty(doc) ||
-                lfs::python::is_document_update_requested(doc))
+            if (isVisibleForAnimation() &&
+                (lfs::python::is_document_dirty(doc) ||
+                 lfs::python::is_document_update_requested(doc)))
                 return true;
         }
 
         return ops.needs_animation ? ops.needs_animation(host_) : false;
+    }
+
+    std::string RmlPythonPanelAdapter::animationDemandDescription() const {
+        std::string result = dirty_driven_updates_
+                                 ? "policy=dirty"
+                                 : std::format("policy=interval,{}ms", update_interval_ms_);
+
+        const auto append_reason = [&result](const char* reason) {
+            result += ',';
+            result += reason;
+        };
+        if (content_dirty_)
+            append_reason("content_dirty");
+
+        if (host_) {
+            const auto& ops = lfs::python::get_rml_panel_host_ops();
+            const auto language_generation =
+                lfs::event::LocalizationManager::getInstance().getCurrentLanguageGeneration();
+            if (language_generation != last_language_generation_)
+                append_reason("language");
+
+            if (!dirty_driven_updates_) {
+                const auto now = std::chrono::steady_clock::now();
+                if (next_update_at_ == std::chrono::steady_clock::time_point{} ||
+                    now >= next_update_at_)
+                    append_reason("interval");
+            }
+
+            if (ops.get_document) {
+                auto* doc = static_cast<Rml::ElementDocument*>(ops.get_document(host_));
+                if (has_draw_ && doc &&
+                    doc->HasAttribute(IMMEDIATE_INPUT_PENDING_ATTRIBUTE))
+                    append_reason("immediate_input");
+                if (lfs::python::is_document_dirty(doc))
+                    append_reason("doc_dirty");
+                if (lfs::python::is_document_update_requested(doc))
+                    append_reason("update_requested");
+            }
+
+            if (ops.needs_animation && ops.needs_animation(host_))
+                append_reason("rml_animation");
+
+            if (ops.animation_demand_description) {
+                const auto document = ops.animation_demand_description(host_);
+                if (!document.empty()) {
+                    result += ',';
+                    result += document;
+                }
+            }
+        }
+        return result;
+    }
+
+    bool RmlPythonPanelAdapter::needsImmediateAnimationFrame() const {
+        if (!host_)
+            return false;
+        const auto& ops = lfs::python::get_rml_panel_host_ops();
+        return ops.needs_immediate_animation && ops.needs_immediate_animation(host_);
+    }
+
+    std::optional<double> RmlPythonPanelAdapter::nextScheduledAnimationDelay() const {
+        std::optional<double> min_delay;
+
+        if (host_) {
+            const auto& ops = lfs::python::get_rml_panel_host_ops();
+            if (ops.next_scheduled_update_delay) {
+                double host_delay = 0.0;
+                if (ops.next_scheduled_update_delay(host_, &host_delay))
+                    min_delay = host_delay;
+            }
+        }
+
+        // Interval-policy panels: remaining time until next_update_at_ when it is
+        // still in the future. When unset/expired, needsAnimationFrame() is true.
+        if (!dirty_driven_updates_) {
+            if (next_update_at_ != std::chrono::steady_clock::time_point{}) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now < next_update_at_) {
+                    const double remaining =
+                        std::chrono::duration<double>(next_update_at_ - now).count();
+                    if (remaining > 0.0) {
+                        if (!min_delay || remaining < *min_delay)
+                            min_delay = remaining;
+                    }
+                }
+            }
+        }
+
+        return min_delay;
     }
 
     void RmlPythonPanelAdapter::setForeground(bool fg) {
@@ -605,6 +971,28 @@ namespace lfs::vis::gui {
             if (ops.set_foreground)
                 ops.set_foreground(host_, fg);
         }
+    }
+
+    void RmlPythonPanelAdapter::setPanelSpace(const PanelSpace space) {
+        const bool floating = space == PanelSpace::Floating;
+        if (floating_ == floating)
+            return;
+
+        floating_ = floating;
+        on_layout_changed();
+        if (host_) {
+            const auto& ops = lfs::python::get_rml_panel_host_ops();
+            if (ops.set_floating)
+                ops.set_floating(host_, floating_);
+        }
+    }
+
+    std::string RmlPythonPanelAdapter::captureChromeJson() const {
+        return capture_python_panel_chrome(panel_instance_);
+    }
+
+    void RmlPythonPanelAdapter::applyChromeJson(const std::string_view json) {
+        apply_python_panel_chrome(panel_instance_, json);
     }
 
 } // namespace lfs::vis::gui

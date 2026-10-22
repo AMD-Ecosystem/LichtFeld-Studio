@@ -34,15 +34,22 @@ namespace lfs::vis {
         std::optional<SplitViewPanelId> panel;
         int focused_gaussian_id = -1;
         SelectionPreviewMode selection_mode{};
+        // A preview that does not re-render on pointer motion must not tint
+        // splats, or the tint stays wherever the last unrelated frame put it.
+        bool highlight_splats = true;
     };
 
     struct GizmoState {
         bool cropbox_active = false;
         glm::vec3 cropbox_min{0}, cropbox_max{0};
         glm::mat4 cropbox_transform{1};
+        bool cropbox_affects_render = true;
+        int cropbox_parent_node_index = -1;
         bool ellipsoid_active = false;
         glm::vec3 ellipsoid_radii{1};
         glm::mat4 ellipsoid_transform{1};
+        bool ellipsoid_affects_render = true;
+        int ellipsoid_parent_node_index = -1;
     };
 
     struct FrameViewPanel {
@@ -73,13 +80,15 @@ namespace lfs::vis {
         glm::ivec2 viewport_pos;
         DirtyMask frame_dirty = 0;
         bool training_active = false;
+        bool gaussian_selection_visible = true;
+        // Surface tools must not unproject HiGS batch-approximate depth.
+        bool exact_surface_picking = false;
 
         CursorPreviewState cursor_preview;
         GizmoState gizmo;
         int hovered_camera_id = -1;
         int current_camera_id = -1;
         int hovered_gaussian_id = -1;
-        float selection_flash_intensity = 0;
         std::vector<FrameViewPanel> view_panels;
 
         [[nodiscard]] const FrameViewPanel* findViewPanel(const SplitViewPanelId panel_id) const {
@@ -152,7 +161,6 @@ namespace lfs::vis {
         float near_plane = lfs::rendering::DEFAULT_NEAR_PLANE;
         float far_plane = lfs::rendering::DEFAULT_FAR_PLANE;
         bool orthographic = false;
-        bool color_has_alpha = false;
 
         [[nodiscard]] const std::shared_ptr<lfs::core::Tensor>& primaryDepth() const {
             return depth_panels[0].depth;
@@ -167,7 +175,6 @@ namespace lfs::vis {
             .near_plane = result.near_plane,
             .far_plane = result.far_plane,
             .orthographic = result.orthographic,
-            .color_has_alpha = result.color_has_alpha,
         };
         for (size_t i = 0; i < result.depth_panel_count && i < metadata.depth_panels.size(); ++i) {
             metadata.depth_panels[i] = {

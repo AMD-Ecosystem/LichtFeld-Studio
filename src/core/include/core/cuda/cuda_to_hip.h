@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * CUDA -> HIP compatibility shim for the ROCm/AMD build of the LichtFeld-Studio
- * GPU COMPUTE tranche (tensor library, training kernels, gsplat/fastgs/edge
+ * GPU COMPUTE tranche (tensor library, training kernels, gsplat/fastgs
  * rasterizer backends). This is the ONLY file in the compute tree that knows
  * about HIP: it is force-included on every HIP translation unit (see the
  * top-level CMakeLists `USE_HIP` block, CMAKE_HIP_FLAGS -include ...). On a
@@ -31,13 +31,30 @@
 #define cudaDevAttrComputeCapabilityMinor           hipDeviceAttributeComputeCapabilityMinor
 #define cudaDeviceGetAttribute                      hipDeviceGetAttribute
 #define cudaDeviceGetDefaultMemPool                 hipDeviceGetDefaultMemPool
+#define cudaDeviceGetPCIBusId                       hipDeviceGetPCIBusId
 #define cudaDeviceProp                              hipDeviceProp_t
 #define cudaDeviceReset                             hipDeviceReset
 #define cudaDeviceSynchronize                       hipDeviceSynchronize
 #define cudaDriverGetVersion                        hipDriverGetVersion
+#define cudaErrorAssert                             hipErrorAssert
+#define cudaErrorContextIsDestroyed                 hipErrorContextIsDestroyed
+#define cudaErrorCudartUnloading                    hipErrorDeinitialized
+#define cudaErrorECCUncorrectable                   hipErrorECCNotCorrectable
+#define cudaErrorIllegalAddress                     hipErrorIllegalAddress
+#define cudaErrorInitializationError                hipErrorInitializationError
+#define cudaErrorInsufficientDriver                 hipErrorInsufficientDriver
+#define cudaErrorInvalidConfiguration               hipErrorInvalidConfiguration
 #define cudaErrorInvalidDevice                      hipErrorInvalidDevice
+#define cudaErrorInvalidMemcpyDirection             hipErrorInvalidMemcpyDirection
+#define cudaErrorInvalidResourceHandle              hipErrorInvalidResourceHandle
 #define cudaErrorInvalidValue                       hipErrorInvalidValue
+#define cudaErrorLaunchFailure                      hipErrorLaunchFailure
+#define cudaErrorLaunchTimeout                      hipErrorLaunchTimeOut
+#define cudaErrorMemoryAllocation                   hipErrorMemoryAllocation
+#define cudaErrorNoDevice                           hipErrorNoDevice
 #define cudaErrorNotReady                           hipErrorNotReady
+#define cudaErrorStreamCaptureUnsupported           hipErrorStreamCaptureUnsupported
+#define cudaErrorUnknown                            hipErrorUnknown
 #define cudaError_t                                 hipError_t
 #define cudaEventCreate                             hipEventCreate
 #define cudaEventCreateWithFlags                    hipEventCreateWithFlags
@@ -49,6 +66,8 @@
 #define cudaEventRecord                             hipEventRecord
 #define cudaEventSynchronize                        hipEventSynchronize
 #define cudaEvent_t                                 hipEvent_t
+#define cudaExternalSemaphoreWaitParams             hipExternalSemaphoreWaitParams
+#define cudaExternalSemaphore_t                     hipExternalSemaphore_t
 #define cudaFree                                    hipFree
 #define cudaFreeAsync                               hipFreeAsync
 #define cudaFreeHost                                hipHostFree
@@ -60,8 +79,10 @@
 #define cudaGetErrorName                            hipGetErrorName
 #define cudaGetErrorString                          hipGetErrorString
 #define cudaGetLastError                            hipGetLastError
+#define cudaGraphDestroy                            hipGraphDestroy
 #define cudaHostAlloc                               hipHostMalloc
 #define cudaHostAllocDefault                        hipHostMallocDefault
+#define cudaLaunchKernel                            hipLaunchKernel
 #define cudaLaunchHostFunc                          hipLaunchHostFunc
 #define cudaMalloc                                  hipMalloc
 #define cudaMallocAsync                             hipMallocAsync
@@ -76,9 +97,11 @@
 #define cudaMemPoolTrimTo                           hipMemPoolTrimTo
 #define cudaMemPool_t                               hipMemPool_t
 #define cudaMemcpy                                  hipMemcpy
+#define cudaMemcpy2DAsync                           hipMemcpy2DAsync
 #define cudaMemcpyAsync                             hipMemcpyAsync
 #define cudaMemcpyDeviceToDevice                    hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost                      hipMemcpyDeviceToHost
+#define cudaMemcpyFromSymbol                        hipMemcpyFromSymbol
 #define cudaMemcpyHostToDevice                      hipMemcpyHostToDevice
 #define cudaMemcpyKind                              hipMemcpyKind
 #define cudaMemcpyToSymbol                          hipMemcpyToSymbol
@@ -86,11 +109,13 @@
 #define cudaMemoryTypeDevice                        hipMemoryTypeDevice
 #define cudaMemoryTypeHost                          hipMemoryTypeHost
 #define cudaMemoryTypeManaged                       hipMemoryTypeManaged
+#define cudaMemoryTypeUnregistered                  hipMemoryTypeUnregistered
 #define cudaMemset                                  hipMemset
 #define cudaMemsetAsync                             hipMemsetAsync
 #define cudaPeekAtLastError                         hipPeekAtLastError
 #define cudaPointerAttributes                       hipPointerAttribute_t
 #define cudaPointerGetAttributes                    hipPointerGetAttributes
+#define cudaRuntimeGetVersion                       hipRuntimeGetVersion
 #define cudaSetDevice                               hipSetDevice
 #define cudaStreamCreate                            hipStreamCreate
 #define cudaStreamCreateWithFlags                   hipStreamCreateWithFlags
@@ -101,16 +126,21 @@
 #define cudaStreamWaitEvent                         hipStreamWaitEvent
 #define cudaStream_t                                hipStream_t
 #define cudaSuccess                                 hipSuccess
+#define cudaWaitExternalSemaphoresAsync             hipWaitExternalSemaphoresAsync
+#define curand                                      hiprand
 #define curandCreateGenerator                       hiprandCreateGenerator
 #define curandDestroyGenerator                      hiprandDestroyGenerator
 #define curandGenerateNormal                        hiprandGenerateNormal
 #define curandGenerator_t                           hiprandGenerator_t
 #define curandSetGeneratorOffset                    hiprandSetGeneratorOffset
 #define curandSetPseudoRandomGeneratorSeed          hiprandSetPseudoRandomGeneratorSeed
+#define curandSetStream                             hiprandSetStream
 #define curandState                                 hiprandState_t
+#define curandStatePhilox4_32_10_t                  hiprandStatePhilox4_32_10_t
 #define curandStatus_t                              hiprandStatus_t
 #define curand_init                                 hiprand_init
 #define curand_normal                               hiprand_normal
+#define curand_normal4                              hiprand_normal4
 #define curand_uniform                              hiprand_uniform
 #define CURAND_RNG_PSEUDO_PHILOX4_32_10             HIPRAND_RNG_PSEUDO_PHILOX4_32_10
 #define CURAND_STATUS_SUCCESS                       HIPRAND_STATUS_SUCCESS
@@ -135,10 +165,12 @@
 #define cudaIpcOpenEventHandle                      hipIpcOpenEventHandle
 #define cudaStreamBeginCapture                      hipStreamBeginCapture
 #define cudaStreamCaptureMode                       hipStreamCaptureMode
+#define cudaStreamCaptureModeGlobal                 hipStreamCaptureModeGlobal
 #define cudaStreamCaptureStatus                     hipStreamCaptureStatus
 #define cudaStreamCaptureStatusActive               hipStreamCaptureStatusActive
 #define cudaStreamCaptureStatusInvalidated          hipStreamCaptureStatusInvalidated
 #define cudaStreamCaptureStatusNone                 hipStreamCaptureStatusNone
+#define cudaStreamEndCapture                        hipStreamEndCapture
 #define cudaStreamGetCaptureInfo                    hipStreamGetCaptureInfo
 #define cudaStreamGetCaptureInfo_v2                 hipStreamGetCaptureInfo_v2
 #define cudaStreamGetPriority                       hipStreamGetPriority
@@ -153,6 +185,7 @@
  * memory_arena.cu uses the low-level virtual-memory-management driver API
  * (cuMemCreate/Map/SetAccess/AddressReserve, CUmemGenericAllocationHandle,
  * CUdeviceptr, ...) which all have hip* driver equivalents. */
+#define CUDA_ERROR_OUT_OF_MEMORY                         hipErrorOutOfMemory
 #define CUDA_SUCCESS                                     hipSuccess
 #define CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED hipDeviceAttributeVirtualMemoryManagementSupported
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE               hipMemAccessFlagsProtReadWrite
@@ -160,6 +193,8 @@
 #define CU_MEM_ALLOC_GRANULARITY_MINIMUM                 hipMemAllocationGranularityMinimum
 #define CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR         hipMemHandleTypePosixFileDescriptor
 #define CU_MEM_LOCATION_TYPE_DEVICE                      hipMemLocationTypeDevice
+#define CUevent_st                                       ihipEvent_t
+#define CUstream_st                                      ihipStream_t
 #define CUdevice_attribute                               hipDeviceAttribute_t
 #define CUdeviceptr                                      hipDeviceptr_t
 #define CUmemAccessDesc                                  hipMemAccessDesc
@@ -168,7 +203,7 @@
 #define CUmemGenericAllocationHandle                     hipMemGenericAllocationHandle_t
 #define CUresult                                         hipError_t
 #define cuDeviceGetAttribute                             hipDeviceGetAttribute
-#define cuGetErrorName                                   hipGetErrorName
+#define cuGetErrorName                                   hipDrvGetErrorName
 #define cuGetErrorString                                 hipDrvGetErrorString
 #define cuMemAddressFree                                 hipMemAddressFree
 #define cuMemAddressReserve                              hipMemAddressReserve
@@ -179,6 +214,30 @@
 #define cuMemRelease                                     hipMemRelease
 #define cuMemSetAccess                                   hipMemSetAccess
 #define cuMemUnmap                                       hipMemUnmap
+
+/* CUDA error codes with no HIP counterpart. The error classifiers name them in
+ * switch labels; HIP never returns them, so give each its CUDA value, which no
+ * hipError_t enumerator uses, to keep the labels distinct and unreachable. */
+#define cudaErrorCompatNotSupportedOnDevice static_cast<hipError_t>(804)
+#define cudaErrorDevicesUnavailable         static_cast<hipError_t>(46)
+#define cudaErrorHardwareStackError         static_cast<hipError_t>(714)
+#define cudaErrorIllegalInstruction         static_cast<hipError_t>(715)
+#define cudaErrorInvalidAddressSpace        static_cast<hipError_t>(717)
+#define cudaErrorInvalidPc                  static_cast<hipError_t>(718)
+#define cudaErrorMisalignedAddress          static_cast<hipError_t>(716)
+#define cudaErrorStartupFailure             static_cast<hipError_t>(127)
+#define cudaErrorSystemDriverMismatch       static_cast<hipError_t>(803)
+#define cudaErrorSystemNotReady             static_cast<hipError_t>(802)
+
+/* __grid_constant__ only marks a const kernel parameter as read in place; HIP
+ * passes kernel arguments the same way without it. */
+#define __grid_constant__
+#define __trap() __builtin_trap()
+/* __nanosleep is only a back-off hint in spin loops; s_sleep 1 is the shortest
+ * hardware sleep (about 64 clocks). */
+#if defined(__HIPCC__)
+__device__ inline void __nanosleep(unsigned int) { __builtin_amdgcn_s_sleep(1); }
+#endif
 
 /* fp16/bf16: HIP provides __half/__half2 (hip_fp16.h) as drop-ins. The CUDA
  * bfloat16 scalar __nv_bfloat16 maps to HIP's __hip_bfloat16. */
@@ -220,6 +279,14 @@ namespace lfs {
  * 64-bit mask (sizeof(MaskT)==8) regardless of active wave width, so the CUDA
  * literal 0xffffffff fails to COMPILE on HIP. */
 #define LFS_FULL_WARP_MASK 0xffffffffffffffffULL
+
+/* Lane mask of the caller's 32-lane group, for code written for 32-lane CUDA
+ * warps: the whole wave on wave32, the caller's half on wave64. HIP checks a
+ * *_sync mask against the lanes that reach the call (__hip_check_mask, which
+ * traps unless NDEBUG), so where the two halves of a 64-lane wave take
+ * different paths only the group mask is valid. The shuffle itself does not
+ * depend on the mask; a ballot returns only the mask's bits. */
+#define LFS_GROUP32_LANE_MASK (0xffffffffull << (__lane_id() & 32u))
 
 /* ---- GLM in device code ----
  * The build uses GLM 1.0.1 (vendored), which has a NATIVE GLM_COMPILER_HIP path

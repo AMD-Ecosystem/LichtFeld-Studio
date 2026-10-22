@@ -16,7 +16,8 @@ namespace lfs::vis {
                               lfs::core::Tensor* selection_tensor,
                               bool saturation_mode, float saturation_amount,
                               std::optional<SplitViewPanelId> panel,
-                              int focused_gaussian_id) {
+                              int focused_gaussian_id,
+                              bool highlight_splats) {
             cursor_preview_.active = active;
             cursor_preview_.x = x;
             cursor_preview_.y = y;
@@ -27,6 +28,7 @@ namespace lfs::vis {
             cursor_preview_.saturation_amount = saturation_amount;
             cursor_preview_.panel = panel;
             cursor_preview_.focused_gaussian_id = focused_gaussian_id;
+            cursor_preview_.highlight_splats = highlight_splats;
         }
 
         void clearCursorPreview() {
@@ -163,8 +165,11 @@ namespace lfs::vis {
         void setHoveredGaussianId(int hovered_gaussian_id) { hovered_gaussian_id_ = hovered_gaussian_id; }
 
         void setCropbox(bool active, const glm::vec3& min, const glm::vec3& max,
-                        const glm::mat4& world_transform) {
+                        const glm::mat4& world_transform, bool affects_render = true,
+                        int parent_node_index = -1) {
             cropbox_active_ = active;
+            cropbox_affects_render_ = affects_render;
+            cropbox_parent_node_index_ = parent_node_index;
             if (active) {
                 cropbox_min_ = min;
                 cropbox_max_ = max;
@@ -172,26 +177,44 @@ namespace lfs::vis {
             }
         }
 
-        void setEllipsoid(bool active, const glm::vec3& radii, const glm::mat4& world_transform) {
+        void setEllipsoid(bool active, const glm::vec3& radii, const glm::mat4& world_transform,
+                          bool affects_render = true, int parent_node_index = -1) {
             ellipsoid_active_ = active;
+            ellipsoid_affects_render_ = affects_render;
+            ellipsoid_parent_node_index_ = parent_node_index;
             if (active) {
                 ellipsoid_radii_ = radii;
                 ellipsoid_transform_ = world_transform;
             }
         }
 
-        void setCropboxActive(bool active) { cropbox_active_ = active; }
-        void setEllipsoidActive(bool active) { ellipsoid_active_ = active; }
-
+        void setCropboxActive(bool active) {
+            cropbox_active_ = active;
+            if (!active) {
+                cropbox_affects_render_ = true;
+                cropbox_parent_node_index_ = -1;
+            }
+        }
+        void setEllipsoidActive(bool active) {
+            ellipsoid_active_ = active;
+            if (!active) {
+                ellipsoid_affects_render_ = true;
+                ellipsoid_parent_node_index_ = -1;
+            }
+        }
         [[nodiscard]] GizmoState makeFrameGizmoState() const {
             return GizmoState{
                 .cropbox_active = cropbox_active_,
                 .cropbox_min = cropbox_min_,
                 .cropbox_max = cropbox_max_,
                 .cropbox_transform = cropbox_transform_,
+                .cropbox_affects_render = cropbox_affects_render_,
+                .cropbox_parent_node_index = cropbox_parent_node_index_,
                 .ellipsoid_active = ellipsoid_active_,
                 .ellipsoid_radii = ellipsoid_radii_,
                 .ellipsoid_transform = ellipsoid_transform_,
+                .ellipsoid_affects_render = ellipsoid_affects_render_,
+                .ellipsoid_parent_node_index = ellipsoid_parent_node_index_,
             };
         }
 
@@ -233,6 +256,10 @@ namespace lfs::vis {
 
         bool cropbox_active_ = false;
         bool ellipsoid_active_ = false;
+        bool cropbox_affects_render_ = true;
+        int cropbox_parent_node_index_ = -1;
+        bool ellipsoid_affects_render_ = true;
+        int ellipsoid_parent_node_index_ = -1;
         glm::vec3 cropbox_min_{0.0f};
         glm::vec3 cropbox_max_{0.0f};
         glm::mat4 cropbox_transform_{1.0f};

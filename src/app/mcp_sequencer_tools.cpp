@@ -13,7 +13,11 @@
 #include "visualizer/sequencer/sequencer_controller.hpp"
 #include "visualizer/visualizer.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 
@@ -26,6 +30,10 @@ namespace lfs::app {
         using json = nlohmann::json;
         using mcp::McpTool;
 
+        json number_array_schema(const std::string& description) {
+            return json{{"type", "array"}, {"minItems", 3}, {"maxItems", 3}, {"items", json{{"type", "number"}}}, {"description", description}};
+        }
+
         json vec3_to_json(const glm::vec3& value) {
             return json::array({value.x, value.y, value.z});
         }
@@ -35,10 +43,38 @@ namespace lfs::app {
                 return std::optional<glm::vec3>{};
 
             const auto& value = args[key];
-            if (!value.is_array() || value.size() != 3)
-                return std::unexpected(std::string("Field '") + key + "' must be a 3-element array");
+            if (!value.is_array() || value.size() != 3 ||
+                !std::ranges::all_of(value, [](const json& item) { return item.is_number(); }))
+                return std::unexpected(std::format("Field '{}' must be a 3-element number array (got {})", key, value.dump()));
+            const glm::vec3 result(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
+            if (!std::isfinite(result.x) || !std::isfinite(result.y) || !std::isfinite(result.z))
+                return std::unexpected(std::format("Field '{}' must contain finite float values (got {})", key, value.dump()));
+            return result;
+        }
 
-            return glm::vec3(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
+        std::optional<std::string> view_vectors_error(const glm::vec3& eye, const glm::vec3& target) {
+            constexpr float max_coordinate = 1.0e20f;
+            const auto coordinate_ok = [](const glm::vec3& value) {
+                constexpr float limit = 1.0e20f;
+                return std::abs(value.x) <= limit && std::abs(value.y) <= limit && std::abs(value.z) <= limit;
+            };
+            if (!coordinate_ok(eye) || !coordinate_ok(target))
+                return std::format("Camera eye and target coordinates must be within +/-{}", max_coordinate);
+            const glm::vec3 direction = target - eye;
+            if (!std::isfinite(glm::length(direction)) || glm::length(direction) <= 1.0e-6f)
+                return "Camera eye and target must not coincide";
+            return std::nullopt;
+        }
+
+        std::optional<std::string> explicit_up_error(const glm::vec3& eye, const glm::vec3& target,
+                                                     const glm::vec3& up) {
+            const float up_length = glm::length(up);
+            if (!std::isfinite(up_length) || up_length <= 1.0e-6f)
+                return "Camera up vector must have finite length greater than 1e-6";
+            const glm::vec3 forward = glm::normalize(target - eye);
+            if (glm::length(glm::cross(forward, up / up_length)) <= 1.0e-6f)
+                return "Camera up vector must not be parallel to the view direction";
+            return std::nullopt;
         }
 
         const char* keyframe_easing_name(const uint8_t easing) {
@@ -115,8 +151,9 @@ namespace lfs::app {
 
         json sequencer_state_json(const SequencerToolBackend& backend, const vis::SequencerController& controller) {
             const auto& timeline = controller.timeline();
+            const bool has_ply_sequence = controller.hasPlySequence();
             const bool has_any_timeline_state =
-                timeline.realKeyframeCount() > 0 || timeline.hasAnimationClip();
+                timeline.realKeyframeCount() > 0 || timeline.hasAnimationClip() || has_ply_sequence;
             json keyframe_list = json::array();
             int64_t visible_index = 0;
             for (const auto& keyframe : timeline.keyframes()) {
@@ -132,6 +169,11 @@ namespace lfs::app {
                 {"visible", backend.is_visible ? backend.is_visible() : false},
                 {"has_keyframes", has_any_timeline_state},
                 {"playback_speed", controller.playbackSpeed()},
+                {"has_ply_sequence", has_ply_sequence},
+                {"ply_sequence_node", has_ply_sequence ? controller.plySequence()->node_name : ""},
+                {"ply_sequence_uuid", has_ply_sequence ? controller.plySequence()->node_uuid.to_string() : ""},
+                {"ply_sequence_fps", controller.plySequenceFps()},
+                {"ply_sequence_frame_count", has_ply_sequence ? controller.plySequence()->frames.size() : 0},
                 {"show_camera_path", ui_state ? ui_state->show_camera_path : true},
                 {"follow_playback", ui_state ? ui_state->follow_playback : false},
                 {"keyframe_count", keyframe_list.size()},
@@ -140,6 +182,16 @@ namespace lfs::app {
             result["selected_keyframe_id"] = controller.selectedKeyframeId()
                                                  ? json(*controller.selectedKeyframeId())
                                                  : json(nullptr);
+            result["ply_sequence_current_frame"] = controller.currentPlySequenceFrameIndex()
+                                                       ? json(*controller.currentPlySequenceFrameIndex())
+                                                       : json(nullptr);
+            if (backend.ply_sequence_status) {
+                const std::string status = backend.ply_sequence_status();
+                if (!status.empty()) {
+                    if (auto parsed = json::parse(status, nullptr, false); !parsed.is_discarded())
+                        result["ply_player"] = std::move(parsed);
+                }
+            }
             return result;
         }
 
@@ -189,9 +241,10 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"eye", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera eye position [x,y,z]"}}},
-                        {"target", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera target [x,y,z]"}}},
-                        {"up", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera up vector [x,y,z]"}}},
+                        {"time", json{{"type", "number"}, {"description", "Keyframe time in seconds; defaults to the playhead. Times past the clip duration extend it, which scrubbing cannot reach."}}},
+                        {"eye", number_array_schema("Optional camera eye position [x,y,z]")},
+                        {"target", number_array_schema("Optional camera target [x,y,z]")},
+                        {"up", number_array_schema("Optional camera up vector [x,y,z]")},
                         {"fov_degrees", json{{"type", "number"}, {"description", "Optional camera FOV override"}}},
                         {"show_sequencer", json{{"type", "boolean"}, {"description", "Show the sequencer panel before operating (default: true)"}}}},
                     .required = {}}},
@@ -207,13 +260,27 @@ namespace lfs::app {
                     return json{{"error", up.error()}};
                 if (eye->has_value() != target->has_value())
                     return json{{"error", "Fields 'eye' and 'target' must either both be provided or both be omitted"}};
+                if (eye->has_value()) {
+                    if (auto error = view_vectors_error(**eye, **target))
+                        return mcp::invalid_argument_result(*error, "eye");
+                    if (up->has_value()) {
+                        if (auto error = explicit_up_error(**eye, **target, **up))
+                            return mcp::invalid_argument_result(*error, "up");
+                    }
+                }
 
                 const std::optional<float> fov = args.contains("fov_degrees")
                                                      ? std::optional<float>(args["fov_degrees"].get<float>())
                                                      : std::nullopt;
+                const bool has_time = args.contains("time") && !args["time"].is_null();
+                const std::optional<float> time = has_time
+                                                      ? std::optional<float>(args["time"].get<float>())
+                                                      : std::nullopt;
+                if (time && *time < 0.0f)
+                    return json{{"error", "Field 'time' must not be negative"}};
                 const bool show_sequencer = args.value("show_sequencer", true);
 
-                return post_and_wait(viewer, [backend, eye = *eye, target = *target, up = *up, fov, show_sequencer]() -> json {
+                return post_and_wait(viewer, [backend, eye = *eye, target = *target, up = *up, fov, time, show_sequencer]() -> json {
                     auto controller = ensure_ready_controller(backend);
                     if (!controller)
                         return json{{"error", controller.error()}};
@@ -222,7 +289,7 @@ namespace lfs::app {
                         backend.set_visible(true);
                     apply_camera_args(eye, target, up, fov);
                     if (backend.add_keyframe)
-                        backend.add_keyframe();
+                        backend.add_keyframe(time);
                     return sequencer_state_json(backend, **controller);
                 });
             });
@@ -235,9 +302,9 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"keyframe_id", json{{"type", "integer"}, {"description", "Stable keyframe id to select before updating"}}},
-                        {"eye", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera eye position [x,y,z]"}}},
-                        {"target", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera target [x,y,z]"}}},
-                        {"up", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera up vector [x,y,z]"}}},
+                        {"eye", number_array_schema("Optional camera eye position [x,y,z]")},
+                        {"target", number_array_schema("Optional camera target [x,y,z]")},
+                        {"up", number_array_schema("Optional camera up vector [x,y,z]")},
                         {"fov_degrees", json{{"type", "number"}, {"description", "Optional camera FOV override"}}},
                         {"show_sequencer", json{{"type", "boolean"}, {"description", "Show the sequencer panel before operating (default: true)"}}}},
                     .required = {}}},
@@ -253,6 +320,14 @@ namespace lfs::app {
                     return json{{"error", up.error()}};
                 if (eye->has_value() != target->has_value())
                     return json{{"error", "Fields 'eye' and 'target' must either both be provided or both be omitted"}};
+                if (eye->has_value()) {
+                    if (auto error = view_vectors_error(**eye, **target))
+                        return mcp::invalid_argument_result(*error, "eye");
+                    if (up->has_value()) {
+                        if (auto error = explicit_up_error(**eye, **target, **up))
+                            return mcp::invalid_argument_result(*error, "up");
+                    }
+                }
 
                 const std::optional<float> fov = args.contains("fov_degrees")
                                                      ? std::optional<float>(args["fov_degrees"].get<float>())
@@ -361,6 +436,9 @@ namespace lfs::app {
                     if (!keyframe_index)
                         return json{{"error", keyframe_index.error()}};
 
+                    if (*keyframe_index == 0)
+                        return mcp::invalid_argument_result("The first keyframe cannot be deleted", "keyframe_id");
+
                     if (backend.delete_keyframe)
                         backend.delete_keyframe(*keyframe_index);
                     return sequencer_state_json(backend, **controller);
@@ -377,6 +455,8 @@ namespace lfs::app {
                         {"keyframe_id", json{{"type", "integer"}, {"description", "Stable keyframe id"}}},
                         {"easing", json{{"oneOf", json::array({json{{"type", "integer"}},
                                                                json{{"type", "string"}, {"enum", json::array({"linear", "ease_in", "ease_out", "ease_in_out"})}}})},
+                                        {"minimum", 0},
+                                        {"maximum", 3},
                                         {"description", "Easing mode as integer or name"}}}},
                     .required = {"keyframe_id", "easing"}}},
             [viewer, backend](const json& args) -> json {
@@ -514,7 +594,7 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"speed", json{{"type", "number"}, {"description", "Playback speed multiplier"}}}},
+                        {"speed", json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 4.0}, {"description", "Playback speed multiplier"}}}},
                     .required = {"speed"}}},
             [viewer, backend](const json& args) -> json {
                 const float speed = args["speed"].get<float>();
@@ -527,6 +607,93 @@ namespace lfs::app {
                     if (backend.set_playback_speed)
                         backend.set_playback_speed(speed);
                     return sequencer_state_json(backend, **controller);
+                });
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "sequencer.load_ply_sequence",
+                .description = "Load an ordered PLY frame sequence from a directory for streaming playback",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"directory", json{{"type", "string"}, {"description", "Directory containing ordered .ply frames"}}},
+                        {"fps", json{{"type", "number"}, {"minimum", 1}, {"maximum", 240}, {"description", "Playback frame rate (1-240, default 24)"}}},
+                        {"show_sequencer", json{{"type", "boolean"}, {"description", "Show the sequencer panel (default: true)"}}}},
+                    .required = {"directory"}}},
+            [viewer, backend](const json& args) -> json {
+                const std::string directory = args["directory"].get<std::string>();
+                const float fps = args.value("fps", 24.0f);
+                const bool show_sequencer = args.value("show_sequencer", true);
+
+                return post_and_wait(viewer, [backend, directory, fps, show_sequencer]() -> json {
+                    auto controller = ensure_ready_controller(backend);
+                    if (!controller)
+                        return json{{"error", controller.error()}};
+
+                    if (show_sequencer && backend.set_visible)
+                        backend.set_visible(true);
+                    if (!backend.load_ply_sequence)
+                        return json{{"error", "load_ply_sequence backend unavailable"}};
+                    if (const auto loaded = backend.load_ply_sequence(directory, fps); !loaded)
+                        return json{{"error", loaded.error().user_message()}};
+
+                    json result = sequencer_state_json(backend, **controller);
+                    result["directory"] = directory;
+                    return result;
+                });
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "sequencer.scrub",
+                .description = "Move the sequencer playhead to a time (seconds) or PLY-sequence frame index, optionally updating the viewport camera. PLY seeks are asynchronous: success is false and pending is true until the requested frame is displayed. Poll sequencer.get ply_player.on_target and requested_frame_failed for completion",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"time", json{{"type", "number"}, {"description", "Playhead time in seconds"}}},
+                        {"frame", json{{"type", "integer"}, {"description", "PLY-sequence frame index (overrides time)"}}},
+                        {"update_camera", json{{"type", "boolean"}, {"description", "Apply the interpolated camera pose to the viewport (default: false)"}}}},
+                    .required = {}}},
+            [viewer, backend](const json& args) -> json {
+                const bool has_time = args.contains("time") && !args["time"].is_null();
+                const bool has_frame = args.contains("frame") && !args["frame"].is_null();
+                const std::optional<float> time = has_time ? std::optional<float>(args["time"].get<float>()) : std::nullopt;
+                const std::optional<int64_t> frame = has_frame ? std::optional<int64_t>(args["frame"].get<int64_t>()) : std::nullopt;
+                const bool update_camera = args.value("update_camera", false);
+
+                return post_and_wait(viewer, [backend, time, frame, update_camera]() -> json {
+                    auto controller = ensure_ready_controller(backend);
+                    if (!controller)
+                        return json{{"error", controller.error()}};
+
+                    float target_time = time.value_or((*controller)->playhead());
+                    if (frame.has_value()) {
+                        const float fps = (*controller)->plySequenceFps();
+                        target_time = static_cast<float>(std::max<int64_t>(*frame, 0)) / (fps > 0.0f ? fps : 24.0f);
+                    }
+                    bool camera_updated = false;
+                    if (backend.scrub_to_time) {
+                        camera_updated = backend.scrub_to_time(target_time, update_camera);
+                    } else {
+                        (*controller)->seek(target_time);
+                    }
+
+                    json result = sequencer_state_json(backend, **controller);
+                    result["scrubbed_to_time"] = target_time;
+                    result["camera_updated"] = camera_updated;
+                    if (const auto player = result.find("ply_player"); player != result.end()) {
+                        const bool displayed = player->value("on_target", false);
+                        const bool failed = !displayed && player->value("requested_frame_failed", false);
+                        result["success"] = displayed;
+                        result["pending"] = !displayed && !failed;
+                        if (failed) {
+                            result["error"] = std::format(
+                                "Failed to load requested PLY sequence frame {} (displayed frame: {})",
+                                player->value("requested_frame", -1ll), player->value("displayed_frame", -1ll));
+                        }
+                    }
+                    return result;
                 });
             });
     }

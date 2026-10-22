@@ -103,6 +103,39 @@
                         </svg>
                     </button>
 
+                    <button id="measure" class="controlButton" title="Measure Distance">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">
+                            <g class='stroke'><use href="#measureIcon"/></g>
+                            <g class='fill'><use href="#measureIcon"/></g>
+                        </svg>
+                    </button>
+
+                    <button id="orthoCamera" class="controlButton" title="Orthographic Mode">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">
+                            <g class='stroke'><use href="#orthoIcon"/></g>
+                            <g class='fill'><use href="#orthoIcon"/></g>
+                        </svg>
+                    </button>
+
+                    <button id="labels" class="controlButton" title="Add Labels">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">
+                            <g class='stroke'><use href="#labelIcon"/></g>
+                            <g class='fill'><use href="#labelIcon"/></g>
+                        </svg>
+                    </button>
+                    <button id="labelSave" class="controlButton" title="Save Annotations (labels + measurements)">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">
+                            <g class='stroke'><use href="#labelSaveIcon"/></g>
+                            <g class='fill'><use href="#labelSaveIcon"/></g>
+                        </svg>
+                    </button>
+                    <button id="labelLoad" class="controlButton" title="Load Annotations (labels + measurements)">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">
+                            <g class='stroke'><use href="#labelLoadIcon"/></g>
+                            <g class='fill'><use href="#labelLoadIcon"/></g>
+                        </svg>
+                    </button>
+
                     <button id="arMode" class="controlButton hidden">
                         <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28">
                             <g class='stroke'><use href="#arIcon"/></g>
@@ -116,6 +149,12 @@
                         </svg>
                     </button>
 
+                    <button id="screenshot" class="controlButton" title="Export View as JPG">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">
+                            <g class='stroke'><use href="#screenshotIcon"/></g>
+                            <g class='fill'><use href="#screenshotIcon"/></g>
+                        </svg>
+                    </button>
                     <button id="info" class="controlButton">
                         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">
                             <g class='stroke'><use href="#infoIcon"/></g>
@@ -156,8 +195,25 @@
                 </div>
                 <div class="divider"></div>
                 <div class="settingsRow">
+                    <div id="fovLabel">FOV</div>
+                    <input id="fovSlider" type="range" min="10" max="120" step="0.5" value="50">
+                    <div id="fovValue">50°</div>
+                    <button id="fovReset">Reset FOV</button>
+                </div>
+                <div class="settingsRow">
                     <button id="frame">Frame</button>
                     <button id="reset">Reset</button>
+                </div>
+            </div>
+
+            <!-- Screenshot Panel -->
+            <div id="screenshotPanel" class="hidden">
+                <div id="screenshotPanelLabel">Export Current View (JPG)</div>
+                <div id="screenshotOptions">
+                    <button id="screenshot1080p">1080p</button>
+                    <button id="screenshot2k">2K</button>
+                    <button id="screenshot4k">4K</button>
+                    <button id="screenshot8k">8K</button>
                 </div>
             </div>
 
@@ -250,6 +306,9 @@
             <!-- Tooltip -->
             <div id="tooltip"></div>
 
+            <!-- Screenshot Toast -->
+            <div id="screenshotToast" class="hidden"></div>
+
             <!-- Branding -->
             <a id="lichtfeldBranding" href="https://github.com/MrNeRF/LichtFeld-Studio" target="_blank" rel="noopener">
                 <svg id="lichtfeldLogo" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
@@ -306,6 +365,34 @@
                 <path d="M8.40039 2.09961C8.89727 2.09982 9.2998 2.50307 9.2998 3C9.2998 3.49693 8.89727 3.90018 8.40039 3.90039H4C3.94477 3.90039 3.90039 3.94477 3.90039 4V8.40039C3.90018 8.89727 3.49693 9.2998 3 9.2998C2.50307 9.2998 2.09982 8.89727 2.09961 8.40039V4C2.09961 2.95066 2.95066 2.09961 4 2.09961H8.40039Z"/>
                 <path d="M20 2.09961C21.0493 2.09961 21.9004 2.95066 21.9004 4V8.40039C21.9002 8.89727 21.4969 9.2998 21 9.2998C20.5031 9.2998 20.0998 8.89727 20.0996 8.40039V4C20.0996 3.94477 20.0552 3.90039 20 3.90039H15.5996C15.1027 3.90018 14.7002 3.49693 14.7002 3C14.7002 2.50307 15.1027 2.09982 15.5996 2.09961H20Z"/>
             </symbol>
+            <symbol id="measureIcon" viewBox="0 0 24 24">
+                <g transform="rotate(-45 12 12)">
+                    <rect x="1" y="10.5" width="22" height="3" rx="1"/>
+                    <rect x="4" y="8" width="2" height="4"/>
+                    <rect x="9" y="8" width="2" height="4"/>
+                    <rect x="14" y="8" width="2" height="4"/>
+                    <rect x="19" y="8" width="2" height="4"/>
+                </g>
+            </symbol>
+            <symbol id="orthoIcon" viewBox="0 0 24 24">
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M5 2C3.34315 2 2 3.34315 2 5V19C2 20.6569 3.34315 22 5 22H19C20.6569 22 22 20.6569 22 19V5C22 3.34315 20.6569 2 19 2H5ZM5 7V17H17V7H5Z"/>
+            </symbol>
+            <symbol id="screenshotIcon" viewBox="0 0 24 24">
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M5 5C3.34315 5 2 6.34315 2 8V19C2 20.6569 3.34315 22 5 22H19C20.6569 22 22 20.6569 22 19V8C22 6.34315 20.6569 5 19 5H16.5L15 3H9L7.5 5H5ZM14.5 12A2.5 2.5 0 1 1 9.5 12A2.5 2.5 0 1 1 14.5 12Z"/>
+            </symbol>
+            <symbol id="labelIcon" viewBox="0 0 24 24">
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M2 5C2 3.3431 3.3431 2 5 2H9.1716C9.7064 2 10.2225 2.2121 10.6064 2.5858L21.4142 13.3936C22.1953 14.1747 22.1953 15.4359 21.4142 16.217L16.2172 21.4142C15.4361 22.1953 14.1749 22.1953 13.3938 21.4142L2.5858 10.6064C2.2121 10.2225 2 9.7064 2 9.1716V5ZM7.5 3.5A1.5 1.5 0 1 1 7.5 6.5A1.5 1.5 0 0 1 7.5 3.5Z"/>
+            </symbol>
+            <symbol id="labelSaveIcon" viewBox="0 0 24 24">
+                <path d="M10.0996 2.0996C10.5966 2.0996 11 2.5029 11 3V8.4004H7V3C7 2.5029 7.4034 2.0996 7.9004 2.0996H10.0996Z"/>
+                <path d="M6.5 8.0996L11 12.5996L15.5 8.0996L16.91 9.5098L11 15.4199L5.09 9.5098L6.5 8.0996Z"/>
+                <path d="M3 14.5C3 14.2239 3.2239 14 3.5 14H8V17.5C8 17.7761 8.2239 18 8.5 18H15.5C15.7761 18 16 17.7761 16 17.5V14H20.5C20.7761 14 21 14.2239 21 14.5V19.5C21 20.3284 20.3284 21 19.5 21H4.5C3.6716 21 3 20.3284 3 19.5V14.5Z"/>
+            </symbol>
+            <symbol id="labelLoadIcon" viewBox="0 0 24 24">
+                <path d="M10.0996 7.0996C10.5966 7.0996 11 7.5029 11 8V14H7V8C7 7.5029 7.4034 7.0996 7.9004 7.0996H10.0996Z"/>
+                <path d="M11 2.5898L16.91 8.4999L15.5 9.9099L11 5.4099L6.5 9.9099L5.09 8.4999L11 2.5898Z"/>
+                <path d="M3 14.5C3 14.2239 3.2239 14 3.5 14H8V17.5C8 17.7761 8.2239 18 8.5 18H15.5C15.7761 18 16 17.7761 16 17.5V14H20.5C20.7761 14 21 14.2239 21 14.5V19.5C21 20.3284 20.3284 21 19.5 21H4.5C3.6716 21 3 20.3284 3 19.5V14.5Z"/>
+            </symbol>
             <symbol id="exitFullscreenIcon" viewBox="0 0 24 24">
                 <path d="M8 15.0996C8.49706 15.0996 8.90039 15.5029 8.90039 16V21C8.90039 21.4971 8.49706 21.9004 8 21.9004C7.50294 21.9004 7.09961 21.4971 7.09961 21V16.9004H3C2.50294 16.9004 2.09961 16.4971 2.09961 16C2.09961 15.5029 2.50294 15.0996 3 15.0996H8Z" />
                 <path d="M21 15.0996C21.4971 15.0996 21.9004 15.5029 21.9004 16C21.9004 16.4971 21.4971 16.9004 21 16.9004H16.9004V21C16.9004 21.4971 16.4971 21.9004 16 21.9004C15.5029 21.9004 15.0996 21.4971 15.0996 21V16C15.0996 15.5029 15.5029 15.0996 16 15.0996H21Z" />
@@ -340,6 +427,13 @@
                 ]);
 
                 const viewer = await main(appElement.app, cameraElement.entity, settingsJson, config);
+                // Vendored gizmo/measure/label tool code (see gizmo.js,
+                // measure-tool.js, label-tool.js) is appended after this bundle
+                // at export time and exposes itself via these hooks so it can
+                // share the viewer's app/camera/events.
+                window.__lfsInitMeasureTool?.(viewer.global);
+                window.__lfsInitLabelTool?.(viewer.global);
+                window.__lfsInitVrAnnotations?.(viewer.global);
             });
         </script>
     </body>

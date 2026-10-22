@@ -13,6 +13,14 @@
 // limitations under the License.
 
 #include "config.slang"
+#include "overlay_flags.inc"
+#include "equirect_projection.inc"
+
+#define LFS_PORTAL_INLINE
+#define LFS_PORTAL_VEC3 float3
+#define LFS_PORTAL_VEC4 float4
+#include "portal_compact.inc"
+
 
 static const float eps = 1e-7;
 
@@ -81,16 +89,7 @@ float4 read_t4_float4(uint32_t idx, StructuredBuffer<float> t4) {
     return float4(t4[4*idx+0], t4[4*idx+1], t4[4*idx+2], t4[4*idx+3]);
 }
 
-[ForceInline]
-void write_t1_float(float val, uint32_t idx, RWStructuredBuffer<float> t1) {
-    t1[idx] = val;
-}
 
-[ForceInline]
-void write_t2_float2(float2 val, uint32_t idx, RWStructuredBuffer<float> t2) {
-    t2[2*idx+0] = val.x;
-    t2[2*idx+1] = val.y;
-}
 
 [ForceInline]
 void write_t3_float3(float3 val, uint32_t idx, RWStructuredBuffer<float> t3) {
@@ -106,13 +105,6 @@ void write_t3_float3(half3 val, uint32_t idx, RWStructuredBuffer<half> t3) {
     t3[3*idx+2] = val.z;
 }
 
-[ForceInline]
-void write_t4_float4(float4 val, uint32_t idx, RWStructuredBuffer<float> t4) {
-    t4[4*idx+0] = val.x;
-    t4[4*idx+1] = val.y;
-    t4[4*idx+2] = val.z;
-    t4[4*idx+3] = val.w;
-}
 
 [ForceInline]
 [Differentiable]
@@ -183,11 +175,12 @@ float3 project_point_equirect(float3 point, Camera cam) {
         return {0, 0, -1};
 
     float3 dir = view_point / len;
-    float azimuth = atan2(dir.x, dir.z);
-    float elevation = asin(clamp(dir.y, -1.0f, 1.0f));
+    // Rasterizer camera space is +Y down and +Z forward (see the pinhole projection);
+    // the shared panorama frame is +Y up and -Z forward.
+    float2 uv = lfs_equirect_uv(float3(dir.x, -dir.y, -dir.z));
     return {
-        (azimuth / (2.0f * M_PI) + 0.5f) * float(cam.W),
-        (elevation / M_PI + 0.5f) * float(cam.H),
+        uv.x * float(cam.W),
+        uv.y * float(cam.H),
         len
     };
 }
@@ -385,24 +378,6 @@ float3 project_point_fisheye(float3 point, Camera cam) {
     };
 }
 
-[Differentiable]
-float3x3 compute_jacobian_opencv(float3 xyz_ws, Camera cam) {
-    float3 view_point = geom_transform_points(xyz_ws, cam.world_view_transform);
-    float x = view_point.x, y = view_point.y, z = view_point.z;
-    float fx = cam.fx, fy = cam.fy, cx = cam.cx, cy = cam.cy;
-
-    DifferentialPair<float2> dx = fwd_diff(_project_point_opencv)
-        (diffPair(x, 1.0), diffPair(y, 0.0), diffPair(z, 0.0), cam.dist_coeffs);
-    DifferentialPair<float2> dy = fwd_diff(_project_point_opencv)
-        (diffPair(x, 0.0), diffPair(y, 1.0), diffPair(z, 0.0), cam.dist_coeffs);
-    DifferentialPair<float2> dz = fwd_diff(_project_point_opencv)
-        (diffPair(x, 0.0), diffPair(y, 0.0), diffPair(z, 1.0), cam.dist_coeffs);
-
-    return float3x3(
-        fx * dx.d.x, fx * dy.d.x, fx * dz.d.x,
-        fy * dx.d.y, fy * dy.d.y, fy * dz.d.y,
-        0.0, 0.0, 0.0);
-}
 
 [Differentiable]
 float3x3 compute_jacobian_fisheye(float3 xyz_ws, Camera cam) {
@@ -444,7 +419,6 @@ float3x3 compute_jacobian(float3 xyz_ws, Camera cam) {
     if (cam.model == int(CameraModel::FISHEYE))
         return compute_jacobian_fisheye(xyz_ws, cam);
     else if (cam.model == int(CameraModel::OPENCV))
-        // return compute_jacobian_opencv(xyz_ws, cam);
         return compute_jacobian_pinhole(xyz_ws, cam);  // TODO
     else if (cam.model == int(CameraModel::ORTHO))
         return compute_jacobian_ortho(xyz_ws, cam);
@@ -532,13 +506,11 @@ WorldRay pixel_to_world_ray(float2 pixel, Camera cam) {
     float3x3 view_to_world_rotation = float3x3(world_view_t);
     float3 camera_origin = -mul(view_to_world_rotation, world_view_t[3]);
     if (cam.model == int(CameraModel::EQUIRECTANGULAR)) {
-        float azimuth = 2.0f * M_PI * (pixel.x / float(cam.W) - 0.5f);
-        float elevation = M_PI * (pixel.y / float(cam.H) - 0.5f);
-        float cos_elevation = cos(elevation);
-        float3 ray_camera = safe_normalize(float3(
-            sin(azimuth) * cos_elevation,
-            sin(elevation),
-            cos(azimuth) * cos_elevation));
+        // Inverse of project_point_equirect. Shared equirect is +Y up at uv.y = 0
+        // and -Z forward; the rasterizer camera is +Y down and +Z forward.
+        float2 equirect_uv = float2(pixel.x / float(cam.W), pixel.y / float(cam.H));
+        float3 shared_dir = lfs_equirect_direction(equirect_uv);
+        float3 ray_camera = float3(shared_dir.x, -shared_dir.y, -shared_dir.z);
         float3 direction = safe_normalize(mul(view_to_world_rotation, ray_camera));
         return { camera_origin, direction, isfinite(dot(camera_origin, camera_origin)) && isfinite(dot(direction, direction)) };
     }
@@ -608,7 +580,7 @@ float3 clamp_covariance_2d_extent(float3 cov_vs, float opacity_after_compensatio
 
 [ForceInline]
 [Differentiable]
-float4 add_blur_to_covariance2d(float3 cov_vs, no_diff bool mip_filter) {
+float4 add_blur_to_covariance2d(float3 cov_vs, no_diff bool mip_filter, no_diff bool compensate_non_mip) {
     float4 result = float4(cov_vs, 1.0);
 
     if (mip_filter) {
@@ -618,8 +590,13 @@ float4 add_blur_to_covariance2d(float3 cov_vs, no_diff bool mip_filter) {
         float new_det = compute_det(result.xyz);
         result.w = sqrt(max(0.f, old_det / new_det));
     } else {
+        float old_det = compute_det(result.xyz);
         result.x += DILATION_3DGS;
         result.z += DILATION_3DGS;
+        if (compensate_non_mip) {
+            float new_det = compute_det(result.xyz);
+            result.w = sqrt(max(0.f, old_det / new_det));
+        }
     }
 
     return result;
@@ -644,12 +621,96 @@ float2 undistort_fisheye(float2 uv, float4 dist_coeffs) {
 
 // returns (xx, xy, yy, compensation)
 [Differentiable]
-float4 covariance_3d_to_2d(Camera cam, float3 xyz_ws, float3x3 cov_ws, no_diff bool mip_filter) {
+float4 covariance_3d_to_2d(
+    Camera cam,
+    float3 xyz_ws,
+    float3x3 cov_ws,
+    no_diff bool mip_filter,
+    no_diff bool compensate_non_mip) {
     float3x3 R = (float3x3)cam.world_view_transform;
     float3x3 J = compute_jacobian(xyz_ws, cam);
     float3x3 cov_vs = mul(J, mul(R, mul(cov_ws, mul(transpose(R), transpose(J)))));
 
-    return add_blur_to_covariance2d(float3(cov_vs[0][0], cov_vs[0][1], cov_vs[1][1]), mip_filter);
+    return add_blur_to_covariance2d(
+        float3(cov_vs[0][0], cov_vs[0][1], cov_vs[1][1]),
+        mip_filter,
+        compensate_non_mip);
+}
+
+
+// Standard PlayCanvas projects with an unclamped pinhole Jacobian. Its
+// covariance is in 4x native pixel-squared units, so +0.3 becomes +0.075 here.
+// Keep this forward-only path separate from the native training derivatives.
+[ForceInline]
+float4 covariance_3d_to_2d_portal(Camera cam, float3 xyz_ws, float3x3 cov_ws, bool mip_filter) {
+    float3 t = geom_transform_points(xyz_ws, cam.world_view_transform);
+    float3x3 J = cam.model == int(CameraModel::ORTHO)
+        ? compute_jacobian_ortho(xyz_ws, cam)
+        : float3x3(cam.fx / t.z, 0.0f, -(cam.fx * t.x) / (t.z * t.z),
+                   0.0f, cam.fy / t.z, -(cam.fy * t.y) / (t.z * t.z),
+                   0.0f, 0.0f, 0.0f);
+    float3x3 R = (float3x3)cam.world_view_transform;
+    float3x3 cov = mul(J, mul(R, mul(cov_ws, mul(transpose(R), transpose(J)))));
+    float3 raw = float3(cov[0][0], cov[0][1], cov[1][1]);
+    float3 blurred = raw + float3(0.075f, 0.0f, 0.075f);
+    float compensation = mip_filter ? sqrt(max(0.0f, compute_det(raw) / compute_det(blurred))) : 1.0f;
+    return float4(blurred, compensation);
+}
+
+// The legacy billboard caps each eigen-axis to min(1024, width, height)
+// pixels at its full support. Preserve its minor-axis floor as well.
+[ForceInline]
+float3 clamp_covariance_2d_portal(float3 cov, uint width, uint height) {
+    // Match the WebGPU projector's uniform covariance cap before its
+    // billboard eigen-axis cap. WebGL uses this same standard profile rule.
+    float limit = min(1024.0f, min(float(width), float(height)));
+    float cap = max(1.0f, sqrt(8.0f * max(cov.x, cov.z)) / limit);
+    cov /= cap * cap;
+    float mid = 0.5f * (cov.x + cov.z);
+    float radius = length(float2(0.5f * (cov.x - cov.z), cov.y));
+    float first = mid + radius;
+    float second = max(mid - radius, 0.025f);
+    float max_variance = limit * limit / 8.0f;
+    float a = min(first, max_variance);
+    float b = min(second, max_variance);
+    float2 axis = abs(cov.y) > 1e-6f ? normalize(float2(cov.y, first - cov.x))
+        : (cov.x >= cov.z ? float2(1.0f, 0.0f) : float2(0.0f, 1.0f));
+    float2 other = float2(axis.y, -axis.x);
+    return float3(a * axis.x * axis.x + b * other.x * other.x,
+                  a * axis.x * axis.y + b * other.x * other.y,
+                  a * axis.y * axis.y + b * other.y * other.y);
+}
+
+[ForceInline]
+float3 clamp_covariance_2d_portal(float3 cov, Camera cam) {
+    return clamp_covariance_2d_portal(cov, cam.W, cam.H);
+}
+
+[ForceInline]
+float3 portal_gut_bin_inverse(float3 raw_inv_cov, uint width, uint height) {
+    // Count and emit tiles from the same stored representation, including its
+    // rounding, so both passes agree even close to tile boundaries.
+    return compute_inverse(2.0f * clamp_covariance_2d_portal(
+        compute_inverse(raw_inv_cov), width, height));
+}
+
+
+// The portal's GUT fragment shader evaluates a ray only inside its projected
+// billboard. Binning can be conservative, but shading must retain that bound.
+[ForceInline]
+bool portal_gut_quad_contains(float2 pixel, float2 xy, float3 inv_cov, float opacity, Camera cam) {
+    if (opacity <= (1.0f / 255.0f)) return false;
+    float3 cov = clamp_covariance_2d_portal(compute_inverse(inv_cov), cam);
+    float mid = 0.5f * (cov.x + cov.z);
+    float radius = length(float2(0.5f * (cov.x - cov.z), cov.y));
+    float first = mid + radius;
+    float second = max(mid - radius, 0.025f);
+    float2 axis = abs(cov.y) > 1e-6f ? normalize(float2(cov.y, first - cov.x))
+        : (cov.x >= cov.z ? float2(1.0f, 0.0f) : float2(0.0f, 1.0f));
+    float clip = min(1.0f, 0.5f * sqrt(max(0.0f, log(opacity * 255.0f))));
+    float2 extent = sqrt(8.0f * float2(first, second)) * clip;
+    float2 d = pixel - xy;
+    return abs(dot(d, axis)) <= extent.x && abs(dot(d, float2(axis.y, -axis.x))) <= extent.y;
 }
 
 
@@ -716,19 +777,48 @@ Splat_2D_AlphaBlend load_splat_alphablend(
 
 [ForceInline]
 Splat_3D_GUT_AlphaBlend load_splat_gut_alphablend(
-    int32_t g_idx,
+    uint g_idx,
+    uint rgb_idx,
     StructuredBuffer<float> xyz_ws,
-    StructuredBuffer<float4> rotations,
-    StructuredBuffer<float> scaling_raw,
-    StructuredBuffer<float> opacity_raw,
-    StructuredBuffer<float> rgb
+    ByteAddressBuffer rotations,
+    ByteAddressBuffer scaling_raw,
+    ByteAddressBuffer opacity_raw,
+    StructuredBuffer<float> rgb,
+    uint lod_flags,
+    bool quantized_pool,
+    uint splat_render_profile
 ) {
     float3 g_xyz_ws = read_t3_float3(g_idx, xyz_ws);
-    float4 g_rotation = rotations[g_idx];
-    float3 g_scale = exp(read_t3_float3(g_idx, scaling_raw));
-    float g_opacity = sigmoid_activation(opacity_raw[g_idx]);
-    float3 g_rgb = read_t3_float3(g_idx, rgb);
-    float3x3 rotation = quat_to_rotmat(normalize(g_rotation));
+    float4 g_rotation;
+    float3 raw_scale;
+    float raw_opacity;
+    // Match the canonical RAD pool layout used by load_gaussian_split_quant.
+    if (quantized_pool) {
+        uint2 rq = rotations.Load2(g_idx * 8u);
+        g_rotation = float4(f16tof32(rq.x & 0xffffu), f16tof32(rq.x >> 16),
+                            f16tof32(rq.y & 0xffffu), f16tof32(rq.y >> 16));
+        uint2 sq = scaling_raw.Load2(g_idx * 8u);
+        raw_scale = float3(f16tof32(sq.x & 0xffffu), f16tof32(sq.x >> 16),
+                           f16tof32(sq.y & 0xffffu));
+        uint word = opacity_raw.Load((g_idx >> 1u) * 4u);
+        raw_opacity = f16tof32((g_idx & 1u) != 0u ? word >> 16 : word & 0xffffu);
+    } else {
+        g_rotation = asfloat(rotations.Load4(g_idx * 16u));
+        raw_scale = asfloat(scaling_raw.Load3(g_idx * 12u));
+        raw_opacity = asfloat(opacity_raw.Load(g_idx * 4u));
+    }
+    float3 g_scale = exp(min(raw_scale, float3(MAX_RAW_SCALE)));
+    const bool spark_rad_opacity = (lod_flags & 4u) != 0u;
+    float g_opacity = spark_rad_opacity ? max(raw_opacity, 0.0f) : sigmoid_activation(raw_opacity);
+    if (spark_rad_opacity && g_opacity > 1.0f)
+        g_opacity = min(g_opacity * 4.0f - 3.0f, 5.0f);
+    float3 g_rgb = read_t3_float3(rgb_idx, rgb);
+    if (splat_render_profile == 1u) {
+        g_rotation = lfsPortalCompactRotation(g_rotation);
+        g_scale = lfsPortalCompactScales(g_scale);
+        g_opacity = lfsPortalCompactOpacity(g_opacity);
+    }
+    float3x3 rotation = quat_to_rotmat(safe_quat_normalize(g_rotation));
     float3 safe_scale = max(g_scale, float3(1e-8f));
     float3x3 inv_scale = float3x3(
         1.0f / safe_scale.x, 0.0f, 0.0f,
@@ -739,67 +829,8 @@ Splat_3D_GUT_AlphaBlend load_splat_gut_alphablend(
     return { g_xyz_ws, iscl_rot, g_opacity, g_rgb };
 }
 
-[ForceInline]
-[Differentiable]
-float3x3 rotation_scale_to_iscl_rot(float4 g_rotation, float3 g_scale) {
-    float3x3 R = quat_to_rotmat(normalize(g_rotation));
-    float3x3 S = float3x3(
-        1.0f/g_scale.x, 0.f, 0.f,
-        0.f, 1.0f/g_scale.y, 0.f,
-        0.f, 0.f, 1.0f/g_scale.z
-    );
-    return mul(S, transpose(R));
-}
 
 
-[Differentiable]
-[ForceInline]
-[ForwardDerivative(normalCdfDiffFwd)]
-[BackwardDerivative(normalCdfDiffBwd)]
-float normalCdf(float x) {
-    // return 0.5+0.5*tanh(x*(0.8+0.035*x*x));
-    return 0.5+0.5*tanh(clamp(x*(0.8+0.035*x*x),-7.0,7.0));
-}
-
-[ForceInline]
-DifferentialPair<float> normalCdfDiffFwd(DifferentialPair<float> vx) {
-    float x = vx.p;
-    float y = 0.5+0.5*tanh(x*(0.8+0.035*x*x));
-    float dydx = sqrt(0.5/M_PI) * exp(-0.5*x*x);
-    return DifferentialPair<float>(y, dydx*vx.d);
-}
-
-[ForceInline]
-void normalCdfDiffBwd(inout DifferentialPair<float> vx, float.Differential v) {
-    float x = vx.p;
-    float dx = sqrt(0.5/M_PI) * exp(-0.5*x*x);
-    vx = DifferentialPair<float>(x, v * dx);
-}
-
-[Differentiable]
-[ForceInline]
-[ForwardDerivative(erfDiffFwd)]
-[BackwardDerivative(erfDiffBwd)]
-float erf(float x) {
-    float t = abs(x);
-    float d = (((0.078108*t+0.000972)*t+0.230389)*t+0.278393)*t+1.0;
-    return sign(x) * (1.0 - 1.0/(d*d*d*d));
-}
-
-[ForceInline]
-DifferentialPair<float> erfDiffFwd(DifferentialPair<float> vx) {
-    float x = vx.p;
-    float y = erf(x);
-    float dydx = sqrt(4.0/M_PI) * exp(-x*x);
-    return DifferentialPair<float>(y, dydx*vx.d);
-}
-
-[ForceInline]
-void erfDiffBwd(inout DifferentialPair<float> vx, float.Differential v) {
-    float x = vx.p;
-    float dx = sqrt(4.0/M_PI) * exp(-x*x);
-    vx = DifferentialPair<float>(x, v * dx);
-}
 
 [ForceInline]
 [Differentiable]
@@ -848,6 +879,40 @@ float4 evaluate_splat(Splat_2D_AlphaBlend g,
 }
 
 [ForceInline]
+float spark_rad_alpha_from_value(float opacity, float val)
+{
+    if (opacity <= 1.0f) {
+        return clipOpacity(opacity * val);
+    }
+
+    const float lod_density = exp((opacity * opacity - 1.0f) / 2.718281828459045f);
+    const float lod_alpha = 1.0f - pow(max(0.0f, 1.0f - val), lod_density);
+    return clipOpacity(lod_alpha);
+}
+
+[ForceInline]
+float4 evaluate_splat_spark_rad(Splat_2D_AlphaBlend g,
+                                no_diff float2 pix_coord)
+{
+    float2 g_xy = g.xy_vs;
+    float3 g_rgb = g.rgb;
+    float3 g_inv_cov_vs = g.inv_cov_vs_opacity.xyz;
+    float g_opacity = g.inv_cov_vs_opacity.w;
+
+    float2 d = pix_coord - g_xy;
+
+    float sigma_over_2 = 0.5f * (g_inv_cov_vs.x * d.x*d.x + g_inv_cov_vs.z * d.y*d.y) + g_inv_cov_vs.y * d.x*d.y;
+    float val = (sigma_over_2 < 0.0f || sigma_over_2 > power_threshold_for_spark_rad_opacity(g_opacity))
+        ? 0.0f
+        : exp(-sigma_over_2);
+
+    float alpha = float(spark_rad_alpha_from_value(g_opacity, val));
+    float3 premult_rgb = clamp(g_rgb, float3(0.0f), float3(MAX_BLEND_COLOR)) * alpha;
+
+    return float4(premult_rgb, alpha);
+}
+
+[ForceInline]
 float4 evaluate_gut_splat(Splat_3D_GUT_AlphaBlend g, float3 ray_origin, float3 ray_direction)
 {
     // Same world-space 3DGUT alpha test as the CUDA path: transform the pixel
@@ -877,8 +942,83 @@ float evaluate_splat_alpha(
         : exp(-sigma_over_2);
 
     float alpha = clipOpacity(g_opacity * val);
-
     return float(alpha);
+}
+
+[ForceInline]
+float4 evaluate_gut_splat_lod(Splat_3D_GUT_AlphaBlend g, float3 ray_origin, float3 ray_direction,
+                              bool spark_rad, uint profile) {
+    float3 gro = mul(g.iscl_rot, ray_origin - g.xyz_ws);
+    float3 grd = safe_normalize(mul(g.iscl_rot, ray_direction));
+    float3 distance = cross(grd, gro);
+    float sigma_over_2 = 0.5f * dot(distance, distance);
+    float value = exp(-sigma_over_2);
+    float alpha;
+    // Spark RAD leaves (opacity <= 1) blend like ordinary splats; only high-density LOD parents
+    // need the Spark kernel, so the ordinary path keeps its cost.
+    if (spark_rad && g.opacity > 1.0f) {
+        alpha = spark_rad_alpha_from_value(
+            g.opacity, sigma_over_2 > power_threshold_for_spark_rad_opacity(g.opacity) ? 0.0f : value);
+    } else {
+        alpha = clipOpacity(g.opacity * value);
+        if (!spark_rad && profile == 1u && alpha < (1.0f / 255.0f))
+            alpha = 0.0f;
+    }
+    return float4(clamp(g.rgb, float3(0.0f), float3(MAX_BLEND_COLOR)) * alpha, alpha);
+}
+
+[ForceInline]
+float evaluate_splat_alpha_spark_rad(
+    float2 g_xy,
+    float g_opacity,
+    float3 g_inv_cov_vs,
+    no_diff float2 pix_coord)
+{
+
+    float2 d = pix_coord - g_xy;
+
+    float sigma_over_2 = 0.5f * (g_inv_cov_vs.x * d.x*d.x + g_inv_cov_vs.z * d.y*d.y) + g_inv_cov_vs.y * d.x*d.y;
+    float val = (sigma_over_2 < 0.0f || sigma_over_2 > power_threshold_for_spark_rad_opacity(g_opacity))
+        ? 0.0f
+        : exp(-sigma_over_2);
+
+    return float(spark_rad_alpha_from_value(g_opacity, val));
+}
+
+
+// Portal standard 3DGS uses a compact, normalized Gaussian. A pure exp()
+// leaves more opacity in its tails and visibly changes overlapping splats.
+[ForceInline]
+float portal_normalized_falloff(float value) {
+    const float edge = 0.01831563888873418f; // exp(-4)
+    return max(0.0f, (value - edge) / (1.0f - edge));
+}
+
+[ForceInline]
+float evaluate_splat_alpha_for_profile(float2 xy, float opacity, float3 inv_cov, float2 pixel, uint profile) {
+    if (profile != 1u)
+        return evaluate_splat_alpha(xy, opacity, inv_cov, pixel);
+    if (opacity <= (1.0f / 255.0f)) return 0.0f;
+    float2 d = pixel - xy;
+    float power = 0.5f * (inv_cov.x * d.x * d.x + inv_cov.z * d.y * d.y) + inv_cov.y * d.x * d.y;
+    float value = power < 0.0f || power > 4.0f ? 0.0f : exp(-power);
+    float alpha = clipOpacity(opacity * portal_normalized_falloff(value));
+    return alpha >= (1.0f / 255.0f) ? alpha : 0.0f;
+}
+
+[ForceInline]
+float4 evaluate_splat_for_profile(Splat_2D_AlphaBlend g, float2 pixel, uint profile) {
+    if (profile != 1u)
+        return evaluate_splat(g, pixel);
+    float alpha = evaluate_splat_alpha_for_profile(g.xy_vs, g.inv_cov_vs_opacity.w,
+                                                  g.inv_cov_vs_opacity.xyz, pixel, profile);
+    return float4(clamp(g.rgb, float3(0.0f), float3(MAX_BLEND_COLOR)) * alpha, alpha);
+}
+
+[ForceInline]
+float4 evaluate_gut_splat_for_profile(Splat_3D_GUT_AlphaBlend g, float3 origin, float3 direction, uint profile) {
+    float4 rgba = evaluate_gut_splat(g, origin, direction);
+    return profile == 1u && rgba.a < (1.0f / 255.0f) ? float4(0.0f) : rgba;
 }
 
 [Differentiable]
@@ -902,6 +1042,16 @@ float3x3 get_covariance_from_quat_scales(float4 q, float3 s) {
 float power_threshold_for_opacity(float opacity) {
     const float safe_opacity = max(opacity, ALPHA_THRESHOLD);
     return max(MAX_POWER_THRESHOLD, log(safe_opacity / ALPHA_THRESHOLD));
+}
+
+float power_threshold_for_spark_rad_opacity(float opacity) {
+    const float safe_opacity = max(opacity, ALPHA_THRESHOLD);
+    if (safe_opacity > 1.0f) {
+        const float spark_lod_opacity = min(safe_opacity, 5.0f);
+        const float adjusted_stddev = sqrt(8.0f) + 0.7f * (spark_lod_opacity - 1.0f);
+        return 0.5f * adjusted_stddev * adjusted_stddev;
+    }
+    return power_threshold_for_opacity(safe_opacity);
 }
 
 float extend_from_opacity(float opac) {
@@ -983,8 +1133,8 @@ float2 ellipse_range_bound(
     float bv0 = -b*v0, bv1 = -b*v1;
 
     float inv_a = 1.0f / a;
-    float x0 = inv_a * (bv0 - sqrt(bv0*bv0 - a*(c*v0*v0-1.f)));
-    float x1 = inv_a * (bv1 + sqrt(bv1*bv1 - a*(c*v1*v1-1.f)));
+    float x0 = inv_a * (bv0 - sqrt(max(bv0*bv0 - a*(c*v0*v0-1.f), 0.0f)));
+    float x1 = inv_a * (bv1 + sqrt(max(bv1*bv1 - a*(c*v1*v1-1.f), 0.0f)));
 
     return float2(x0, x1);
 
@@ -995,13 +1145,14 @@ float2 ellipse_range_bound(
 int count_ellipse_grid_overlaps(
     float2 pixelspace_xy,
     float3 inv_cov,
-    rectangle grid
+    rectangle grid,
+    bool scan_rows
 ) {
     // count the number grid cells that overlap with an ellipse
 
     int n_tiles = 0;
 
-    if (grid.max_y-grid.min_y <= grid.max_x-grid.min_x) {
+    if (scan_rows) {
         for (uint16_t y = grid.min_y; y < grid.max_y; y++) {
             float y0 = y * TILE_HEIGHT - pixelspace_xy.y;
             float y1 = y0 + TILE_HEIGHT;
@@ -1043,19 +1194,103 @@ struct Uniforms {
     uint camera_model;
     uint sort_capacity;
     uint shN_layout_slots;
+    uint lod_enabled;
+    uint lod_count;
     uint mip_filter;
-    uint pad2;
+    uint render_origin_x;
+    uint render_origin_y;
+    uint camera_width;
+    uint camera_height;
+    uint model_num_splats;
     float fx;
     float fy;
     float cx;
     float cy;
+    // HiGS raster/compose wave window start (batch index); occupies what was
+    // implicit alignment padding before dist_coeffs, so the layout is unchanged.
+    uint wave_base;
+    // Splats per LOD pool page (quant-pool projection: page = g_idx / this).
+    uint lod_page_splats;
+    // 0 = median depth; > 0 = alpha-weighted (expected) depth, far bound = value.
+    float expected_far;
+    // Explicit padding to keep dist_coeffs 16-byte aligned; mirrors the C++
+    // struct exactly (224 bytes total). shN_address occupies the former
+    // uniforms_pad1/pad2 (offset 104, 8-byte aligned).
+    uint depth_wave;
+    uint64_t shN_address;
     float4 dist_coeffs;
     float4x4 world_view_transform;
+    float color_exposure;
+    uint color_tonemapping;
+    uint splat_render_profile;
+    float rasterization_scale;
+    // Distance the orthographic eye was moved back; subtracted from every depth output.
+    float depth_offset;
+    uint depth_offset_pad0;
+    uint depth_offset_pad1;
+    uint depth_offset_pad2;
+}
+
+// mip_filter packs MIP filtering (bit 0), exact depth replay (bit 1),
+// full-frame binning for banded exports (bit 2), and a depth sample mask (bit 3).
+#ifndef LFS_BANDED_EXPORT_RENDER
+#define LFS_BANDED_EXPORT_RENDER 0
+#endif
+
+bool full_frame_binning(Uniforms uniforms) {
+#if LFS_BANDED_EXPORT_RENDER
+    return (uniforms.mip_filter & 4u) != 0u;
+#else
+    return false;
+#endif
+}
+
+[ForceInline]
+rectangle clip_to_render_grid(rectangle rect, Uniforms uniforms) {
+    const uint2 lo = uint2(uniforms.render_origin_x / TILE_WIDTH,
+                          uniforms.render_origin_y / TILE_HEIGHT);
+    const uint2 hi = lo + uint2(uniforms.grid_width, uniforms.grid_height);
+    // Full-width panorama bands retain the wrapped interval across the seam.
+    // The tile pass reduces these x coordinates modulo the full-width grid.
+    if (base_camera_model(uniforms.camera_model) != uint(CameraModel::EQUIRECTANGULAR)) {
+        rect.min_x = uint16_t(clamp(uint(rect.min_x), lo.x, hi.x));
+        rect.max_x = uint16_t(clamp(uint(rect.max_x), lo.x, hi.x));
+    }
+    rect.min_y = uint16_t(clamp(uint(rect.min_y), lo.y, hi.y));
+    rect.max_y = uint16_t(clamp(uint(rect.max_y), lo.y, hi.y));
+    return rect;
+}
+
+// HiGS macro-tile grid (64x32 px macro tiles), derived from the legacy
+// 16px-tile grid dims carried in the uniforms: ceil(ceil(w/16)/4) == ceil(w/64).
+[ForceInline]
+uint higs_macro_grid_width(uint grid_width) {
+    return (grid_width + HIGS_MACRO_T16_W - 1u) / HIGS_MACRO_T16_W;
+}
+
+[ForceInline]
+uint higs_macro_grid_height(uint grid_height) {
+    return (grid_height + HIGS_MACRO_T16_H - 1u) / HIGS_MACRO_T16_H;
+}
+
+// The active-mask buffer starts with one word per possible macro batch.
+// Exact-depth replay ballots follow that header and reuse the partials pool
+// across raster waves. Use the logical grid here, not its allocation bucket.
+[ForceInline]
+uint higs_replay_mask_base(Uniforms uniforms) {
+    return (uniforms.sort_capacity + RASTER_BATCH_SIZE - 1u) / RASTER_BATCH_SIZE +
+           higs_macro_grid_width(uniforms.grid_width) * higs_macro_grid_height(uniforms.grid_height);
 }
 
 static const uint OVERLAY_FLAG_DIM = 1;
 static const uint OVERLAY_FLAG_NONSELECTABLE = 2;
-static const uint OVERLAY_FLAG_FLASH = 4;
+
+static const uint SELECTION_PREVIEW_FLAG = 0x80;
+static const uint SELECTION_GROUP_MASK = 0x7F;
+static const uint SELECTION_PREVIEW_COLOR_INDEX = 256;
+static const uint SELECTION_SELECTED_HOVER_COLOR_INDEX = 257;
+static const float SELECTION_PREVIEW_BLEND = 0.9f;
+static const float SELECTION_COMMITTED_BLEND = 0.8f;
 
 static const uint OVERLAY_PARAM_CROP_FLAGS = 0;
 static const uint OVERLAY_PARAM_CROP_MIN = 1;
@@ -1074,7 +1309,13 @@ static const uint OVERLAY_PARAM_MARKER_FLAGS = 22;
 static const uint OVERLAY_PARAM_SELECTION_CURSOR = 23;
 static const uint OVERLAY_PARAM_SELECTION_FLAGS = 24;
 static const uint OVERLAY_PARAM_VISIBILITY_FLAGS = 25;
-static const uint OVERLAY_PARAM_COUNT = 26;
+static const uint OVERLAY_PARAM_CROP_EXTRA_BASE = 26;
+static const uint OVERLAY_PARAM_CROP_STRIDE = 7;
+static const uint OVERLAY_PARAM_CROP_EXTRA_COUNT = 15;
+static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE = OVERLAY_PARAM_CROP_EXTRA_BASE + OVERLAY_PARAM_CROP_STRIDE * OVERLAY_PARAM_CROP_EXTRA_COUNT;
+static const uint OVERLAY_PARAM_ELLIPSOID_STRIDE = 5;
+static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT = 15;
+static const uint OVERLAY_PARAM_COUNT = OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE + OVERLAY_PARAM_ELLIPSOID_STRIDE * OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT;
 
 [ForceInline]
 bool overlay_enabled(float value)
@@ -1096,10 +1337,265 @@ uint read_byte(ByteAddressBuffer buffer, uint idx)
     return (buffer.Load(aligned_idx) >> shift) & 0xffu;
 }
 
+// The host clears every word before projection. Atomic OR preserves adjacent
+// bytes even when compact survivor slots in one word come from different waves.
+// All-zero flags need no store; clearing also removes flags from the last frame.
+[ForceInline]
+void write_overlay_byte(RWByteAddressBuffer buffer, uint idx, uint flags, uint lod_enabled)
+{
+    if ((lod_enabled & LFS_VK_OVERLAY_WRITE_BIT) == 0u || (flags & 0xffu) == 0u)
+        return;
+    const uint word_offset = idx & ~(LFS_VK_OVERLAY_WORD_BYTES - 1u);
+    const uint shift = (idx & (LFS_VK_OVERLAY_WORD_BYTES - 1u)) * 8u;
+    buffer.InterlockedOr(word_offset, (flags & 0xffu) << shift);
+}
+
 [ForceInline]
 int read_int32(ByteAddressBuffer buffer, uint idx)
 {
     return int(buffer.Load(idx * 4u));
+}
+
+// Uniform overlay scalars loaded once per thread (or workgroup) before any
+// per-splat/per-pixel loop. Keeps the hot raster loops free of overlay_params
+// buffer traffic.
+struct OverlayUniformState {
+    bool cursor_enabled;
+    bool saturation_preview;
+    float saturation_amount;
+    float ring_width;
+    bool show_rings;
+    bool show_center_markers;
+    float2 cursor_xy;
+    float cursor_radius;
+    bool cursor_selection_enabled;
+    bool selection_mask_enabled;
+    bool preview_mask_enabled;
+    bool add_mode;
+    int focused_gaussian_id;
+};
+
+[ForceInline]
+OverlayUniformState load_overlay_uniform_state(StructuredBuffer<float4> overlay_params)
+{
+    float4 cursor_flags = overlay_params[OVERLAY_PARAM_CURSOR_FLAGS];
+    float4 marker_flags = overlay_params[OVERLAY_PARAM_MARKER_FLAGS];
+    float4 selection_cursor = overlay_params[OVERLAY_PARAM_SELECTION_CURSOR];
+    float4 selection_flags = overlay_params[OVERLAY_PARAM_SELECTION_FLAGS];
+
+    OverlayUniformState state;
+    state.cursor_enabled = overlay_enabled(cursor_flags.x);
+    state.saturation_preview = overlay_enabled(cursor_flags.y);
+    state.saturation_amount = cursor_flags.z;
+    state.ring_width = cursor_flags.w;
+    state.show_rings = overlay_enabled(marker_flags.x);
+    state.show_center_markers = overlay_enabled(marker_flags.y);
+    state.cursor_xy = selection_cursor.xy;
+    state.cursor_radius = selection_cursor.z;
+    state.cursor_selection_enabled = overlay_enabled(selection_cursor.w);
+    state.selection_mask_enabled = overlay_enabled(selection_flags.x);
+    state.preview_mask_enabled = overlay_enabled(selection_flags.y);
+    state.add_mode = overlay_enabled(selection_flags.z);
+    state.focused_gaussian_id = overlay_int(selection_flags.w);
+    return state;
+}
+
+// Pack per-splat overlay payload for groupshared staging: flags | sel | preview.
+// Flags currently use 2 bits; 16 bits leave headroom without a second shared slot.
+[ForceInline]
+uint pack_overlay_per_splat(uint flags, uint selection_byte, uint preview_byte)
+{
+    return (flags & 0xffffu) |
+           ((selection_byte & 0xffu) << 16) |
+           ((preview_byte & 0xffu) << 24);
+}
+
+[ForceInline]
+uint unpack_overlay_flags(uint packed)
+{
+    return packed & 0xffffu;
+}
+
+[ForceInline]
+uint unpack_overlay_selection_byte(uint packed)
+{
+    return (packed >> 16) & 0xffu;
+}
+
+[ForceInline]
+uint unpack_overlay_preview_byte(uint packed)
+{
+    return (packed >> 24) & 0xffu;
+}
+
+[ForceInline]
+uint load_overlay_per_splat_pack(
+    uint splat_id,
+    ByteAddressBuffer gaussian_overlay_flags,
+    ByteAddressBuffer selection_mask,
+    ByteAddressBuffer preview_mask,
+    OverlayUniformState state)
+{
+    uint flags = read_byte(gaussian_overlay_flags, splat_id);
+    uint selection_byte = state.selection_mask_enabled ? read_byte(selection_mask, splat_id) : 0u;
+    uint preview_byte = state.preview_mask_enabled ? read_byte(preview_mask, splat_id) : 0u;
+    return pack_overlay_per_splat(flags, selection_byte, preview_byte);
+}
+
+[ForceInline]
+bool overlay_cursor_hit(float2 gaussian_xy, float2 cursor_xy, float cursor_radius)
+{
+    float2 delta = gaussian_xy - cursor_xy;
+    return dot(delta, delta) <= cursor_radius * cursor_radius;
+}
+
+[ForceInline]
+float4 replace_unpremultiplied_color(float4 gauss_rgba, float3 color)
+{
+    return float4(color * gauss_rgba.a, gauss_rgba.a);
+}
+
+[ForceInline]
+float3 unpremultiplied_color(float4 gauss_rgba)
+{
+    return gauss_rgba.a > eps ? gauss_rgba.rgb / gauss_rgba.a : float3(0.0f);
+}
+
+// selection_byte / preview_byte are the already-fetched mask values for splat_id
+// (from groupshared or a prior global load). No mask buffer access here.
+[ForceInline]
+uint selection_status(
+    float2 gaussian_xy,
+    uint splat_id,
+    uint flags,
+    uint selection_byte,
+    uint preview_byte,
+    OverlayUniformState state)
+{
+    if (state.saturation_preview) {
+        return 0u;
+    }
+    bool selectable = (flags & OVERLAY_FLAG_NONSELECTABLE) == 0u;
+    uint group_id = 0;
+    if (state.selection_mask_enabled) {
+        group_id = selection_byte & SELECTION_GROUP_MASK;
+    }
+    bool is_committed = group_id > 0;
+    bool is_in_preview = false;
+    if (state.preview_mask_enabled) {
+        is_in_preview = preview_byte != 0;
+    }
+    bool under_brush = false;
+    if (state.cursor_selection_enabled && selectable) {
+        under_brush = overlay_cursor_hit(gaussian_xy, state.cursor_xy, state.cursor_radius);
+    }
+    bool add_mode = state.add_mode;
+    bool is_ring_highlight = selectable && state.focused_gaussian_id == int(splat_id);
+    bool is_preview = (is_in_preview && !is_committed && add_mode) ||
+                      (is_in_preview && is_committed && !add_mode) ||
+                      (under_brush && selectable && add_mode && !is_committed) ||
+                      (under_brush && selectable && !add_mode && is_committed) ||
+                      is_ring_highlight;
+
+    return (group_id & SELECTION_GROUP_MASK) | (is_preview ? SELECTION_PREVIEW_FLAG : 0u);
+}
+
+[ForceInline]
+float4 apply_projection_overlay_color(
+    float4 gauss_rgba,
+    float2 gaussian_xy,
+    uint flags,
+    OverlayUniformState state)
+{
+    float3 color = unpremultiplied_color(gauss_rgba);
+    bool selectable = (flags & OVERLAY_FLAG_NONSELECTABLE) == 0u;
+    if (state.cursor_enabled && state.saturation_preview && selectable &&
+        overlay_cursor_hit(gaussian_xy, state.cursor_xy, state.cursor_radius)) {
+        float lum = 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
+        float sat = 1.0f + state.saturation_amount;
+        color = clamp(lum + sat * (color - lum), 0.0f, 1.0f);
+    }
+    if ((flags & OVERLAY_FLAG_DIM) != 0u) {
+        const float DEPTH_FILTER_BRIGHTNESS = 0.25f;
+        float lum = 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
+        color = float3(lum * DEPTH_FILTER_BRIGHTNESS);
+    }
+    return replace_unpremultiplied_color(gauss_rgba, color);
+}
+
+[ForceInline]
+float3 selection_overlay_target_color(uint sel_status, StructuredBuffer<float4> selection_colors)
+{
+    uint group_id = sel_status & SELECTION_GROUP_MASK;
+    bool is_preview = (sel_status & SELECTION_PREVIEW_FLAG) != 0u;
+    if (is_preview && group_id > 0u) {
+        return selection_colors[SELECTION_SELECTED_HOVER_COLOR_INDEX].xyz;
+    }
+    if (is_preview) {
+        return selection_colors[SELECTION_PREVIEW_COLOR_INDEX].xyz;
+    }
+    if (group_id > 0u) {
+        return selection_colors[group_id].xyz;
+    }
+    return selection_colors[0].xyz;
+}
+
+// show_rings / ring_width come from hoisted OverlayUniformState — no buffer
+// loads and no exp() until the cheap enable gates pass.
+[ForceInline]
+float4 apply_ring_overlay(
+    float4 gauss_rgba,
+    Splat_2D_AlphaBlend g,
+    float2 pix_coord,
+    uint sel_status,
+    uint flags,
+    bool show_rings,
+    float ring_width,
+    StructuredBuffer<float4> selection_colors)
+{
+    bool selectable = (flags & OVERLAY_FLAG_NONSELECTABLE) == 0u;
+    if (!show_rings || !selectable) {
+        return gauss_rgba;
+    }
+    float2 d = pix_coord - g.xy_vs;
+    float3 inv_cov = g.inv_cov_vs_opacity.xyz;
+    float sigma_over_2 = 0.5f * (inv_cov.x * d.x * d.x + inv_cov.z * d.y * d.y) + inv_cov.y * d.x * d.y;
+    float gaussian = exp(-sigma_over_2);
+    float boundary_gaussian = ALPHA_THRESHOLD / max(g.inv_cov_vs_opacity.w, eps);
+    float ring_outer = boundary_gaussian * (1.0f + ring_width * 10.0f);
+    float ring_inner = boundary_gaussian * (1.0f - ring_width * 10.0f);
+    if (gaussian < ring_outer && gaussian > ring_inner) {
+        float3 color = unpremultiplied_color(gauss_rgba);
+        uint group_id = sel_status & SELECTION_GROUP_MASK;
+        bool is_preview = (sel_status & SELECTION_PREVIEW_FLAG) != 0u;
+        if (is_preview || group_id > 0u) {
+            color = selection_overlay_target_color(sel_status, selection_colors);
+        }
+        float alpha = min(0.8f, ALPHA_BLEND_MAX_OPACITY);
+        return float4(color * alpha, alpha);
+    }
+    return gauss_rgba;
+}
+
+[ForceInline]
+float4 apply_selection_overlay(
+    float4 gauss_rgba,
+    uint sel_status,
+    StructuredBuffer<float4> selection_colors)
+{
+    uint group_id = sel_status & SELECTION_GROUP_MASK;
+    bool is_preview = (sel_status & SELECTION_PREVIEW_FLAG) != 0u;
+    if (!is_preview && group_id == 0u) {
+        return gauss_rgba;
+    }
+
+    float3 color = unpremultiplied_color(gauss_rgba);
+    if (is_preview) {
+        color = lerp(color, selection_overlay_target_color(sel_status, selection_colors), SELECTION_PREVIEW_BLEND);
+    } else if (group_id > 0u) {
+        color = lerp(color, selection_colors[group_id].xyz, SELECTION_COMMITTED_BLEND);
+    }
+    return replace_unpremultiplied_color(gauss_rgba, color);
 }
 
 [ForceInline]

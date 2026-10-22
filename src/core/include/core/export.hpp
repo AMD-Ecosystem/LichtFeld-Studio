@@ -4,6 +4,16 @@
 #pragma once
 
 #ifdef _WIN32
+#define LFS_LOCAL_SYMBOL
+// Standalone executables that compile selected module sources directly do not
+// cross a DLL boundary and must not import or export those module interfaces.
+#ifdef LFS_STATIC_BUILD
+#define LFS_LOGGER_API
+#define LFS_CORE_API
+#define LFS_IO_API
+#define LFS_VIS_API
+#define LFS_MCP_API
+#else
 #ifdef LFS_LOGGER_EXPORTS
 #define LFS_LOGGER_API __declspec(dllexport)
 #else
@@ -25,12 +35,18 @@
 #else
 #define LFS_MCP_API __declspec(dllimport)
 #endif
+#endif
+// rendering is a static library today (lfs_rendering_tensor / lfs_vulkan_rasterizer).
+// Empty on Windows like LFS_IO_API; visibility default on ELF.
+#define LFS_RENDERING_API
 #else
-#define LFS_LOGGER_API __attribute__((visibility("default")))
-#define LFS_CORE_API   __attribute__((visibility("default")))
-#define LFS_IO_API     __attribute__((visibility("default")))
-#define LFS_VIS_API    __attribute__((visibility("default")))
-#define LFS_MCP_API    __attribute__((visibility("default")))
+#define LFS_LOCAL_SYMBOL  __attribute__((visibility("hidden")))
+#define LFS_LOGGER_API    __attribute__((visibility("default")))
+#define LFS_CORE_API      __attribute__((visibility("default")))
+#define LFS_IO_API        __attribute__((visibility("default")))
+#define LFS_VIS_API       __attribute__((visibility("default")))
+#define LFS_MCP_API       __attribute__((visibility("default")))
+#define LFS_RENDERING_API __attribute__((visibility("default")))
 #endif
 
 // For functions in CUDA static libs (lfs_core_cuda) that are resolved directly

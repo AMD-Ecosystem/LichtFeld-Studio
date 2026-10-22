@@ -5,32 +5,49 @@
 #include "viewport_frame_lifecycle_service.hpp"
 #include "viewport_artifact_service.hpp"
 
+#include <algorithm>
+#include <utility>
+
 namespace lfs::vis {
 
     namespace {
-        constexpr int kResizeDebounceFrames = 3;
+        constexpr auto kResizeSettleQuietDelay = std::chrono::milliseconds(96);
     }
 
     ViewportFrameLifecycleService::ResizeResult
     ViewportFrameLifecycleService::handleViewportResize(const glm::ivec2& current_size) {
         ResizeResult result;
         const bool resize_is_active = resize_active_.load(std::memory_order_relaxed);
+        result.require_immediate_output_resize =
+            resize_is_active &&
+            resize_render_policy_.load(std::memory_order_relaxed) ==
+                ViewportResizeRenderPolicy::FullResolution;
 
         if (current_size != last_viewport_size_) {
+            const auto now = std::chrono::steady_clock::now();
             const bool had_viewport_size = last_viewport_size_.x > 0 && last_viewport_size_.y > 0;
             last_viewport_size_ = current_size;
+            last_resize_change_ = now;
             if (!had_viewport_size) {
-                resize_debounce_ = 0;
+                resize_settle_pending_ = false;
                 result.dirty = DirtyFlag::VIEWPORT | DirtyFlag::CAMERA | DirtyFlag::OVERLAY;
             } else {
-                resize_debounce_ = kResizeDebounceFrames;
+                resize_settle_pending_ = true;
                 result.dirty = DirtyFlag::OVERLAY;
+                result.render_resized_frame = true;
+                result.use_interactive_render_scale =
+                    !resize_is_active ||
+                    resize_render_policy_.load(std::memory_order_relaxed) ==
+                        ViewportResizeRenderPolicy::InteractivePreview;
             }
             return result;
         }
 
-        if (resize_debounce_ > 0 && !resize_is_active) {
-            if (--resize_debounce_ == 0) {
+        if (resize_settle_pending_ && !resize_is_active) {
+            const auto now = std::chrono::steady_clock::now();
+            const bool quiet = now - last_resize_change_ >= kResizeSettleQuietDelay;
+            if (quiet) {
+                resize_settle_pending_ = false;
                 result.dirty = DirtyFlag::VIEWPORT | DirtyFlag::CAMERA;
                 result.completed = true;
             } else {
@@ -42,8 +59,9 @@ namespace lfs::vis {
 
     ViewportFrameLifecycleService::ModelChangeResult
     ViewportFrameLifecycleService::handleModelChange(const size_t model_ptr,
-                                                     ViewportArtifactService& viewport_artifacts) {
-        if (model_ptr == last_model_ptr_) {
+                                                     ViewportArtifactService& viewport_artifacts,
+                                                     const ModelSource source) {
+        if (model_ptr == last_model_ptr_ && source == last_model_source_) {
             return {};
         }
 
@@ -51,6 +69,7 @@ namespace lfs::vis {
             .changed = true,
             .previous_model_ptr = last_model_ptr_};
         last_model_ptr_ = model_ptr;
+        last_model_source_ = source;
         viewport_artifacts.clearViewportOutput();
         return result;
     }
@@ -58,8 +77,9 @@ namespace lfs::vis {
     DirtyMask ViewportFrameLifecycleService::handleTrainingRefresh(const bool is_training,
                                                                    const float refresh_interval_sec) {
         if (!is_training) {
-            return 0;
+            return std::exchange(training_refreshing_, false) ? DirtyFlag::SPLATS : 0;
         }
+        training_refreshing_ = true;
 
         const auto now = std::chrono::steady_clock::now();
         const auto interval = std::chrono::duration<float>(refresh_interval_sec);
@@ -69,6 +89,13 @@ namespace lfs::vis {
 
         last_training_render_ = now;
         return DirtyFlag::SPLATS;
+    }
+
+    double ViewportFrameLifecycleService::secondsUntilTrainingRefresh(const float refresh_interval_sec) const {
+        const auto due = last_training_render_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                     std::chrono::duration<float>(refresh_interval_sec));
+        const auto remaining = due - std::chrono::steady_clock::now();
+        return std::max(0.0, std::chrono::duration<double>(remaining).count());
     }
 
     DirtyMask ViewportFrameLifecycleService::requiredDirtyMask(const bool has_viewport_output,
@@ -82,22 +109,59 @@ namespace lfs::vis {
         return dirty;
     }
 
-    DirtyMask ViewportFrameLifecycleService::setViewportResizeActive(const bool active) {
+    DirtyMask ViewportFrameLifecycleService::setViewportResizeActive(
+        const bool active,
+        const ViewportResizeRenderPolicy render_policy) {
+        if (active) {
+            resize_render_policy_.store(render_policy, std::memory_order_relaxed);
+        }
         const bool was_active = resize_active_.exchange(active);
         if (!was_active || active) {
             return 0;
         }
 
-        if (resize_debounce_ == 0) {
-            resize_debounce_ = 1;
-        }
+        resize_render_policy_.store(ViewportResizeRenderPolicy::InteractivePreview,
+                                    std::memory_order_relaxed);
+        resize_settle_pending_ = true;
+        last_resize_change_ = std::chrono::steady_clock::now();
 
         return DirtyFlag::VIEWPORT | DirtyFlag::CAMERA | DirtyFlag::OVERLAY;
     }
 
     DirtyMask ViewportFrameLifecycleService::deferViewportRefresh() {
-        resize_debounce_ = kResizeDebounceFrames;
+        resize_settle_pending_ = true;
+        last_resize_change_ = std::chrono::steady_clock::now();
         return DirtyFlag::OVERLAY;
+    }
+
+    bool ViewportFrameLifecycleService::hasPendingResizeSettle() const {
+        return resize_settle_pending_ && !resize_active_.load(std::memory_order_relaxed);
+    }
+
+    bool ViewportFrameLifecycleService::resizeSettleReady() const {
+        return hasPendingResizeSettle() &&
+               std::chrono::steady_clock::now() - last_resize_change_ >= kResizeSettleQuietDelay;
+    }
+
+    bool ViewportFrameLifecycleService::resizeRecentlyChanged(
+        const std::chrono::steady_clock::duration max_age) const {
+        if (last_resize_change_ == std::chrono::steady_clock::time_point{}) {
+            return false;
+        }
+        return std::chrono::steady_clock::now() - last_resize_change_ < max_age;
+    }
+
+    double ViewportFrameLifecycleService::secondsUntilResizeSettleReady() const {
+        if (!hasPendingResizeSettle()) {
+            return 0.0;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - last_resize_change_;
+        if (elapsed >= kResizeSettleQuietDelay) {
+            return 0.0;
+        }
+        return std::chrono::duration<double>(kResizeSettleQuietDelay - elapsed).count();
     }
 
 } // namespace lfs::vis
