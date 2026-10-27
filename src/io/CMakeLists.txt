@@ -87,6 +87,8 @@ target_compile_options(lfs_io_rad_quant_cuda PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 --fmad=false -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --fmad=false>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --fmad=false>
+        # HIP: clang contracts across statements by default; divisions and square roots are IEEE.
+        $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>
 )
 
 # SPZ library (Niantic compressed format) - MIT licensed
@@ -428,12 +430,35 @@ target_link_libraries(lfs_io
 )
 target_compile_definitions(lfs_io PRIVATE nsel_CONFIG_SELECT_EXPECTED=1)
 
+if(USE_HIP)
+    # nvImageCodec is NVIDIA-only. JPEG decodes with rocJPEG where the ROCm SDK
+    # ships it; ROCm has no JPEG encoder or JPEG 2000 codec, so those run on the
+    # CPU with libjpeg and OpenJPH (HTJ2K, from the vcpkg OpenEXR dependency).
+    target_sources(lfs_io PRIVATE nvcodec_image_loader_hip.cpp)
+    get_target_property(_lfs_io_sources lfs_io SOURCES)
+    list(REMOVE_ITEM _lfs_io_sources nvcodec_image_loader.cpp)
+    set_property(TARGET lfs_io PROPERTY SOURCES ${_lfs_io_sources})
+    find_path(LFS_ROCJPEG_INCLUDE_DIR rocjpeg/rocjpeg.h HINTS "${ROCM_PATH}/include")
+    find_library(LFS_ROCJPEG_LIBRARY rocjpeg HINTS "${ROCM_PATH}/lib")
+    if(LFS_ROCJPEG_INCLUDE_DIR AND LFS_ROCJPEG_LIBRARY)
+        target_include_directories(lfs_io SYSTEM PRIVATE "${LFS_ROCJPEG_INCLUDE_DIR}")
+        target_link_libraries(lfs_io PRIVATE "${LFS_ROCJPEG_LIBRARY}")
+        target_compile_definitions(lfs_io PRIVATE LFS_HAVE_ROCJPEG=1)
+    else()
+        message(WARNING "rocJPEG not found - JPEG decoding will run on the CPU")
+        target_compile_definitions(lfs_io PRIVATE LFS_HAVE_ROCJPEG=0)
+    endif()
+    find_package(openjph CONFIG REQUIRED)
+    target_link_libraries(lfs_io PRIVATE JPEG::JPEG openjph)
+    unset(_lfs_io_sources)
+endif()
+
 # Link nvImageCodec if available
 if(TARGET nvimgcodec)
     target_link_libraries(lfs_io PRIVATE nvimgcodec)
     add_dependencies(lfs_io nvimgcodec)
     message(STATUS "Linking nvImageCodec to lfs_io")
-else()
+elseif(NOT USE_HIP)
     message(WARNING "nvImageCodec target not found - JPEG hardware decode will not work")
 endif()
 
@@ -491,7 +516,13 @@ message(STATUS "  WebP decoder library: ${WEBP_DECODE_LIB}")
 message(STATUS "  Archive library: ${ARCHIVE_LIB}")
 
 # Reference decimation needs IEEE arithmetic despite the IO CUDA fast-math defaults.
+if(USE_HIP)
+    # clang keeps denormals and IEEE division and square root for HIP by default.
+    set_source_files_properties(cuda/splat_decimate.cu PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off")
+else()
 set_source_files_properties(cuda/splat_decimate.cu PROPERTIES
     COMPILE_OPTIONS "--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true")
+endif()
 set_source_files_properties(splat_decimate.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")
