@@ -348,6 +348,12 @@
 __device__ inline void __nanosleep(unsigned int) { __builtin_amdgcn_s_sleep(1); }
 #endif
 
+/* clang's HIP __fsqrt_rn is the native, approximate square root unless the
+ * device library's rounded operations are enabled; CUDA's is correctly rounded.
+ * HIP's sqrtf is correctly rounded (-fhip-fp32-correctly-rounded-divide-sqrt,
+ * on by default). */
+#define __fsqrt_rn(x) sqrtf(x)
+
 /* fp16/bf16: HIP provides __half/__half2 (hip_fp16.h) as drop-ins. The CUDA
  * bfloat16 scalar __nv_bfloat16 maps to HIP's __hip_bfloat16. */
 #define __nv_bfloat16 __hip_bfloat16

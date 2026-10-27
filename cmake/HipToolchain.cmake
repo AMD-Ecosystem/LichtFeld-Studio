@@ -29,6 +29,12 @@ string(APPEND CMAKE_HIP_FLAGS " -Wno-#pragma-messages -Wno-unused-result")
 # default on the HIP toolchain where nvcc was lenient. The behaviour matches the
 # CUDA build; demote to non-fatal.
 string(APPEND CMAKE_HIP_FLAGS " -Wno-non-pod-varargs -Wno-format-security")
+# Without this, clang's HIP headers declare host min/max for int only, so min or
+# max of floats on the host side of a __host__ __device__ function (the camera
+# model constructors) silently converts to int. CUDA declares float, double and
+# wider integer overloads for host and device; this enables clang's. Its math
+# header is pre-included, so the define cannot come from a header.
+string(APPEND CMAKE_HIP_FLAGS " -D__HIP_DEFINE_EXTENDED_HOST_MIN_MAX__=1")
 # __HIP_PLATFORM_AMD__ makes <hip/hip_runtime.h> expose the AMD runtime
 # declarations on plain C++ TUs too (the HIP toolchain auto-defines it only for
 # .cu / -x hip). Many host .cpp in lfs_core/lfs_diagnostics include
