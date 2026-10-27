@@ -114,7 +114,14 @@ namespace {
         std::size_t printf_fifo = 0;
         std::size_t per_thread_stack = 0;
         std::size_t malloc_heap = 0;
+#if defined(USE_HIP)
+        // HIP reports the printf FIFO as an unsupported limit; clear that error so
+        // the next launch check does not report it.
+        if (cudaDeviceGetLimit(&printf_fifo, cudaLimitPrintfFifoSize) != cudaSuccess)
+            (void)cudaGetLastError();
+#else
         cudaDeviceGetLimit(&printf_fifo, cudaLimitPrintfFifoSize);
+#endif
         cudaDeviceGetLimit(&per_thread_stack, cudaLimitStackSize);
         cudaDeviceGetLimit(&malloc_heap, cudaLimitMallocHeapSize);
 
