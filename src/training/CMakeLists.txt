@@ -83,7 +83,7 @@ endif()
 add_subdirectory(depth_anchor)
 
 # Optimizer sources
-if(USE_HIP)
+if(_LFS_HIP_COMPUTE_ONLY)
     # Compute tranche: build the kernel-facing training pieces (optimizer,
     # schedulers, losses, the rasterization wrappers, MCMC, the GPU components)
     # that the compute gtests exercise directly. The full training-loop
@@ -192,7 +192,7 @@ target_include_directories(lfs_training SYSTEM PRIVATE
 )
 
 # Link dependencies
-if(USE_HIP)
+if(_LFS_HIP_COMPUTE_ONLY)
     # Compute tranche: no lfs_io (dataloader/exporter -> FFmpeg/nvjpeg/USD) and no
     # lfs_python_utils (nanobind); those belong to the deferred io/GUI tranche.
     target_link_libraries(lfs_training

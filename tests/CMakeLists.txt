@@ -512,7 +512,9 @@ endif()
 # Find LibTorch for tensor comparison tests
 # Set Torch_DIR based on platform
 get_filename_component(PROJ_ROOT_DIR "${CMAKE_SOURCE_DIR}" ABSOLUTE)
-if(WIN32)
+if(USE_HIP)
+    # The LibTorch download is a CUDA build; the ROCm one comes from -DTorch_DIR.
+elseif(WIN32)
     if(CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
         set(Torch_DIR "${PROJ_ROOT_DIR}/external/release/libtorch/share/cmake/Torch")
     else()
@@ -523,6 +525,19 @@ else()
 endif()
 find_package(Torch REQUIRED)
 message(STATUS "Tests: LibTorch ${Torch_VERSION} found for tensor comparison tests")
+if(USE_HIP)
+    # ROCm LibTorch ships c10/hip, not c10/cuda/impl/cuda_cmake_macros.h; torch's
+    # own header documents this define as the escape hatch for the unported
+    # configure-file. USE_ROCM routes the c10/cuda compat includes to c10/hip.
+    add_compile_definitions(
+        C10_CUDA_NO_CMAKE_CONFIGURE_FILE
+        # Set by the skipped configure-file; keeps dllimport on c10_hip data exports.
+        $<$<PLATFORM_ID:Windows>:C10_CUDA_BUILD_SHARED_LIBS>
+        USE_ROCM=1)
+    # Some tests narrow size_t in braced lists, which GCC only warns about and
+    # clang rejects; keep GCC's behaviour.
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX,HIP>:-Wno-c++11-narrowing>)
+endif()
 
 # Shared by the full suite and the focused POPSpa target.
 set(POPSPA_TEST_FILES

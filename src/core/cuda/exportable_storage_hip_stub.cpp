@@ -1,7 +1,7 @@
-/* Windows stub for exportable_storage.cpp -- CUDA VMM IPC not supported in
- * the compute-tranche HIP build. The compute tests do not call these functions.
- * ROCm/HIP port: stub added for Windows build. */
-#if defined(_WIN32) && defined(USE_HIP)
+/* HIP stand-in for exportable_storage.cpp. HIP has no attribute reporting
+ * shareable-handle support, so the HIP build exports no VMM memory; callers
+ * fall back to Vulkan-exported memory imported into HIP. */
+#if defined(USE_HIP)
 
 #include "core/exportable_storage.hpp"
 #include <stdexcept>
@@ -15,27 +15,27 @@ std::size_t exportable_allocation_granularity(int) {
 std::expected<std::shared_ptr<ExportableBlock>, std::string>
 allocateExportableDeviceBlock(std::size_t, int, bool, std::size_t) {
     return std::unexpected(
-        "allocateExportableDeviceBlock: CUDA VMM IPC not available in compute-only Windows HIP build");
+        "allocateExportableDeviceBlock: VMM export is not available in the HIP build");
 }
 
 std::expected<void, std::string>
 commitExportableDeviceRange(const std::shared_ptr<ExportableBlock>&, std::size_t, std::size_t) {
     return std::unexpected(
-        "commitExportableDeviceRange: CUDA VMM IPC not available in compute-only Windows HIP build");
+        "commitExportableDeviceRange: VMM export is not available in the HIP build");
 }
 
 std::expected<bool, std::string>
 growExportableDeviceBlock(const std::shared_ptr<ExportableBlock>&, std::size_t) {
     return std::unexpected(
-        "growExportableDeviceBlock: CUDA VMM IPC not available in compute-only Windows HIP build");
+        "growExportableDeviceBlock: VMM export is not available in the HIP build");
 }
 
 std::expected<bool, std::string>
 shrinkExportableDeviceBlock(const std::shared_ptr<ExportableBlock>&, std::size_t) {
     return std::unexpected(
-        "shrinkExportableDeviceBlock: CUDA VMM IPC not available in compute-only Windows HIP build");
+        "shrinkExportableDeviceBlock: VMM export is not available in the HIP build");
 }
 
 } // namespace lfs::core
 
-#endif // _WIN32 && USE_HIP
+#endif // USE_HIP

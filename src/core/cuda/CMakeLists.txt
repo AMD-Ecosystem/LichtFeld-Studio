@@ -23,15 +23,13 @@ set(LFS_CORE_CUDA_SOURCES
 
 # exportable_storage.cpp implements CUDA-IPC export (cuMemExportToShareableHandle
 # + POSIX/Win handle-type-supported attribute queries) for cross-process memory
-# sharing. That feature is part of the DEFERRED io/sharing tranche (HIP has no
-# direct handle-type-supported device attribute), so it is excluded from the HIP
-# compute build. The compute kernels do not use IPC-exported storage.
+# sharing with Vulkan. HIP has no handle-type-supported device attribute, so the
+# HIP build uses a stand-in that exports nothing; the viewer then falls back to
+# Vulkan-exported memory imported into HIP.
 if(NOT USE_HIP)
     list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage.cpp)
-elseif(WIN32)
-    # Windows lld-link requires all symbols be resolved at link time; on Linux the
-    # shared-library linker silently defers undefined symbols (tested, never called).
-    list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage_win_stub.cpp)
+else()
+    list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage_hip_stub.cpp)
 endif()
 
 add_library(lfs_core_cuda STATIC ${LFS_CORE_CUDA_SOURCES})

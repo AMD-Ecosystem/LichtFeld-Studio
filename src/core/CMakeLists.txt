@@ -114,7 +114,7 @@ set(CORE_SOURCES
 )
 # The ROCm compute build on Windows has no image codec packages; the compute
 # tests never decode or encode image files, so use a stub.
-if(USE_HIP AND WIN32)
+if(_LFS_HIP_COMPUTE_ONLY AND WIN32)
     list(REMOVE_ITEM CORE_SOURCES image_codecs.cpp image_exr.cpp)
     list(APPEND CORE_SOURCES image_codecs_win_stub.cpp)
 endif()

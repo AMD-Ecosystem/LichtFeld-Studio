@@ -4,21 +4,26 @@
 
 cmake_minimum_required(VERSION 3.30)
 
-# ROCm/HIP port of the GPU compute tranche only (tensor library, training
-# kernels, gsplat/fastgs rasterizer backends + a focused GPU gtest binary).
-# The full desktop app (GUI/Vulkan-interop/Python/MCP/USD/nvImageCodec) is NVIDIA-
-# only and DEFERRED. When -DUSE_HIP=ON, route to a self-contained compute-only
-# build (cmake/HipCompute.cmake) and skip the entire NVIDIA path below, so the
-# CUDA build stays unchanged (it never sees USE_HIP).
-# Plain cache BOOL (not option()) so a command-line -DUSE_HIP=ON survives the
-# automatic reconfigure that compiler detection triggers; option() can reset to
-# its default on the re-run and silently fall back to the NVIDIA path.
+# -DUSE_HIP=ON builds for AMD GPUs with ROCm/HIP instead of CUDA. Plain cache
+# BOOLs (not option()) so command-line values survive the automatic reconfigure
+# that compiler detection triggers; option() can reset to its default on the
+# re-run and silently fall back to the NVIDIA path.
 if(NOT DEFINED USE_HIP)
-    set(USE_HIP OFF CACHE BOOL "Build the ROCm/HIP GPU-compute tranche (deferred GUI/USD/Python)")
+    set(USE_HIP OFF CACHE BOOL "Build for AMD GPUs with ROCm/HIP instead of CUDA")
+endif()
+# With USE_HIP, build only the GPU compute libraries and lfs_compute_tests from
+# distribution packages, without vcpkg (cmake/HipCompute.cmake).
+if(NOT DEFINED LFS_HIP_COMPUTE_ONLY)
+    set(LFS_HIP_COMPUTE_ONLY OFF CACHE BOOL "With USE_HIP, build only the GPU compute libraries and tests, without vcpkg")
+endif()
+if(USE_HIP AND LFS_HIP_COMPUTE_ONLY)
+    set(_LFS_HIP_COMPUTE_ONLY ON)
+else()
+    set(_LFS_HIP_COMPUTE_ONLY OFF)
 endif()
 
 # windows/linux platform independent
-if(NOT USE_HIP)
+if(NOT _LFS_HIP_COMPUTE_ONLY)
     set(RAW_VCPKG_PATH $ENV{VCPKG_ROOT})
     file(TO_CMAKE_PATH "${RAW_VCPKG_PATH}" VCPKG_ROOT)
 
@@ -91,7 +96,7 @@ unset(_LFS_HOST_PROCESSOR_COUNT)
 
 option(LFS_ENFORCE_LINUX_GUI_BACKENDS "Fail configure when Linux SDL3 would lack X11 and Wayland support" ON)
 
-if(NOT USE_HIP)
+if(NOT _LFS_HIP_COMPUTE_ONLY)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxGuiSanity.cmake")
     lfs_linux_preflight_gui_backends()
 endif()
@@ -108,11 +113,14 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
+if(NOT _LFS_HIP_COMPUTE_ONLY)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VcpkgProfiles.cmake")
+    lfs_validate_vcpkg_profile()
+endif()
+
 if(USE_HIP)
-    # Compute-only ROCm build: enable HIP (not CUDA) at project() time so the HIP
-    # compiler is detected during CMakeDetermineSystem and no mid-configure
-    # reconfigure (which would not re-apply -DUSE_HIP) is triggered. Hand off
-    # entirely to the compute-only build and skip the NVIDIA path below.
+    # Enable HIP at project() time so the compiler is detected before any
+    # reconfigure could drop -DUSE_HIP.
     if(WIN32)
         # clang++ for HIP next to clang-cl is only accepted when HIP is enabled last.
         project(LichtFeld-Studio VERSION 0.5.5 LANGUAGES CXX C)
@@ -121,14 +129,13 @@ if(USE_HIP)
     else()
         project(LichtFeld-Studio VERSION 0.5.5 LANGUAGES HIP CXX C)
     endif()
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HipCompute.cmake")
-    return()
-endif()
-
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VcpkgProfiles.cmake")
-lfs_validate_vcpkg_profile()
-
+    if(_LFS_HIP_COMPUTE_ONLY)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HipCompute.cmake")
+        return()
+    endif()
+else()
 project(LichtFeld-Studio VERSION 0.5.5 LANGUAGES CUDA CXX C)
+endif()
 
 if(WIN32)
     # Public headers can include windows.h in consumers such as the test targets.
@@ -402,6 +409,11 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+if(USE_HIP)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HipToolchain.cmake")
+    # Compute capability does not apply to AMD GPUs; the app has no SM floor.
+    set(LFS_RUNTIME_MIN_SM 0)
+else()
 # CUDA setup
 # On Windows, nvidia-smi.exe is in System32, but CMake might be running as 32-bit
 # which causes WOW64 redirection. Explicitly search in Sysnative to avoid this.
@@ -518,6 +530,7 @@ if(NOT TARGET CUDA::nvToolsExt)
 endif()
 
 message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
+endif()
 
 # Find packages
 find_package(TBB REQUIRED)
@@ -1309,6 +1322,10 @@ if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZ
     else()
         message(STATUS "Tests enabled. Build with 'ninja lichtfeld_tests' and run with 'ninja run_tests' or 'ctest -L fast'")
     endif()
+endif()
+
+if(USE_HIP)
+    lfs_hip_retag_cuda_sources("${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 # =============================================================================
