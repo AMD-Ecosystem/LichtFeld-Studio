@@ -112,6 +112,9 @@ set(CORE_SOURCES
         persisted_settings.cpp
         legacy_settings_migration.cpp
 )
+if(USE_HIP AND NOT WIN32)
+    list(APPEND CORE_SOURCES cuda/hip_host_timeline.cpp)
+endif()
 # The ROCm compute build on Windows has no image codec packages; the compute
 # tests never decode or encode image files, so use a stub.
 if(_LFS_HIP_COMPUTE_ONLY AND WIN32)

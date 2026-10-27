@@ -30,6 +30,48 @@
 #include <unistd.h>
 #endif
 
+#if defined(USE_HIP)
+// CUDA's CUdeviceptr is an integer and HIP's device pointer a void*. Keep the
+// reservation address an integer as on CUDA and convert at the VMM calls.
+#undef CUdeviceptr
+#define CUdeviceptr std::uintptr_t
+#undef cuMemAddressFree
+#undef cuMemAddressReserve
+#undef cuMemMap
+#undef cuMemSetAccess
+#undef cuMemUnmap
+
+namespace lfs::core {
+    namespace {
+        hipError_t cuMemAddressReserve(std::uintptr_t* const ptr, const std::size_t size, const std::size_t alignment,
+                                       const std::uintptr_t addr, const unsigned long long flags) {
+            void* reserved = nullptr;
+            const hipError_t r = hipMemAddressReserve(&reserved, size, alignment, reinterpret_cast<void*>(addr), flags);
+            *ptr = reinterpret_cast<std::uintptr_t>(reserved);
+            return r;
+        }
+
+        hipError_t cuMemAddressFree(const std::uintptr_t ptr, const std::size_t size) {
+            return hipMemAddressFree(reinterpret_cast<void*>(ptr), size);
+        }
+
+        hipError_t cuMemMap(const std::uintptr_t ptr, const std::size_t size, const std::size_t offset,
+                            const hipMemGenericAllocationHandle_t handle, const unsigned long long flags) {
+            return hipMemMap(reinterpret_cast<void*>(ptr), size, offset, handle, flags);
+        }
+
+        hipError_t cuMemSetAccess(const std::uintptr_t ptr, const std::size_t size, const hipMemAccessDesc* const desc,
+                                  const std::size_t count) {
+            return hipMemSetAccess(reinterpret_cast<void*>(ptr), size, desc, count);
+        }
+
+        hipError_t cuMemUnmap(const std::uintptr_t ptr, const std::size_t size) {
+            return hipMemUnmap(reinterpret_cast<void*>(ptr), size);
+        }
+    } // namespace
+} // namespace lfs::core
+#endif
+
 namespace lfs::core {
 
     namespace {
@@ -79,6 +121,17 @@ namespace lfs::core {
         }
 
         bool export_handle_supported(int device) {
+#if defined(USE_HIP)
+            // HIP has no attribute for shareable handle support. On Linux a VMM
+            // allocation exports a POSIX fd that Vulkan imports as OPAQUE_FD; the
+            // Windows handle path is not verified, so Windows uses the fallback.
+            (void)device;
+#ifdef _WIN32
+            return false;
+#else
+            return true;
+#endif
+#else
             int supported = 0;
 #ifdef _WIN32
             constexpr CUdevice_attribute handle_attribute =
@@ -90,6 +143,7 @@ namespace lfs::core {
             LFS_CUDA_BREADCRUMB("exportable.cuDeviceGetAttribute.handle_type");
             const CUresult r = cuDeviceGetAttribute(&supported, handle_attribute, device);
             return r == CUDA_SUCCESS && supported != 0;
+#endif
         }
 
         void log_cleanup_error(std::string_view operation, CUresult result) {
@@ -103,7 +157,11 @@ namespace lfs::core {
             prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = device;
+#if defined(USE_HIP)
+            prop.requestedHandleType = kCudaHandleType;
+#else
             prop.requestedHandleTypes = kCudaHandleType;
+#endif
             return prop;
         }
 

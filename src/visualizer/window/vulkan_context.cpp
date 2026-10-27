@@ -160,6 +160,47 @@ namespace lfs::vis {
         // cards, Vulkan's enumeration order can differ from CUDA's; matching by
         // UUID lets pickPhysicalDevice keep the viewer on the same card as the
         // trainer so CUDA<->Vulkan external-memory interop can import the block.
+#if defined(USE_HIP)
+        // HIP reports a board-serial UUID and the Vulkan driver a different one, so AMD
+        // devices are matched by LUID on Windows and by PCI location on Linux.
+        [[nodiscard]] bool vulkanDeviceMatchesCudaDevice(const VkPhysicalDevice device, const int cuda_device) {
+            cudaDeviceProp cuda_props{};
+            if (cudaGetDeviceProperties(&cuda_props, cuda_device) != cudaSuccess) {
+                return false;
+            }
+#ifdef _WIN32
+            VkPhysicalDeviceIDProperties vk_id{};
+            vk_id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 vk_props2{};
+            vk_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            vk_props2.pNext = &vk_id;
+            vkGetPhysicalDeviceProperties2(device, &vk_props2);
+            static_assert(sizeof(cuda_props.luid) == VK_LUID_SIZE);
+            return vk_id.deviceLUIDValid == VK_TRUE &&
+                   std::memcmp(cuda_props.luid, vk_id.deviceLUID, VK_LUID_SIZE) == 0;
+#else
+            std::uint32_t extension_count = 0;
+            vkEnumerateDeviceExtensionProperties(device, nullptr, &extension_count, nullptr);
+            std::vector<VkExtensionProperties> extensions(extension_count);
+            vkEnumerateDeviceExtensionProperties(device, nullptr, &extension_count, extensions.data());
+            const bool has_pci_bus_info = std::ranges::any_of(extensions, [](const VkExtensionProperties& e) {
+                return std::strcmp(e.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME) == 0;
+            });
+            if (!has_pci_bus_info) {
+                return false;
+            }
+            VkPhysicalDevicePCIBusInfoPropertiesEXT vk_pci{};
+            vk_pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 vk_props2{};
+            vk_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            vk_props2.pNext = &vk_pci;
+            vkGetPhysicalDeviceProperties2(device, &vk_props2);
+            return vk_pci.pciDomain == static_cast<std::uint32_t>(cuda_props.pciDomainID) &&
+                   vk_pci.pciBus == static_cast<std::uint32_t>(cuda_props.pciBusID) &&
+                   vk_pci.pciDevice == static_cast<std::uint32_t>(cuda_props.pciDeviceID);
+#endif
+        }
+#else
         [[nodiscard]] bool vulkanDeviceMatchesCudaDevice(const VkPhysicalDevice device, const int cuda_device) {
             cudaDeviceProp cuda_props{};
             if (cudaGetDeviceProperties(&cuda_props, cuda_device) != cudaSuccess) {
@@ -174,6 +215,74 @@ namespace lfs::vis {
             static_assert(sizeof(cuda_props.uuid.bytes) == VK_UUID_SIZE);
             return std::memcmp(cuda_props.uuid.bytes, vk_id.deviceUUID, VK_UUID_SIZE) == 0;
         }
+#endif
+
+#if defined(USE_HIP) && !defined(_WIN32)
+        // Host-side ordering for HIP (core/cuda/hip_host_timeline.hpp). An import is a
+        // second VkSemaphore sharing the exported payload, so it outlives the original.
+        constexpr std::uint64_t kHipHostTimelineWaitTimeoutNs = 10'000'000'000ull;
+
+        void* hipHostTimelineImport(void* const context, const int fd) {
+            const auto device = static_cast<VkDevice>(context);
+            const auto import_semaphore_fd = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
+                vkGetDeviceProcAddr(device, "vkImportSemaphoreFdKHR"));
+            if (import_semaphore_fd == nullptr) {
+                return nullptr;
+            }
+            VkSemaphoreTypeCreateInfo type_info{};
+            type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+            type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            VkSemaphoreCreateInfo create_info{};
+            create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            create_info.pNext = &type_info;
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            if (vkCreateSemaphore(device, &create_info, nullptr, &semaphore) != VK_SUCCESS) {
+                return nullptr;
+            }
+            VkImportSemaphoreFdInfoKHR import_info{};
+            import_info.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+            import_info.semaphore = semaphore;
+            import_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+            import_info.fd = fd;
+            if (import_semaphore_fd(device, &import_info) != VK_SUCCESS) {
+                vkDestroySemaphore(device, semaphore, nullptr);
+                return nullptr;
+            }
+            return reinterpret_cast<void*>(semaphore);
+        }
+
+        bool hipHostTimelineWait(void* const context, void* const semaphore, const std::uint64_t value) {
+            const auto vk_semaphore = reinterpret_cast<VkSemaphore>(semaphore);
+            VkSemaphoreWaitInfo wait_info{};
+            wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+            wait_info.semaphoreCount = 1;
+            wait_info.pSemaphores = &vk_semaphore;
+            wait_info.pValues = &value;
+            return vkWaitSemaphores(static_cast<VkDevice>(context), &wait_info,
+                                    kHipHostTimelineWaitTimeoutNs) == VK_SUCCESS;
+        }
+
+        bool hipHostTimelineSignal(void* const context, void* const semaphore, const std::uint64_t value) {
+            const auto device = static_cast<VkDevice>(context);
+            const auto vk_semaphore = reinterpret_cast<VkSemaphore>(semaphore);
+            std::uint64_t current = 0;
+            if (vkGetSemaphoreCounterValue(device, vk_semaphore, &current) != VK_SUCCESS) {
+                return false;
+            }
+            if (current >= value) {
+                return true;
+            }
+            VkSemaphoreSignalInfo signal_info{};
+            signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+            signal_info.semaphore = vk_semaphore;
+            signal_info.value = value;
+            return vkSignalSemaphore(device, &signal_info) == VK_SUCCESS;
+        }
+
+        void hipHostTimelineDestroy(void* const context, void* const semaphore) {
+            vkDestroySemaphore(static_cast<VkDevice>(context), reinterpret_cast<VkSemaphore>(semaphore), nullptr);
+        }
+#endif
 
         [[nodiscard]] std::string vulkanApiVersionString(const uint32_t api_version) {
             return std::format("{}.{}.{}",
@@ -680,12 +789,26 @@ namespace lfs::vis {
             timed("vulkan_init.createCommandPool", [&] { return createCommandPool(); }) &&
             timed("vulkan_init.createCommandBuffers", [&] { return createCommandBuffers(); }) &&
             timed("vulkan_init.createSyncObjects", [&] { return createSyncObjects(); });
+#if defined(USE_HIP) && !defined(_WIN32)
+        if (initialized) {
+            lfs::core::hip_host_timeline::set_vulkan_ops({
+                .context = device_,
+                .import_fd = hipHostTimelineImport,
+                .wait = hipHostTimelineWait,
+                .signal = hipHostTimelineSignal,
+                .destroy = hipHostTimelineDestroy,
+            });
+        }
+#endif
         return initialized;
     }
 
     void VulkanContext::shutdown() {
         // AMB-B3: latch before any device wait so concurrent UI waits observe Shutdown.
         context_shutdown_started_.store(true, std::memory_order_release);
+#if defined(USE_HIP) && !defined(_WIN32)
+        lfs::core::hip_host_timeline::set_vulkan_ops({});
+#endif
         if (device_ != VK_NULL_HANDLE) {
             // Shutdown is the one place where a whole-device wait is intentional:
             // all swapchain, UI, and external interop resources are about to be destroyed.
@@ -2658,6 +2781,20 @@ namespace lfs::vis {
         props2.pNext = &id_props;
         vkGetPhysicalDeviceProperties2(physical_device_, &props2);
         std::memcpy(device_uuid_.data(), id_props.deviceUUID, VK_UUID_SIZE);
+#if defined(USE_HIP)
+        hip_device_uuid_ = device_uuid_;
+        int hip_device_count = 0;
+        if (cudaGetDeviceCount(&hip_device_count) == cudaSuccess) {
+            for (int hip_device = 0; hip_device < hip_device_count; ++hip_device) {
+                cudaDeviceProp hip_props{};
+                if (vulkanDeviceMatchesCudaDevice(physical_device_, hip_device) &&
+                    cudaGetDeviceProperties(&hip_props, hip_device) == cudaSuccess) {
+                    std::memcpy(hip_device_uuid_.data(), hip_props.uuid.bytes, VK_UUID_SIZE);
+                    break;
+                }
+            }
+        }
+#endif
         return true;
     }
 

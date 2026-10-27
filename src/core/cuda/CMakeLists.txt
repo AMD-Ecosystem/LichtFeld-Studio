@@ -23,10 +23,9 @@ set(LFS_CORE_CUDA_SOURCES
 
 # exportable_storage.cpp implements CUDA-IPC export (cuMemExportToShareableHandle
 # + POSIX/Win handle-type-supported attribute queries) for cross-process memory
-# sharing with Vulkan. HIP has no handle-type-supported device attribute, so the
-# HIP build uses a stand-in that exports nothing; the viewer then falls back to
-# Vulkan-exported memory imported into HIP.
-if(NOT USE_HIP)
+# sharing with Vulkan. The compute-only HIP build has no viewer and uses a
+# stand-in that exports nothing.
+if(NOT _LFS_HIP_COMPUTE_ONLY)
     list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage.cpp)
 else()
     list(APPEND LFS_CORE_CUDA_SOURCES exportable_storage_hip_stub.cpp)

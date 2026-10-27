@@ -190,10 +190,25 @@
 #define cudaResourceTypeArray                       hipResourceTypeArray
 #define cudaSurfaceObject_t                         hipSurfaceObject_t
 #define make_cudaExtent                             make_hipExtent
+#if defined(_WIN32)
+/* HIP rejects the timeline handle types in a range check before reaching the
+ * driver. A timeline VkSemaphore exported as OPAQUE_WIN32 imports as
+ * OpaqueWin32 and keeps its timeline semantics: waits block until the value,
+ * signals set it. */
+#define cudaExternalSemaphoreHandleTypeTimelineSemaphoreWin32 hipExternalSemaphoreHandleTypeOpaqueWin32
 #define cudaDestroyExternalSemaphore                hipDestroyExternalSemaphore
 #define cudaImportExternalSemaphore                 hipImportExternalSemaphore
 #define cudaSignalExternalSemaphoresAsync           hipSignalExternalSemaphoresAsync
 #define cudaWaitExternalSemaphoresAsync             hipWaitExternalSemaphoresAsync
+#else
+/* No external semaphore imports into HIP on Linux; order on the host instead
+ * (see hip_host_timeline.hpp). */
+#include "core/cuda/hip_host_timeline.hpp"
+#define cudaDestroyExternalSemaphore                lfs::core::hip_host_timeline::destroy_semaphore
+#define cudaImportExternalSemaphore                 lfs::core::hip_host_timeline::import_semaphore
+#define cudaSignalExternalSemaphoresAsync           lfs::core::hip_host_timeline::signal_semaphores
+#define cudaWaitExternalSemaphoresAsync             lfs::core::hip_host_timeline::wait_semaphores
+#endif
 
 /* ---- Runtime pieces used by the application, viewer and tests ---- */
 #define CUDART_CB
@@ -285,6 +300,7 @@
 #define CU_MEM_ALLOCATION_TYPE_PINNED                    hipMemAllocationTypePinned
 #define CU_MEM_ALLOC_GRANULARITY_MINIMUM                 hipMemAllocationGranularityMinimum
 #define CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR         hipMemHandleTypePosixFileDescriptor
+#define CU_MEM_HANDLE_TYPE_WIN32                         hipMemHandleTypeWin32
 #define CU_MEM_LOCATION_TYPE_DEVICE                      hipMemLocationTypeDevice
 #define CUevent_st                                       ihipEvent_t
 #define CUstream_st                                      ihipStream_t

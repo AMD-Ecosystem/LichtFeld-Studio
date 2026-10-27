@@ -249,7 +249,13 @@ namespace lfs::vis {
         [[nodiscard]] VkQueue transferQueue() const { return transfer_queue_; }
         [[nodiscard]] uint32_t transferQueueFamily() const { return transfer_queue_family_; }
         [[nodiscard]] bool hasDedicatedTransferQueue() const { return has_dedicated_transfer_queue_; }
+#if defined(USE_HIP)
+        // HIP and Vulkan report different UUIDs for one GPU; this is the UUID of the HIP device
+        // on the selected GPU, which the interop device check compares against.
+        [[nodiscard]] const std::array<std::uint8_t, VK_UUID_SIZE>& deviceUUID() const { return hip_device_uuid_; }
+#else
         [[nodiscard]] const std::array<std::uint8_t, VK_UUID_SIZE>& deviceUUID() const { return device_uuid_; }
+#endif
         [[nodiscard]] bool externalMemoryDedicatedAllocationEnabled() const {
             return external_memory_dedicated_allocation_enabled_;
         }
@@ -495,6 +501,9 @@ namespace lfs::vis {
         bool transparent_surface_ = false;
         VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
         std::array<std::uint8_t, VK_UUID_SIZE> device_uuid_{};
+#if defined(USE_HIP)
+        std::array<std::uint8_t, VK_UUID_SIZE> hip_device_uuid_{};
+#endif
         VkDevice device_ = VK_NULL_HANDLE;
         VmaAllocator allocator_ = VK_NULL_HANDLE;
         VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
