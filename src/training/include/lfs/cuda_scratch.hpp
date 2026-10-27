@@ -26,7 +26,7 @@ namespace lfs::training::cuda_scratch {
         void after_allocate(void* ptr,
                             const size_t bytes,
                             const std::string_view label) const noexcept {
-#if CUDART_VERSION >= 11020
+#if CUDART_VERSION >= 11020 || defined(USE_HIP)
             constexpr auto method = diagnostics::VramAllocationMethod::Async;
 #else
             constexpr auto method = diagnostics::VramAllocationMethod::Direct;

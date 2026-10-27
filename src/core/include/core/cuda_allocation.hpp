@@ -42,7 +42,7 @@ namespace lfs::core {
                                      const cudaStream_t stream,
                                      const std::string_view label) const {
             void* ptr = nullptr;
-#if CUDART_VERSION >= 11020
+#if CUDART_VERSION >= 11020 || defined(USE_HIP)
             LFS_CUDA_CHECK_MSG(cudaMallocAsync(&ptr, bytes, stream),
                                "stream-ordered CUDA allocation '{}' ({} bytes)", label, bytes);
 #else
@@ -53,7 +53,7 @@ namespace lfs::core {
         }
 
         void deallocate(void* ptr, const cudaStream_t stream) const noexcept {
-#if CUDART_VERSION >= 11020
+#if CUDART_VERSION >= 11020 || defined(USE_HIP)
             const cudaError_t status = cudaFreeAsync(ptr, stream);
 #else
             const cudaError_t status = cudaFree(ptr);
