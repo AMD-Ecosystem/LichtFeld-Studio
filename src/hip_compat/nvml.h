@@ -20,3 +20,14 @@ typedef struct nvmlProcessInfo_st {
     unsigned int gpuInstanceId;
     unsigned int computeInstanceId;
 } nvmlProcessInfo_t;
+
+/* Layout as in NVML's nvmlMemory_v2_t; nvmlMemory_v2 is its version tag. */
+typedef struct nvmlMemory_v2_st {
+    unsigned int version;
+    unsigned long long total;
+    unsigned long long reserved;
+    unsigned long long free;
+    unsigned long long used;
+} nvmlMemory_v2_t;
+
+#define nvmlMemory_v2 (unsigned int)(sizeof(nvmlMemory_v2_t) | (2 << 24U))

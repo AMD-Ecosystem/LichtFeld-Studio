@@ -1,12 +1,11 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * CUDA -> HIP compatibility shim for the ROCm/AMD build of the LichtFeld-Studio
- * GPU COMPUTE tranche (tensor library, training kernels, gsplat/fastgs
- * rasterizer backends). This is the ONLY file in the compute tree that knows
- * about HIP: it is force-included on every HIP translation unit (see the
- * top-level CMakeLists `USE_HIP` block, CMAKE_HIP_FLAGS -include ...). On a
- * CUDA build this header is never reached and the NVIDIA path is unchanged.
+ * CUDA -> HIP compatibility shim for the ROCm/AMD build of LichtFeld Studio.
+ * It is force-included on every HIP translation unit (cmake/HipToolchain.cmake,
+ * CMAKE_HIP_FLAGS -include ...) and reached by plain C++ translation units
+ * through the <cuda_runtime.h> and related shims in src/hip_compat. On a CUDA
+ * build this header is never reached and the NVIDIA path is unchanged.
  *
  * Authored with the assistance of Claude (Anthropic).
  */
@@ -21,9 +20,25 @@
 #include <cstring>
 #include <cmath>
 
+/* LibTorch's CMake package adds -D__HIP_NO_HALF_OPERATORS__=1 and
+ * -D__HIP_NO_HALF_CONVERSIONS__=1 to every target that links it. The kernels
+ * use __half arithmetic as cuda_fp16.h provides it, and no HIP translation
+ * unit in the project includes LibTorch. */
+#if defined(__HIP__)
+#undef __HIP_NO_HALF_OPERATORS__
+#undef __HIP_NO_HALF_CONVERSIONS__
+#endif
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+
+/* For a plain C++ translation unit the HIP headers define __noinline__ as a
+ * macro, which breaks headers that test __has_attribute(__noinline__) (glib).
+ * The CUDA toolkit defines it only when compiling CUDA. */
+#if !defined(__HIP__)
+#undef __noinline__
+#endif
 
 /* ---- CUDA runtime / cuRAND symbol aliases (only what the tranche uses) ----
  * Names taken verbatim from torch/utils/hipify/cuda_to_hip_mappings.py. */
@@ -66,8 +81,6 @@
 #define cudaEventRecord                             hipEventRecord
 #define cudaEventSynchronize                        hipEventSynchronize
 #define cudaEvent_t                                 hipEvent_t
-#define cudaExternalSemaphoreWaitParams             hipExternalSemaphoreWaitParams
-#define cudaExternalSemaphore_t                     hipExternalSemaphore_t
 #define cudaFree                                    hipFree
 #define cudaFreeAsync                               hipFreeAsync
 #define cudaFreeHost                                hipHostFree
@@ -126,7 +139,6 @@
 #define cudaStreamWaitEvent                         hipStreamWaitEvent
 #define cudaStream_t                                hipStream_t
 #define cudaSuccess                                 hipSuccess
-#define cudaWaitExternalSemaphoresAsync             hipWaitExternalSemaphoresAsync
 #define curand                                      hiprand
 #define curandCreateGenerator                       hiprandCreateGenerator
 #define curandDestroyGenerator                      hiprandDestroyGenerator
@@ -144,6 +156,87 @@
 #define curand_uniform                              hiprand_uniform
 #define CURAND_RNG_PSEUDO_PHILOX4_32_10             HIPRAND_RNG_PSEUDO_PHILOX4_32_10
 #define CURAND_STATUS_SUCCESS                       HIPRAND_STATUS_SUCCESS
+
+/* ---- Vulkan interop: external memory, surfaces, external semaphores ---- */
+#define cudaArraySurfaceLoadStore                   hipArraySurfaceLoadStore
+#define cudaArray_t                                 hipArray_t
+#define cudaChannelFormatDesc                       hipChannelFormatDesc
+#define cudaChannelFormatKindFloat                  hipChannelFormatKindFloat
+#define cudaChannelFormatKindUnsigned               hipChannelFormatKindUnsigned
+#define cudaCreateChannelDesc                       hipCreateChannelDesc
+#define cudaCreateSurfaceObject                     hipCreateSurfaceObject
+#define cudaDestroyExternalMemory                   hipDestroyExternalMemory
+#define cudaDestroySurfaceObject                    hipDestroySurfaceObject
+#define cudaExtent                                  hipExtent
+#define cudaExternalMemoryDedicated                 hipExternalMemoryDedicated
+#define cudaExternalMemoryGetMappedMipmappedArray   hipExternalMemoryGetMappedMipmappedArray
+#define cudaExternalMemoryHandleDesc                hipExternalMemoryHandleDesc
+#define cudaExternalMemoryHandleType                hipExternalMemoryHandleType
+#define cudaExternalMemoryHandleTypeOpaqueFd        hipExternalMemoryHandleTypeOpaqueFd
+#define cudaExternalMemoryHandleTypeOpaqueWin32     hipExternalMemoryHandleTypeOpaqueWin32
+#define cudaExternalMemoryMipmappedArrayDesc        hipExternalMemoryMipmappedArrayDesc
+#define cudaExternalMemory_t                        hipExternalMemory_t
+#define cudaExternalSemaphoreHandleDesc             hipExternalSemaphoreHandleDesc
+#define cudaExternalSemaphoreHandleType             hipExternalSemaphoreHandleType
+#define cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd hipExternalSemaphoreHandleTypeTimelineSemaphoreFd
+#define cudaExternalSemaphoreSignalParams           hipExternalSemaphoreSignalParams
+#define cudaExternalSemaphoreWaitParams             hipExternalSemaphoreWaitParams
+#define cudaExternalSemaphore_t                     hipExternalSemaphore_t
+#define cudaFreeMipmappedArray                      hipFreeMipmappedArray
+#define cudaGetMipmappedArrayLevel                  hipGetMipmappedArrayLevel
+#define cudaImportExternalMemory                    hipImportExternalMemory
+#define cudaMipmappedArray_t                        hipMipmappedArray_t
+#define cudaResourceDesc                            hipResourceDesc
+#define cudaResourceTypeArray                       hipResourceTypeArray
+#define cudaSurfaceObject_t                         hipSurfaceObject_t
+#define make_cudaExtent                             make_hipExtent
+#define cudaDestroyExternalSemaphore                hipDestroyExternalSemaphore
+#define cudaImportExternalSemaphore                 hipImportExternalSemaphore
+#define cudaSignalExternalSemaphoresAsync           hipSignalExternalSemaphoresAsync
+#define cudaWaitExternalSemaphoresAsync             hipWaitExternalSemaphoresAsync
+
+/* ---- Runtime pieces used by the application, viewer and tests ---- */
+#define CUDART_CB
+#define CURAND_RNG_PSEUDO_DEFAULT                   HIPRAND_RNG_PSEUDO_DEFAULT
+#define cudaDevAttrClockRate                        hipDeviceAttributeClockRate
+#define cudaDeviceGetLimit                          hipDeviceGetLimit
+#define cudaDeviceSetLimit                          hipDeviceSetLimit
+#define cudaErrorNotSupported                       hipErrorNotSupported
+#define cudaGraphExecDestroy                        hipGraphExecDestroy
+#define cudaGraphExec_t                             hipGraphExec_t
+#define cudaGraphInstantiate                        hipGraphInstantiate
+#define cudaGraphLaunch                             hipGraphLaunch
+#define cudaHostAllocMapped                         hipHostMallocMapped
+#define cudaHostAllocPortable                       hipHostMallocPortable
+#define cudaHostGetDevicePointer                    hipHostGetDevicePointer
+#define cudaLimitMallocHeapSize                     hipLimitMallocHeapSize
+#define cudaLimitPrintfFifoSize                     hipLimitPrintfFifoSize
+#define cudaLimitStackSize                          hipLimitStackSize
+#define cudaMallocFromPoolAsync                     hipMallocFromPoolAsync
+#define cudaMemAllocationTypePinned                 hipMemAllocationTypePinned
+#define cudaMemLocationTypeDevice                   hipMemLocationTypeDevice
+#define cudaMemPoolAttrReservedMemHigh              hipMemPoolAttrReservedMemHigh
+#define cudaMemPoolAttrUsedMemHigh                  hipMemPoolAttrUsedMemHigh
+#define cudaMemPoolCreate                           hipMemPoolCreate
+#define cudaMemPoolDestroy                          hipMemPoolDestroy
+#define cudaMemPoolProps                            hipMemPoolProps
+#define cudaProfilerStart                           hipProfilerStart
+#define cudaProfilerStop                            hipProfilerStop
+#define cudaStreamCaptureModeThreadLocal            hipStreamCaptureModeThreadLocal
+#define cudaStreamDefault                           hipStreamDefault
+#define cudaStreamLegacy                            hipStreamLegacy
+#define cudaStreamPerThread                         hipStreamPerThread
+/* Driver API used through FFmpeg's CUDA hardware context and the tests. */
+#define CU_STREAM_WAIT_VALUE_GEQ                    hipStreamWaitValueGte
+#define CUcontext                                   hipCtx_t
+#define CUstream                                    hipStream_t
+#define cuCtxGetCurrent                             hipCtxGetCurrent
+#define cuCtxPopCurrent                             hipCtxPopCurrent
+#define cuCtxPushCurrent                            hipCtxPushCurrent
+#define cuCtxSetCurrent                             hipCtxSetCurrent
+#define cuStreamSynchronize                         hipStreamSynchronize
+#define cuStreamWaitEvent                           hipStreamWaitEvent
+#define cuStreamWaitValue32                         hipStreamWaitValue32
 
 /* ---- libtorch (ROCm) interop ----
  * The ROCm libtorch the compute gtests link against ships c10/cuda headers that

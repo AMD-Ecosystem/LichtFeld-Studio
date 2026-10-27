@@ -4,7 +4,7 @@
 #include "splat_decimate_internal.hpp"
 #include <cmath>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define DEC_HD __host__ __device__
 #else
 #define DEC_HD

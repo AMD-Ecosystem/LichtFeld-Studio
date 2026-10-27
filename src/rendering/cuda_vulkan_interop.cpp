@@ -404,7 +404,12 @@ namespace lfs::rendering {
         cuda_mem_ = std::exchange(other.cuda_mem_, nullptr);
         cuda_mip_ = std::exchange(other.cuda_mip_, nullptr);
         cuda_array_ = std::exchange(other.cuda_array_, nullptr);
+#if defined(USE_HIP)
+        // hipSurfaceObject_t is a pointer; cudaSurfaceObject_t is an integer.
+        surface_ = std::exchange(other.surface_, cudaSurfaceObject_t{});
+#else
         surface_ = std::exchange(other.surface_, 0);
+#endif
         cuda_timeline_ = std::exchange(other.cuda_timeline_, nullptr);
         last_signaled_ = std::exchange(other.last_signaled_, 0);
         last_waited_ = std::exchange(other.last_waited_, 0);
@@ -481,6 +486,7 @@ namespace lfs::rendering {
         if (status != cudaSuccess) {
             return setCudaFailure(last_error_, "cudaGetDevice", status);
         }
+#if !defined(USE_HIP)
         int timeline_interop_supported = 0;
         status = cudaDeviceGetAttribute(&timeline_interop_supported,
                                         cudaDevAttrTimelineSemaphoreInteropSupported,
@@ -497,6 +503,7 @@ namespace lfs::rendering {
                                                cuda_device,
                                                timeline_interop_supported));
         }
+#endif
 
         NativeHandleOwner memory_handle(image.memory_handle);
         NativeHandleOwner semaphore_handle(semaphore.semaphore_handle);
@@ -633,7 +640,11 @@ namespace lfs::rendering {
                                                reinterpret_cast<std::uintptr_t>(cuda_mem_),
                                                reinterpret_cast<std::uintptr_t>(cuda_mip_),
                                                reinterpret_cast<std::uintptr_t>(cuda_array_),
+#if defined(USE_HIP)
+                                               reinterpret_cast<std::uintptr_t>(surface_),
+#else
                                                static_cast<std::uint64_t>(surface_),
+#endif
                                                reinterpret_cast<std::uintptr_t>(cuda_timeline_),
                                                extent_.width,
                                                extent_.height,

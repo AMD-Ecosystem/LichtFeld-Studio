@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define LFS_RAD_HD __host__ __device__ inline
 #else
 #define LFS_RAD_HD inline

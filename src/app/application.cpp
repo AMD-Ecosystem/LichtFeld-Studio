@@ -1443,6 +1443,23 @@ namespace lfs::app {
     // kernels. Without this gate the first launch inside warmup_kernels dies with no
     // user-facing message (#1540). show_dialog is false for CLI-only modes: a modal in a
     // non-interactive process blocks it forever.
+#if defined(USE_HIP)
+    // On AMD the build carries code objects for the configured GPU architectures;
+    // the CUDA driver version and compute capability floor do not apply.
+    bool preflightGpu(const bool show_dialog) {
+        cudaDeviceProp prop{};
+        if (const cudaError_t err = cudaGetDeviceProperties(&prop, 0); err != cudaSuccess) {
+            reportFatalStartupError(
+                "LichtFeld Studio - No usable GPU",
+                std::format("No usable AMD GPU found ({}). LichtFeld Studio requires a ROCm-supported AMD GPU.",
+                            cudaGetErrorString(err)),
+                show_dialog);
+            return false;
+        }
+        LOG_INFO("GPU: {} ({}, {} MB)", prop.name, prop.gcnArchName, prop.totalGlobalMem / (1024 * 1024));
+        return true;
+    }
+#else
     bool preflightGpu(const bool show_dialog) {
         const auto info = lfs::core::check_cuda_version();
         if (info.query_failed) {
@@ -1486,6 +1503,7 @@ namespace lfs::app {
         }
         return true;
     }
+#endif
 
     namespace {
 

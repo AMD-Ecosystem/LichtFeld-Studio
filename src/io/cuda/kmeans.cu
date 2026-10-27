@@ -397,7 +397,11 @@ namespace lfs::io {
                 __syncthreads();
             }
 
+#if defined(USE_HIP)
+            const auto group_mask = LFS_FULL_WARP_MASK;
+#else
             const unsigned group_mask = 0xffffffffu;
+#endif
             const int group_lane = tid % ASSIGN_CENTROID_GROUPS;
 #pragma unroll
             for (int p = 0; p < ASSIGN_POINTS_PER_THREAD; ++p) {
@@ -539,8 +543,13 @@ namespace lfs::io {
 #endif
                 }
                 for (int delta = 2; delta > 0; delta /= 2) {
+#if defined(USE_HIP)
+                    const float other = __shfl_xor_sync(LFS_FULL_WARP_MASK, best, delta, 4);
+                    const int id = __shfl_xor_sync(LFS_FULL_WARP_MASK, best_id, delta, 4);
+#else
                     const float other = __shfl_xor_sync(0xffffffffu, best, delta, 4);
                     const int id = __shfl_xor_sync(0xffffffffu, best_id, delta, 4);
+#endif
                     if (other < best || (other == best && id < best_id)) {
                         best = other;
                         best_id = id;
@@ -652,7 +661,11 @@ namespace lfs::io {
                 __syncthreads();
             }
 
+#if defined(USE_HIP)
+            const auto group_mask = LFS_FULL_WARP_MASK;
+#else
             const unsigned group_mask = 0xffffffffu;
+#endif
             const int group_lane = tid % ASSIGN_CENTROID_GROUPS;
 #pragma unroll
             for (int p = 0; p < POINTS_PER_THREAD; ++p) {
@@ -1092,7 +1105,11 @@ namespace lfs::io {
                 __syncthreads();
             }
 
+#if defined(USE_HIP)
+            const auto group_mask = LFS_FULL_WARP_MASK;
+#else
             const unsigned group_mask = 0xffffffffu;
+#endif
             const int group_lane = tid % ASSIGN_CENTROID_GROUPS;
 #pragma unroll
             for (int p = 0; p < POINTS_PER_THREAD; ++p) {

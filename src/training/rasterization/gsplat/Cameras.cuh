@@ -490,7 +490,14 @@ struct OpenCVPinholeCameraModel
         std::array<float, 4> thin_prism_coeffs = {0.f};
     };
 
+#if defined(USE_HIP)
+    // The lens-view preprocessing builds this model on the host. nvcc accepts a
+    // host call into a class template's __device__ constructor with a warning;
+    // clang rejects it.
+    __host__ __device__ OpenCVPinholeCameraModel(
+#else
     __device__ OpenCVPinholeCameraModel(
+#endif
         Parameters const& parameters,
         float stop_undistortion_square_error_px2 = 1e-12)
         : parameters(parameters),
