@@ -7,7 +7,7 @@
 - vcpkg (`VCPKG_ROOT` environment variable set)
 - GCC 14+ (Linux) or Visual Studio 2022 v17.10+ (Windows)
 
-On AMD GPUs, ROCm takes the place of the CUDA Toolkit and vcpkg is not used. See [AMD GPUs (ROCm/HIP)](#amd-gpus-rocmhip).
+On AMD GPUs, ROCm takes the place of the CUDA Toolkit. See [AMD GPUs (ROCm/HIP)](#amd-gpus-rocmhip).
 
 Windows builds require the **C++ Clang Compiler for Windows** Visual Studio
 Installer individual component in addition to the regular C++ desktop workload.
@@ -223,7 +223,39 @@ dist/
 
 ## AMD GPUs (ROCm/HIP)
 
-`-DUSE_HIP=ON` configures a HIP build for AMD GPUs. It covers the GPU compute libraries only: the tensor library, the training kernels (Adam, schedulers, losses, SSIM, MCMC, densification, bilateral grid, ppisp) and the fastgs and gsplat rasterizer backends, plus a focused GPU test binary named `lfs_compute_tests`. The desktop application (Vulkan viewer, Python plugins, MCP server, USD export, nvImageCodec) is not built on this path and still requires CUDA. The CUDA build is unaffected: with `USE_HIP` set, the top-level `CMakeLists.txt` hands the configure to `cmake/HipCompute.cmake` and returns before any NVIDIA logic runs.
+`-DUSE_HIP=ON` builds LichtFeld Studio for AMD GPUs with ROCm/HIP in place of CUDA: the application with its Vulkan viewer, the Python module, the MCP server and `lichtfeld_tests`, with dependencies from vcpkg as in the CUDA build. The CUDA build is unaffected.
+
+Requirements on Linux, besides the [Linux prerequisites](#linux-prerequisites):
+
+- ROCm 7.x with its Clang and the rocJPEG library (tested with the ROCm 7.16 SDK). The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`.
+- GCC 14 for C and C++, as in the CUDA build; the ROCm Clang compiles the HIP sources.
+- With `-DBUILD_TESTS=ON`, a ROCm build of LibTorch, passed as `Torch_DIR`. The `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
+
+```bash
+cmake -B build-hip -G Ninja \
+  -DUSE_HIP=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100 \
+  -DCMAKE_C_COMPILER=gcc-14 \
+  -DCMAKE_CXX_COMPILER=g++-14 \
+  -DCMAKE_HIP_COMPILER="${ROCM_PATH:-/opt/rocm}/lib/llvm/bin/clang++" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON \
+  -DTorch_DIR=/path/to/rocm/libtorch/share/cmake/Torch
+cmake --build build-hip -j 16
+./build-hip/LichtFeld-Studio --help
+```
+
+On a system ROCm install the HIP compiler is at `${ROCM_PATH}/llvm/bin/clang++`. Keep `CC` and `CXX` set to GCC 14 in the environment while configuring: vcpkg builds the dependencies with them.
+
+What differs from the CUDA build:
+
+- JPEG images decode on the GPU with rocJPEG. ROCm has no JPEG encoder or JPEG 2000 codec, so JPEG encoding, the lossless JPEG 2000 image caches, and JPEGs the hardware decoder does not accept (smaller than 64x64, progressive) are handled on the CPU with libjpeg and OpenJPH.
+- On Linux, HIP cannot import Vulkan semaphores, so the viewer orders HIP and Vulkan work on the host around each shared image instead of on the GPU.
+- Video import and export use FFmpeg's software codecs; NVDEC and NVENC are NVIDIA-only.
+
+### Compute-only build
+
+`-DUSE_HIP=ON -DLFS_HIP_COMPUTE_ONLY=ON` builds only the GPU compute libraries: the tensor library, the training kernels (Adam, schedulers, losses, SSIM, MCMC, densification, bilateral grid, ppisp) and the fastgs and gsplat rasterizer backends, plus a focused GPU test binary named `lfs_compute_tests`. With this option the top-level `CMakeLists.txt` hands the configure to `cmake/HipCompute.cmake` and returns before the application is configured.
 
 Dependencies are supplied directly rather than through vcpkg:
 
@@ -238,6 +270,7 @@ Dependencies are supplied directly rather than through vcpkg:
 ```bash
 cmake -B build-hip -G Ninja \
   -DUSE_HIP=ON \
+  -DLFS_HIP_COMPUTE_ONLY=ON \
   -DCMAKE_HIP_ARCHITECTURES=gfx90a \
   -DCMAKE_CXX_COMPILER="${ROCM_PATH:-/opt/rocm}/llvm/bin/clang++" \
   -DCMAKE_C_COMPILER="${ROCM_PATH:-/opt/rocm}/llvm/bin/clang" \
@@ -257,12 +290,13 @@ HIP_VISIBLE_DEVICES=0 ./build-hip/cmake/hip_tests/lfs_compute_tests
 
 The commands above are the Linux recipe. `CMAKE_HIP_COMPILER` does not have to be set when ROCm's `bin` directory is on `PATH`: CMake asks `hipconfig` where the ROCm Clang lives, and HIP is enabled at `project()` time so no reconfigure is needed. Otherwise name the compiler yourself with `-DCMAKE_HIP_COMPILER` or the `HIPCXX` environment variable; setting `ROCM_PATH` alone does not steer that search.
 
-On Windows, configure from a Visual Studio developer prompt so the MSVC libraries and linker are found. C and C++ use `clang-cl` and HIP uses `clang++`, both from the ROCm LLVM directory; HIP is enabled after C and C++, which lets the two front ends coexist. LibTorch comes from a ROCm PyTorch install, whose `LoadHIP.cmake` requires `PYTORCH_ROCM_ARCH` to name the target. The image codec libraries and OpenMesh are not needed on Windows. spdlog, nlohmann-json, TBB, GoogleTest and the `xxhash.h` header are found as on Linux, but Windows has no system location for them: list the install prefixes that hold them in `CMAKE_PREFIX_PATH`. If `clang++` cannot find the device libraries, set `HIP_DEVICE_LIB_PATH` to `%ROCM_PATH%\lib\llvm\amdgcn\bitcode`.
+The full application build has not been verified on Windows yet; the compute-only build has. On Windows, configure from a Visual Studio developer prompt so the MSVC libraries and linker are found. C and C++ use `clang-cl` and HIP uses `clang++`, both from the ROCm LLVM directory; HIP is enabled after C and C++, which lets the two front ends coexist. LibTorch comes from a ROCm PyTorch install, whose `LoadHIP.cmake` requires `PYTORCH_ROCM_ARCH` to name the target. The image codec libraries and OpenMesh are not needed on Windows. spdlog, nlohmann-json, TBB, GoogleTest and the `xxhash.h` header are found as on Linux, but Windows has no system location for them: list the install prefixes that hold them in `CMAKE_PREFIX_PATH`. If `clang++` cannot find the device libraries, set `HIP_DEVICE_LIB_PATH` to `%ROCM_PATH%\lib\llvm\amdgcn\bitcode`.
 
 ```bat
 set PYTORCH_ROCM_ARCH=gfx1151
 cmake -B build-hip -G Ninja ^
   -DUSE_HIP=ON ^
+  -DLFS_HIP_COMPUTE_ONLY=ON ^
   -DCMAKE_HIP_ARCHITECTURES=gfx1151 ^
   -DCMAKE_C_COMPILER=%ROCM_PATH%\lib\llvm\bin\clang-cl.exe ^
   -DCMAKE_CXX_COMPILER=%ROCM_PATH%\lib\llvm\bin\clang-cl.exe ^

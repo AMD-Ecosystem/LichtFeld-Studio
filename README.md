@@ -123,7 +123,7 @@ Current project notes:
   RTX 20-series and up). GTX 10-series and older, AMD, and Intel GPUs are not supported
 - NVIDIA driver 570 or newer is required (CUDA 12.8+)
 - Source builds use modern C++23 and CUDA 12.8+ toolchains
-- AMD GPUs are supported for the GPU compute libraries and their tests through a ROCm/HIP build; see [Building and Distribution](docs/building_and_distribution.md#amd-gpus-rocmhip)
+- AMD GPUs are supported through a ROCm/HIP source build; see [Building and Distribution](docs/building_and_distribution.md#amd-gpus-rocmhip)
 
 ## Docs
 
