@@ -73,6 +73,14 @@ target_compile_options(lfs_training_kernels PRIVATE
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
 )
 
+if(USE_HIP)
+    # The masked and unmasked SSIM kernels must produce bit-identical maps. clang
+    # contracts multiplies and adds across statements by default for HIP, which
+    # fuses them differently in kernels that keep different intermediates live;
+    # contract only within an expression.
+    set_source_files_properties(kernels/ssim.cu PROPERTIES COMPILE_OPTIONS "-ffp-contract=on")
+endif()
+
 if(MSVC)
     target_compile_definitions(lfs_training_kernels PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
