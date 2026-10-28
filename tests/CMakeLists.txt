@@ -937,6 +937,9 @@ if(NOT BUILD_VISUALIZER_TESTS)
     list(APPEND TEST_FILES test_preferences_migration.cpp)
 endif()
 list(APPEND TEST_FILES test_vksplat_input_packer.cpp)
+if(USE_HIP)
+    list(APPEND TEST_FILES test_nvcodec_hip_jpeg.cpp)
+endif()
 list(APPEND TEST_FILES test_viewer_sh_zerocopy_triad.cpp)
 # Phase 7A: bounded-wait machine + SubmissionState + QW-6 (GPU-free).
 list(APPEND TEST_FILES test_vulkan_wait_bounded.cpp)
@@ -1119,6 +1122,9 @@ target_link_libraries(lichtfeld_tests PRIVATE
 )
 
 target_link_libraries(lichtfeld_tests PRIVATE lfs_vulkan_rasterizer Vulkan::Vulkan)
+if(USE_HIP)
+    target_link_libraries(lichtfeld_tests PRIVATE JPEG::JPEG)
+endif()
 
 # Focused post-training compaction loop, including parameter and checkpoint
 # compatibility contracts, without compiling the unrelated tensor oracle suite.

@@ -36,6 +36,7 @@
 #endif
 
 #include <jpeglib.h>
+#include <jerror.h>
 #include <openjph/ojph_codestream.h>
 #include <openjph/ojph_file.h>
 #include <openjph/ojph_mem.h>
@@ -58,23 +59,66 @@ namespace lfs::io {
         struct JpegError {
             jpeg_error_mgr base{};
             std::jmp_buf jump{};
+            char message[JMSG_LENGTH_MAX] = {};
         };
 
         [[noreturn]] void jpeg_error_exit(j_common_ptr info) {
-            std::longjmp(reinterpret_cast<JpegError*>(info->err)->jump, 1);
+            auto* const error = reinterpret_cast<JpegError*>(info->err);
+            (*info->err->format_message)(info, error->message);
+            std::longjmp(error->jump, 1);
         }
+
+        // Compressed output in a buffer this class owns, so libjpeg never frees or
+        // reallocates it and an error part way through leaves nothing to double free.
+        struct JpegVectorDestination {
+            jpeg_destination_mgr base{};
+            std::vector<uint8_t> bytes;
+
+            static JpegVectorDestination& of(j_compress_ptr codec) {
+                return *static_cast<JpegVectorDestination*>(codec->client_data);
+            }
+
+            static void init(j_compress_ptr codec) {
+                auto& self = of(codec);
+                self.grow(codec, 0, size_t{1} << 16);
+            }
+
+            static boolean empty(j_compress_ptr codec) {
+                auto& self = of(codec);
+                const size_t used = self.bytes.size();
+                self.grow(codec, used, used * 2);
+                return TRUE;
+            }
+
+            static void term(j_compress_ptr codec) {
+                auto& self = of(codec);
+                self.bytes.resize(self.bytes.size() - self.base.free_in_buffer);
+            }
+
+            void grow(j_compress_ptr codec, const size_t used, const size_t capacity) {
+                bool grown = true;
+                try {
+                    bytes.resize(capacity);
+                } catch (const std::bad_alloc&) {
+                    grown = false;
+                }
+                if (!grown) {
+                    ERREXIT(codec, JERR_OUT_OF_MEMORY);
+                }
+                base.next_output_byte = bytes.data() + used;
+                base.free_in_buffer = capacity - used;
+            }
+        };
 
         struct JpegMemoryEncoder {
             jpeg_compress_struct codec{};
             JpegError error{};
-            unsigned char* buffer = nullptr;
-            unsigned long size = 0;
+            JpegVectorDestination destination{};
             bool created = false;
 
             ~JpegMemoryEncoder() {
                 if (created)
                     jpeg_destroy_compress(&codec);
-                std::free(buffer);
             }
 
             // The jump stays inside a frame with no destructors to skip.
@@ -87,7 +131,11 @@ namespace lfs::io {
                 }
                 jpeg_create_compress(&codec);
                 created = true;
-                jpeg_mem_dest(&codec, &buffer, &size);
+                destination.base.init_destination = JpegVectorDestination::init;
+                destination.base.empty_output_buffer = JpegVectorDestination::empty;
+                destination.base.term_destination = JpegVectorDestination::term;
+                codec.dest = &destination.base;
+                codec.client_data = &destination;
                 codec.image_width = static_cast<JDIMENSION>(width);
                 codec.image_height = static_cast<JDIMENSION>(height);
                 codec.input_components = channels;
@@ -114,9 +162,9 @@ namespace lfs::io {
                                                  const int height, const int channels, const int quality) {
             auto encoder = std::make_unique<JpegMemoryEncoder>();
             if (!encoder->encode(pixels, width, height, channels, quality)) {
-                throw std::runtime_error("JPEG encoding failed");
+                throw std::runtime_error(std::string("JPEG encoding failed: ") + encoder->error.message);
             }
-            return {encoder->buffer, encoder->buffer + encoder->size};
+            return std::move(encoder->destination.bytes);
         }
 
         std::vector<uint8_t> encode_device_jpeg(const lfs::core::Tensor& device_u8, const int width,
@@ -320,14 +368,14 @@ namespace lfs::io {
             }
         };
 
-        // CPU decode for streams the hardware decoder refuses (images under 64x64, and JPEG
-        // modes VCN does not implement), as nvImageCodec falls back to its other decoders.
+        // CPU decode for streams rocJPEG does not support, as nvImageCodec falls back to
+        // its CPU decoder for streams nvJPEG does not support.
         std::vector<uint8_t> decode_jpeg_on_host(const uint8_t* const data, const size_t size, const JpegLayout layout,
                                                  uint32_t& width, uint32_t& height) {
             std::vector<uint8_t> pixels;
             auto decompressor = std::make_unique<JpegDecompressor>();
             if (!decompressor->decode(data, size, layout == JpegLayout::Luma, pixels, width, height)) {
-                throw std::runtime_error("JPEG decoding failed");
+                throw std::runtime_error(std::string("JPEG decoding failed: ") + decompressor->error.message);
             }
             if (layout != JpegLayout::PlanarRgb) {
                 return pixels;
@@ -340,9 +388,196 @@ namespace lfs::io {
             return planar;
         }
 
+        std::atomic<uint64_t> cpu_decoded_jpegs{0};
+
+        void log_cpu_decode(const std::string& reason, const size_t bytes) {
+            const uint64_t n = cpu_decoded_jpegs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 3) {
+                LOG_WARN("[NvCodecImageLoader] Decoding a JPEG on the CPU (libjpeg): {} ({} bytes)", reason, bytes);
+            } else if (n % 500 == 0) {
+                LOG_WARN("[NvCodecImageLoader] {} JPEGs decoded on the CPU (libjpeg) so far", n);
+            }
+        }
+
 #if LFS_HAVE_ROCJPEG
         std::string rocjpeg_error(const char* const what, const RocJpegStatus status) {
             return std::string(what) + " failed: " + rocJpegGetErrorName(status);
+        }
+
+        // rocJPEG declined a stream it does not support, as opposed to failing on it.
+        struct RocJpegUnsupported : std::runtime_error {
+            using std::runtime_error::runtime_error;
+        };
+
+        void check_rocjpeg(const RocJpegStatus status, const char* const what) {
+            if (status == ROCJPEG_STATUS_JPEG_NOT_SUPPORTED) {
+                throw RocJpegUnsupported(rocjpeg_error(what, status));
+            }
+            if (status != ROCJPEG_STATUS_SUCCESS) {
+                throw std::runtime_error(rocjpeg_error(what, status));
+            }
+        }
+
+        struct JpegFrame {
+            uint8_t marker = 0;
+            uint8_t precision = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t components = 0;
+            uint8_t id[4] = {};
+            uint8_t h[4] = {};
+            uint8_t v[4] = {};
+            uint8_t quant_table[4] = {};
+        };
+
+        struct JpegInspection {
+            std::optional<JpegFrame> frame;
+            std::string defect; // empty when the stream is structurally complete
+        };
+
+        // Walks the marker segments of a JPEG stream: the frame header, defined
+        // quantization tables, a well-formed first scan header, scan data, and an
+        // end-of-image marker. rocJPEG parses streams that lack any of these and
+        // submits them to the hardware decoder, which then hangs until the driver
+        // resets it, so such a stream must never reach it.
+        JpegInspection inspect_jpeg(const uint8_t* const data, const size_t size) {
+            JpegInspection result;
+            const auto defect = [&](std::string what) {
+                result.defect = std::move(what);
+                return result;
+            };
+            bool quant_defined[4] = {};
+            size_t i = 2;
+            while (true) {
+                if (i + 2 > size) {
+                    return defect("the data ends before the first scan");
+                }
+                if (data[i] != 0xFF) {
+                    return defect("no marker at byte " + std::to_string(i));
+                }
+                const uint8_t marker = data[i + 1];
+                if (marker == 0xFF) {
+                    ++i;
+                    continue;
+                }
+                i += 2;
+                if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+                    continue;
+                }
+                if (marker == 0xD8 || marker == 0xD9) {
+                    return defect("the data ends before the first scan");
+                }
+                if (i + 2 > size) {
+                    return defect("a marker segment runs past the end of the data");
+                }
+                const size_t length = (size_t{data[i]} << 8) | data[i + 1];
+                if (length < 2 || i + length > size) {
+                    return defect("a marker segment runs past the end of the data");
+                }
+                const uint8_t* const segment = data + i + 2;
+                const size_t n = length - 2;
+                if (marker == 0xDB) {
+                    for (size_t j = 0; j < n;) {
+                        const uint8_t table = segment[j] & 0x0F;
+                        if (table > 3) {
+                            return defect("a quantization table number is out of range");
+                        }
+                        quant_defined[table] = true;
+                        j += 1 + ((segment[j] >> 4) ? 128 : 64);
+                        if (j > n) {
+                            return defect("a quantization table is truncated");
+                        }
+                    }
+                } else if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 &&
+                           marker != 0xCC) {
+                    if (result.frame) {
+                        return defect("more than one frame header");
+                    }
+                    if (n < 6 || n < 6 + 3 * size_t{segment[5]}) {
+                        return defect("the frame header is truncated");
+                    }
+                    JpegFrame frame;
+                    frame.marker = marker;
+                    frame.precision = segment[0];
+                    frame.height = (uint32_t{segment[1]} << 8) | segment[2];
+                    frame.width = (uint32_t{segment[3]} << 8) | segment[4];
+                    frame.components = segment[5];
+                    for (uint32_t c = 0; c < std::min<uint32_t>(frame.components, 4); ++c) {
+                        frame.id[c] = segment[6 + 3 * c];
+                        frame.h[c] = segment[7 + 3 * c] >> 4;
+                        frame.v[c] = segment[7 + 3 * c] & 0x0F;
+                        frame.quant_table[c] = segment[8 + 3 * c];
+                    }
+                    result.frame = frame;
+                } else if (marker == 0xDA) {
+                    if (!result.frame) {
+                        return defect("a scan precedes the frame header");
+                    }
+                    const JpegFrame& frame = *result.frame;
+                    if (n < 1 || segment[0] < 1 || segment[0] > 4 || n != 4 + 2 * size_t{segment[0]}) {
+                        return defect("the scan header is malformed");
+                    }
+                    for (size_t k = 0; k < segment[0]; ++k) {
+                        const uint8_t* const id_end = frame.id + std::min<uint32_t>(frame.components, 4);
+                        if (std::find(frame.id, id_end, segment[1 + 2 * k]) == id_end) {
+                            return defect("the scan names a component the frame does not have");
+                        }
+                    }
+                    for (uint32_t c = 0; c < std::min<uint32_t>(frame.components, 4); ++c) {
+                        if (frame.quant_table[c] > 3 || !quant_defined[frame.quant_table[c]]) {
+                            return defect("a component uses an undefined quantization table");
+                        }
+                    }
+                    const size_t scan_start = i + length;
+                    for (size_t k = scan_start; k + 1 < size; ++k) {
+                        if (data[k] == 0xFF && data[k + 1] == 0xD9) {
+                            if (k == scan_start) {
+                                return defect("the scan has no data");
+                            }
+                            return result;
+                        }
+                    }
+                    return defect("the data is truncated (no end-of-image marker)");
+                }
+                i += length;
+            }
+        }
+
+        // Why rocJPEG cannot decode a stream with this frame header, or nullopt when it can:
+        // it decodes 8-bit baseline and extended Huffman JPEG, grayscale or YCbCr at 4:4:4,
+        // 4:4:0, 4:2:2 or 4:2:0, at least 64x64.
+        std::optional<std::string> rocjpeg_unsupported_reason(const JpegFrame& frame) {
+            if (frame.marker != 0xC0 && frame.marker != 0xC1) {
+                const char* const process = frame.marker == 0xC2   ? "progressive"
+                                            : frame.marker == 0xC3 ? "lossless"
+                                            : frame.marker <= 0xC7 ? "hierarchical"
+                                                                   : "arithmetic-coded";
+                return std::string(process) + " JPEG";
+            }
+            if (frame.precision != 8) {
+                return std::to_string(frame.precision) + "-bit JPEG";
+            }
+            if (frame.components != 1 && frame.components != 3) {
+                return std::to_string(frame.components) + "-component JPEG";
+            }
+            if (frame.width < 64 || frame.height < 64) {
+                return "JPEG smaller than 64x64 (" + std::to_string(frame.width) + "x" +
+                       std::to_string(frame.height) + ")";
+            }
+            if (frame.components == 3) {
+                const bool chroma_match = frame.h[1] == frame.h[2] && frame.v[1] == frame.v[2] &&
+                                          frame.h[1] != 0 && frame.v[1] != 0;
+                const bool supported = chroma_match && frame.h[0] % frame.h[1] == 0 &&
+                                       frame.v[0] % frame.v[1] == 0 && frame.h[0] / frame.h[1] <= 2 &&
+                                       frame.v[0] / frame.v[1] <= 2;
+                if (!supported) {
+                    return "JPEG with chroma sampling " + std::to_string(frame.h[0]) + "x" +
+                           std::to_string(frame.v[0]) + "," + std::to_string(frame.h[1]) + "x" +
+                           std::to_string(frame.v[1]) + "," + std::to_string(frame.h[2]) + "x" +
+                           std::to_string(frame.v[2]);
+                }
+            }
+            return std::nullopt;
         }
 
         // Decodes one baseline JPEG. rocJPEG writes from its own stream and returns once the
@@ -381,18 +616,13 @@ namespace lfs::io {
             }
 
             void parse(const uint8_t* const data, const size_t size, uint32_t& width, uint32_t& height) {
-                if (const auto status = rocJpegStreamParse(data, size, stream); status != ROCJPEG_STATUS_SUCCESS) {
-                    throw std::runtime_error(rocjpeg_error("rocJpegStreamParse", status));
-                }
+                check_rocjpeg(rocJpegStreamParse(data, size, stream), "rocJpegStreamParse");
                 uint8_t num_components = 0;
                 RocJpegChromaSubsampling subsampling{};
                 uint32_t widths[ROCJPEG_MAX_COMPONENT] = {};
                 uint32_t heights[ROCJPEG_MAX_COMPONENT] = {};
-                if (const auto status = rocJpegGetImageInfo(handle, stream, &num_components, &subsampling,
-                                                            widths, heights);
-                    status != ROCJPEG_STATUS_SUCCESS) {
-                    throw std::runtime_error(rocjpeg_error("rocJpegGetImageInfo", status));
-                }
+                check_rocjpeg(rocJpegGetImageInfo(handle, stream, &num_components, &subsampling, widths, heights),
+                              "rocJpegGetImageInfo");
                 if (widths[0] == 0 || heights[0] == 0) {
                     throw std::runtime_error("rocJPEG reported an empty image");
                 }
@@ -428,10 +658,7 @@ namespace lfs::io {
                 }
                 RocJpegDecodeParams params{};
                 params.output_format = format;
-                if (const auto status = rocJpegDecode(handle, stream, &params, &image);
-                    status != ROCJPEG_STATUS_SUCCESS) {
-                    throw std::runtime_error(rocjpeg_error("rocJpegDecode", status));
-                }
+                check_rocjpeg(rocJpegDecode(handle, stream, &params, &image), "rocJpegDecode");
                 for (size_t c = 0; c < planes; ++c) {
                     check_hip(cudaMemcpy2DAsync(static_cast<uint8_t*>(destination) + c * row_bytes * height, row_bytes,
                                                 base + c * plane_bytes, pitch, row_bytes, height,
@@ -443,7 +670,6 @@ namespace lfs::io {
             }
         };
 
-        // The hardware decoder rejects images smaller than 64x64.
         RocJpegOutputFormat rocjpeg_format(const JpegLayout layout) {
             switch (layout) {
             case JpegLayout::PlanarRgb: return ROCJPEG_OUTPUT_RGB_PLANAR;
@@ -533,27 +759,43 @@ namespace lfs::io {
         bool fallback_enabled = true;
 
         // Decodes a JPEG into the tensor allocate(height, width) returns, with rocJPEG, or on
-        // the CPU when the hardware decoder refuses the stream and fallback is enabled.
+        // the CPU when rocJPEG does not support the stream and fallback is enabled. Any other
+        // failure is an error.
         template <typename Allocate>
         lfs::core::Tensor decode_jpeg(const uint8_t* const data, const size_t size, const JpegLayout layout,
                                       const cudaStream_t stream, Allocate&& allocate) {
 #if LFS_HAVE_ROCJPEG
-            try {
-                Lease lease{this, acquire()};
-                uint32_t width = 0;
-                uint32_t height = 0;
-                lease.decoder->parse(data, size, width, height);
-                lfs::core::Tensor decoded = allocate(height, width);
-                lease.decoder->decode_to(decoded.data_ptr(), width, height, rocjpeg_format(layout), stream);
-                return decoded;
-            } catch (const std::exception& e) {
-                if (!fallback_enabled)
+            const JpegInspection inspection = inspect_jpeg(data, size);
+            std::optional<std::string> unsupported =
+                inspection.frame ? rocjpeg_unsupported_reason(*inspection.frame) : std::nullopt;
+            if (!unsupported) {
+                if (!inspection.defect.empty()) {
+                    LOG_ERROR("[NvCodecImageLoader] Decode failed: corrupt JPEG, {} ({} bytes)", inspection.defect,
+                              size);
+                    throw std::runtime_error("Corrupt JPEG: " + inspection.defect);
+                }
+                try {
+                    Lease lease{this, acquire()};
+                    uint32_t width = 0;
+                    uint32_t height = 0;
+                    lease.decoder->parse(data, size, width, height);
+                    lfs::core::Tensor decoded = allocate(height, width);
+                    lease.decoder->decode_to(decoded.data_ptr(), width, height, rocjpeg_format(layout), stream);
+                    return decoded;
+                } catch (const RocJpegUnsupported& e) {
+                    unsupported = e.what();
+                } catch (const std::exception& e) {
+                    LOG_ERROR("[NvCodecImageLoader] Decode failed: {} ({} bytes)", e.what(), size);
                     throw;
-                LOG_DEBUG("[NvCodecImageLoader] rocJPEG refused the stream ({}); decoding on the CPU", e.what());
+                }
             }
+            if (!fallback_enabled)
+                throw std::runtime_error("rocJPEG does not support this stream: " + *unsupported);
+            log_cpu_decode("rocJPEG does not support it: " + *unsupported, size);
 #else
             if (!fallback_enabled)
                 throw std::runtime_error("rocJPEG is not available in this build");
+            log_cpu_decode("rocJPEG is not available in this build", size);
 #endif
             uint32_t width = 0;
             uint32_t height = 0;
@@ -599,7 +841,9 @@ namespace lfs::io {
             available = rocjpeg_decodes_probe();
 #endif
             if (available) {
-                LOG_INFO("JPEG decoding runs on the GPU (rocJPEG)");
+                LOG_INFO("JPEG decoding runs on the GPU (rocJPEG). JPEGs rocJPEG does not support (progressive, "
+                         "arithmetic-coded, 12-bit, CMYK, 4:1:1, or smaller than 64x64) decode on the CPU "
+                         "(libjpeg) with a warning");
             } else {
                 LOG_WARN("JPEG decoding runs on the CPU: rocJPEG cannot decode JPEG on this system");
             }
@@ -608,7 +852,12 @@ namespace lfs::io {
     }
 
     std::string_view NvCodecImageLoader::jpeg_decoder() {
-        return is_available() ? "rocJPEG (GPU)" : "CPU";
+        if (!is_available()) {
+            return "CPU";
+        }
+        return cpu_decoded_jpegs.load(std::memory_order_relaxed) == 0
+                   ? "rocJPEG (GPU)"
+                   : "rocJPEG (GPU), CPU (libjpeg) for JPEGs rocJPEG does not support";
     }
 
     std::vector<uint8_t> NvCodecImageLoader::read_file(const std::filesystem::path& path) {
@@ -1064,13 +1313,27 @@ namespace lfs::io {
         const auto stream = static_cast<cudaStream_t>(cuda_stream);
         const size_t bytes = static_cast<size_t>(width) * height * 3;
         std::vector<uint8_t> host(bytes);
-        std::vector<std::vector<uint8_t>> encoded;
-        encoded.reserve(gpu_ptrs.size());
-        for (void* const ptr : gpu_ptrs) {
-            check_hip(cudaMemcpyAsync(host.data(), ptr, bytes, cudaMemcpyDeviceToHost, stream),
-                      "JPEG encode readback");
-            check_hip(cudaStreamSynchronize(stream), "JPEG encode readback sync");
-            encoded.push_back(encode_jpeg_on_host(host.data(), width, height, 3, quality));
+        std::vector<std::vector<uint8_t>> encoded(gpu_ptrs.size());
+        // A frame that fails to encode comes back empty and the rest of the batch is kept.
+        size_t failed_count = 0;
+        for (size_t i = 0; i < gpu_ptrs.size(); ++i) {
+            if (gpu_ptrs[i]) {
+                check_hip(cudaMemcpyAsync(host.data(), gpu_ptrs[i], bytes, cudaMemcpyDeviceToHost, stream),
+                          "JPEG encode readback");
+                check_hip(cudaStreamSynchronize(stream), "JPEG encode readback sync");
+            }
+            try {
+                if (!gpu_ptrs[i]) {
+                    throw std::runtime_error("null frame pointer");
+                }
+                encoded[i] = encode_jpeg_on_host(host.data(), width, height, 3, quality);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Batch encode frame {} failed: {}", i, e.what());
+                failed_count++;
+            }
+        }
+        if (failed_count > 0) {
+            LOG_WARN("Batch encode: {} of {} frames failed", failed_count, gpu_ptrs.size());
         }
         return encoded;
     }
