@@ -41,6 +41,7 @@ namespace {
         bool progressive = false;
         int luma_h = 1;
         int luma_v = 1;
+        bool extended_sequential = false; // baseline stream relabelled SOF1
     };
 
     std::vector<uint8_t> encode_jpeg(const std::vector<uint8_t>& pixels, const int width, const int height,
@@ -73,6 +74,17 @@ namespace {
         jpeg_destroy_compress(&codec);
         std::vector<uint8_t> encoded(buffer, buffer + size);
         std::free(buffer);
+        if (options.extended_sequential) {
+            // Huffman tables and 8-bit precision are the same in both processes, so only
+            // the frame marker changes.
+            for (size_t i = 2; i + 4 <= encoded.size();
+                 i += 2 + ((size_t{encoded[i + 2]} << 8) | encoded[i + 3])) {
+                if (encoded[i] == 0xFF && encoded[i + 1] == 0xC0) {
+                    encoded[i + 1] = 0xC1;
+                    break;
+                }
+            }
+        }
         return encoded;
     }
 
@@ -130,6 +142,7 @@ TEST_F(NvCodecHipJpegTest, UnsupportedStreamsFallBackToTheCpuAndAreReported) {
         const char* reason;
     };
     const std::vector<Case> cases{
+        {"extended sequential", 128, 96, {.extended_sequential = true}, "extended sequential JPEG"},
         {"progressive", 128, 96, {.progressive = true}, "progressive JPEG"},
         {"4:1:1", 128, 96, {.luma_h = 4, .luma_v = 1}, "chroma sampling 4x1,1x1,1x1"},
         {"48x48", 48, 48, {}, "smaller than 64x64"},

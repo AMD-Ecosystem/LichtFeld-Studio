@@ -437,9 +437,9 @@ namespace lfs::io {
 
         // Walks the marker segments of a JPEG stream: the frame header, defined
         // quantization tables, a well-formed first scan header, scan data, and an
-        // end-of-image marker. rocJPEG parses streams that lack any of these and
-        // submits them to the hardware decoder, which then hangs until the driver
-        // resets it, so such a stream must never reach it.
+        // end-of-image marker. rocJPEG parses a stream with no scan at all, submits
+        // it to the hardware decoder, and the decoder hangs until the driver resets
+        // it. The other checks reject corrupt streams as a precaution.
         JpegInspection inspect_jpeg(const uint8_t* const data, const size_t size) {
             JpegInspection result;
             const auto defect = [&](std::string what) {
@@ -544,11 +544,13 @@ namespace lfs::io {
         }
 
         // Why rocJPEG cannot decode a stream with this frame header, or nullopt when it can:
-        // it decodes 8-bit baseline and extended Huffman JPEG, grayscale or YCbCr at 4:4:4,
-        // 4:4:0, 4:2:2 or 4:2:0, at least 64x64.
+        // it decodes 8-bit baseline JPEG, grayscale or YCbCr at 4:4:4, 4:4:0, 4:2:2 or
+        // 4:2:0, at least 64x64. It rejects every other frame type at parse, including
+        // extended sequential (SOF1).
         std::optional<std::string> rocjpeg_unsupported_reason(const JpegFrame& frame) {
-            if (frame.marker != 0xC0 && frame.marker != 0xC1) {
-                const char* const process = frame.marker == 0xC2   ? "progressive"
+            if (frame.marker != 0xC0) {
+                const char* const process = frame.marker == 0xC1   ? "extended sequential"
+                                            : frame.marker == 0xC2 ? "progressive"
                                             : frame.marker == 0xC3 ? "lossless"
                                             : frame.marker <= 0xC7 ? "hierarchical"
                                                                    : "arithmetic-coded";
@@ -841,8 +843,8 @@ namespace lfs::io {
             available = rocjpeg_decodes_probe();
 #endif
             if (available) {
-                LOG_INFO("JPEG decoding runs on the GPU (rocJPEG). JPEGs rocJPEG does not support (progressive, "
-                         "arithmetic-coded, 12-bit, CMYK, 4:1:1, or smaller than 64x64) decode on the CPU "
+                LOG_INFO("JPEG decoding runs on the GPU (rocJPEG). JPEGs rocJPEG does not support (extended "
+                         "sequential, progressive, arithmetic-coded, 12-bit, CMYK, 4:1:1, or smaller than 64x64) decode on the CPU "
                          "(libjpeg) with a warning");
             } else {
                 LOG_WARN("JPEG decoding runs on the CPU: rocJPEG cannot decode JPEG on this system");
