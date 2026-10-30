@@ -37,7 +37,7 @@ namespace lfs::core::nn::models {
         }
 
         void configure_nn_mempool() {
-#if CUDART_VERSION >= 11020
+#if CUDART_VERSION >= 11020 || defined(USE_HIP)
             int device = 0;
             LFS_CUDA_CHECK(cudaGetDevice(&device));
             cudaMemPool_t pool = nullptr;

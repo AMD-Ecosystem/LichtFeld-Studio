@@ -1243,7 +1243,7 @@ namespace lfs::diagnostics {
         }
 #endif
 
-#if CUDART_VERSION >= 12080
+#if CUDART_VERSION >= 12080 || defined(USE_HIP)
         int device = 0;
         if (cudaGetDevice(&device) == cudaSuccess) {
             cudaMemPool_t pool = nullptr;

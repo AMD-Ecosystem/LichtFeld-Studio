@@ -94,9 +94,7 @@ set(LFS_HIP_TEST_FILES
     # tensor library, allocators and stream lifetimes (added upstream since the
     # last sync; none needs lfs_io, the Trainer or the GUI graph)
     # Not listed: test_vram_leak_regression.cpp needs the IPC exportable storage,
-    # which the HIP build leaves out; test_tensor_multistream.cpp tests cross-stream
-    # reuse in the stream-ordered memory pool, which the HIP build does not enable,
-    # and one of its cases deadlocks on the fallback free path.
+    # which the HIP build leaves out.
     test_cuda_error.cpp
     test_cuda_launch_check.cpp
     test_tensor_launch_check.cpp
@@ -108,6 +106,7 @@ set(LFS_HIP_TEST_FILES
     test_allocator_hygiene.cpp
     test_pinned_stream_teardown.cpp
     test_cuda_pool_stream_teardown.cpp
+    test_tensor_multistream.cpp
     test_stale_stream_teardown.cpp
     test_zero_stride_expand.cpp
     test_strided_reduce_w2.cpp

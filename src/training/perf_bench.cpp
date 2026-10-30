@@ -60,7 +60,7 @@ namespace lfs::training {
         void sample_pool_hwm(std::size_t& used_high, std::size_t& reserved_high,
                              std::size_t& used_cur, std::size_t& reserved_cur) {
             used_high = reserved_high = used_cur = reserved_cur = 0;
-#if CUDART_VERSION >= 12080
+#if CUDART_VERSION >= 12080 || defined(USE_HIP)
             int device = 0;
             if (cudaGetDevice(&device) != cudaSuccess) {
                 return;

@@ -39,7 +39,7 @@ namespace lfs::core {
 
         std::uint64_t pool_used = 0;
         std::uint64_t pool_reserved = 0;
-#if CUDART_VERSION >= 12080
+#if CUDART_VERSION >= 12080 || defined(USE_HIP)
         int device = 0;
         cudaMemPool_t pool = nullptr;
         if (cudaGetDevice(&device) == cudaSuccess &&

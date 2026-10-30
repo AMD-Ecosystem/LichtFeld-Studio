@@ -97,7 +97,7 @@ namespace {
         std::size_t pool_reserved = 0;
         int device = 0;
         if (cudaGetDevice(&device) == cudaSuccess) {
-#if CUDART_VERSION >= 12080
+#if CUDART_VERSION >= 12080 || defined(USE_HIP)
             cudaMemPool_t pool = nullptr;
             if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
                 std::uint64_t reserved = 0;
