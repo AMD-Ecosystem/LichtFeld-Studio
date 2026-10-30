@@ -227,7 +227,7 @@ dist/
 
 Requirements on Linux, besides the [Linux prerequisites](#linux-prerequisites):
 
-- ROCm 7.x with its Clang and the rocJPEG and rocDecode libraries (tested with the ROCm 7.16 SDK). The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`. On Linux it stops at configure if rocDecode is missing. On Windows, where rocDecode is available from ROCm 10.2 (rocDecode 1.12), a ROCm SDK without it configures with a warning and decodes all video on the CPU.
+- ROCm with its Clang and the rocJPEG and rocDecode libraries (tested with ROCm 10.1, which ships HIP 7.16 and rocDecode 1.10). The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`. On Linux it stops at configure if rocDecode is missing. On Windows, rocDecode is part of ROCm from ROCm 10.2 (rocDecode 1.12); with an older ROCm such as 10.1 the build configures with a warning and decodes all video on the CPU.
 - GCC 14 for C and C++, as in the CUDA build; the ROCm Clang compiles the HIP sources.
 - With `-DBUILD_TESTS=ON`, a ROCm build of LibTorch, passed as `Torch_DIR`. The `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
 
