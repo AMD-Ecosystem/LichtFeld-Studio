@@ -96,3 +96,43 @@ TEST_F(PinnedStreamTeardownTest, RecycledStreamHandleIsLiveAgainAfterRecordStrea
 
     ASSERT_EQ(cudaStreamDestroy(s2), cudaSuccess);
 }
+#if defined(USE_HIP)
+
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+
+// A cached block keeps the use event recorded on a stream that is later
+// released and destroyed. Reusing the block must not depend on the destroyed
+// stream's memory, which the heap is free to hand out again: HIP dereferences
+// an event's recording stream in hipEventQuery.
+TEST_F(PinnedStreamTeardownTest, CachedBlockReuseAfterStreamDestroyIgnoresFreedStream) {
+    auto& alloc = PinnedMemoryAllocator::instance();
+    constexpr size_t bytes = 1 << 20;
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    void* ptr = alloc.allocate(bytes);
+    ASSERT_NE(ptr, nullptr);
+    alloc.deallocate(ptr, stream);
+    alloc.release_stream(stream);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    std::vector<void*> heap;
+    for (size_t size = 16; size <= 64 * 1024; size += 16) {
+        auto* const words = static_cast<std::uint32_t*>(std::malloc(size));
+        ASSERT_NE(words, nullptr);
+        for (size_t i = 0; i < size / sizeof(std::uint32_t); ++i) {
+            words[i] = 1;
+        }
+        heap.push_back(words);
+    }
+
+    void* reused = alloc.allocate(bytes);
+    EXPECT_NE(reused, nullptr);
+    alloc.deallocate(reused);
+    for (void* chunk : heap) {
+        std::free(chunk);
+    }
+}
+#endif
