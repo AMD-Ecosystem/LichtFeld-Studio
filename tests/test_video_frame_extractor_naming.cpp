@@ -994,6 +994,9 @@ TEST(VideoEncoderTimingTest, EncodedFramesHaveRequestedDurationAndRate) {
 TEST(VideoFrameExtractorOutputNaming, SparseFpsSeeksOnlyAcrossWholeKeyframeIntervals) {
     if (!cudaAvailable())
         GTEST_SKIP() << "Requires NVDEC";
+#if defined(USE_HIP) && !LFS_HAVE_ROCDECODE
+    GTEST_SKIP() << "Requires rocDecode, which this ROCm SDK does not have";
+#endif
 
     TempDir temp("sparse_seek");
     const std::filesystem::path video_path = temp.path / "source.mp4";
@@ -1050,7 +1053,7 @@ TEST(VideoFrameExtractorOutputNaming, IntervalUsesSourceFrameNumbers) {
     const nlohmann::json metadata = readMetadata(output_dir);
     ASSERT_TRUE(metadata.contains("processing"));
 #if defined(USE_HIP)
-    EXPECT_EQ(metadata["processing"]["decoder"]["backend"], "rocdecode")
+    EXPECT_EQ(metadata["processing"]["decoder"]["backend"], LFS_HAVE_ROCDECODE ? "rocdecode" : "ffmpeg_software")
 #else
     EXPECT_EQ(metadata["processing"]["decoder"]["backend"], "nvdec")
 #endif
@@ -2288,7 +2291,7 @@ TEST(VideoFrameExtractorOutputNaming, Vp9KeepsEverySourceTimestamp) {
     ASSERT_TRUE(extractor.extract(params, error)) << error;
     const auto metadata = readMetadata(temp.path);
 #if defined(USE_HIP)
-    ASSERT_EQ(metadata["processing"]["decoder"]["backend"], "rocdecode");
+    ASSERT_EQ(metadata["processing"]["decoder"]["backend"], LFS_HAVE_ROCDECODE ? "rocdecode" : "ffmpeg_software");
 #else
     ASSERT_EQ(metadata["processing"]["decoder"]["backend"], "nvdec");
 #endif

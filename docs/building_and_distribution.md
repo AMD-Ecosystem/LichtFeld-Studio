@@ -227,7 +227,7 @@ dist/
 
 Requirements on Linux, besides the [Linux prerequisites](#linux-prerequisites):
 
-- ROCm 7.x with its Clang and the rocJPEG and rocDecode libraries (tested with the ROCm 7.16 SDK). The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`, and stops at configure if rocDecode is missing.
+- ROCm 7.x with its Clang and the rocJPEG and rocDecode libraries (tested with the ROCm 7.16 SDK). The build looks for ROCm under `ROCM_PATH`, which defaults to `/opt/rocm`. On Linux it stops at configure if rocDecode is missing. On Windows, where rocDecode is available from ROCm 10.2 (rocDecode 1.12), a ROCm SDK without it configures with a warning and decodes all video on the CPU.
 - GCC 14 for C and C++, as in the CUDA build; the ROCm Clang compiles the HIP sources.
 - With `-DBUILD_TESTS=ON`, a ROCm build of LibTorch, passed as `Torch_DIR`. The `external/libtorch` archive the CUDA build downloads is an NVIDIA build and will not link here.
 
@@ -251,7 +251,7 @@ What differs from the CUDA build:
 
 - JPEG images decode on the GPU with rocJPEG. ROCm has no JPEG encoder or JPEG 2000 codec, so JPEG encoding, the lossless JPEG 2000 image caches, and JPEGs the hardware decoder does not accept (smaller than 64x64, progressive) are handled on the CPU with libjpeg and OpenJPH.
 - On Linux, HIP cannot import Vulkan semaphores, so the viewer orders HIP and Vulkan work on the host around each shared image instead of on the GPU.
-- Video decodes on the GPU with rocDecode (H.264, HEVC, VP9 and AV1, as far as the GPU supports them). Streams it cannot decode on the GPU, such as 4:4:4 chroma or MPEG-4 Part 2, decode with FFmpeg's software decoders, and the log names the reason. ROCm has no video encoder, so video export encodes H.264 with FFmpeg's software encoder.
+- Video decodes on the GPU with rocDecode (H.264, HEVC, VP9 and AV1, as far as the GPU supports them). Streams it cannot decode on the GPU, such as 4:4:4 chroma or MPEG-4 Part 2, decode with FFmpeg's software decoders, and the log names the reason (on a Windows build without rocDecode, "rocDecode not available in this ROCm SDK on Windows"). ROCm has no video encoder, so video export encodes H.264 with FFmpeg's software encoder.
 
 ### Compute-only build
 

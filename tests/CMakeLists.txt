@@ -938,7 +938,10 @@ if(NOT BUILD_VISUALIZER_TESTS)
 endif()
 list(APPEND TEST_FILES test_vksplat_input_packer.cpp)
 if(USE_HIP)
-    list(APPEND TEST_FILES test_nvcodec_hip_jpeg.cpp test_rocdecode_video.cpp)
+    list(APPEND TEST_FILES test_nvcodec_hip_jpeg.cpp)
+    if(LFS_HAVE_ROCDECODE)
+        list(APPEND TEST_FILES test_rocdecode_video.cpp)
+    endif()
 endif()
 list(APPEND TEST_FILES test_viewer_sh_zerocopy_triad.cpp)
 # Phase 7A: bounded-wait machine + SubmissionState + QW-6 (GPU-free).
@@ -1124,6 +1127,7 @@ target_link_libraries(lichtfeld_tests PRIVATE
 target_link_libraries(lichtfeld_tests PRIVATE lfs_vulkan_rasterizer Vulkan::Vulkan)
 if(USE_HIP)
     target_link_libraries(lichtfeld_tests PRIVATE JPEG::JPEG)
+    target_compile_definitions(lichtfeld_tests PRIVATE LFS_HAVE_ROCDECODE=$<BOOL:${LFS_HAVE_ROCDECODE}>)
 endif()
 
 # Focused post-training compaction loop, including parameter and checkpoint

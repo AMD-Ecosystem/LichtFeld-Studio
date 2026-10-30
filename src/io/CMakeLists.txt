@@ -186,16 +186,26 @@ target_compile_features(lfs_video PUBLIC cxx_std_23)
 if(USE_HIP)
     # Video decodes with rocDecode, the ROCm counterpart of the NVDEC decoders
     # FFmpeg uses on CUDA. ROCm has no video encoder; encoding stays on FFmpeg.
-    target_sources(lfs_video PRIVATE video/rocdecode_decoder.hpp video/rocdecode_decoder.cpp)
+    # rocDecode supports Windows from rocDecode 1.12 (ROCm 10.2); a Windows ROCm
+    # SDK without it builds without rocDecode and decodes video on the CPU.
     find_path(LFS_ROCDECODE_INCLUDE_DIR rocdecode/rocdecode.h HINTS "${ROCM_PATH}/include")
     find_library(LFS_ROCDECODE_LIBRARY rocdecode HINTS "${ROCM_PATH}/lib")
-    if(NOT LFS_ROCDECODE_INCLUDE_DIR OR NOT LFS_ROCDECODE_LIBRARY)
+    if(LFS_ROCDECODE_INCLUDE_DIR AND LFS_ROCDECODE_LIBRARY)
+        set(LFS_HAVE_ROCDECODE ON)
+        target_sources(lfs_video PRIVATE video/rocdecode_decoder.hpp video/rocdecode_decoder.cpp)
+        target_include_directories(lfs_video SYSTEM PRIVATE "${LFS_ROCDECODE_INCLUDE_DIR}")
+        target_link_libraries(lfs_video PRIVATE "${LFS_ROCDECODE_LIBRARY}")
+    elseif(WIN32)
+        set(LFS_HAVE_ROCDECODE OFF)
+        message(WARNING "rocDecode not available in this ROCm SDK on Windows (ROCM_PATH ${ROCM_PATH}): "
+                        "video will decode on the CPU (FFmpeg software decoder).")
+        target_sources(lfs_video PRIVATE video/rocdecode_decoder.hpp video/rocdecode_unavailable.cpp)
+    else()
         message(FATAL_ERROR "rocDecode not found under ROCM_PATH (${ROCM_PATH}). The ROCm build decodes "
                             "video with rocDecode: install it with the ROCm SDK, or set "
                             "LFS_ROCDECODE_INCLUDE_DIR and LFS_ROCDECODE_LIBRARY.")
     endif()
-    target_include_directories(lfs_video SYSTEM PRIVATE "${LFS_ROCDECODE_INCLUDE_DIR}")
-    target_link_libraries(lfs_video PRIVATE "${LFS_ROCDECODE_LIBRARY}")
+    set(LFS_HAVE_ROCDECODE ${LFS_HAVE_ROCDECODE} PARENT_SCOPE)
 endif()
 
 set_target_properties(lfs_video PROPERTIES
