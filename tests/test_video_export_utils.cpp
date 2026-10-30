@@ -837,6 +837,33 @@ namespace {
     };
 } // namespace
 
+#if defined(USE_HIP)
+// ROCm has no video encoder: H.264 is always encoded on the CPU, and the error
+// names that path. libx264 accepts 8192x4096 but no side above 16384.
+TEST(VideoEncoderOpenTest, RejectsUnsupportedDimensionsWithoutCreatingOutput) {
+    VideoOutputDirectory directory;
+    const auto path = directory.path / "unsupported.mp4";
+    const lfs::io::video::VideoExportOptions options{
+        .preset = lfs::io::video::VideoPreset::CUSTOM,
+        .width = 16400,
+        .height = 16,
+        .framerate = 2,
+        .crf = 20,
+    };
+
+    lfs::io::video::VideoEncoder encoder;
+    const auto result = encoder.open(path, options);
+    if (!result && result.error().find("H.264 software encoder: H.264 encoder not found") != std::string::npos)
+        GTEST_SKIP() << "No H.264 encoder is available in this build";
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("16400x16"), std::string::npos);
+    EXPECT_NE(result.error().find("ROCm has no video encoder"), std::string::npos);
+    EXPECT_NE(result.error().find("H.264 software encoder"), std::string::npos);
+    EXPECT_NE(result.error().find("codec open failed"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(path));
+}
+#else
 TEST(VideoEncoderOpenTest, RejectsUnsupportedDimensionsWithoutCreatingOutput) {
     VideoOutputDirectory directory;
     const auto path = directory.path / "unsupported.mp4";
@@ -862,6 +889,7 @@ TEST(VideoEncoderOpenTest, RejectsUnsupportedDimensionsWithoutCreatingOutput) {
     EXPECT_NE(result.error().find("codec open failed"), std::string::npos);
     EXPECT_FALSE(std::filesystem::exists(path));
 }
+#endif
 
 TEST(VideoEncoderValidationTest, RejectsConflictingExtensionsWithoutTouchingDestination) {
     VideoOutputDirectory directory;

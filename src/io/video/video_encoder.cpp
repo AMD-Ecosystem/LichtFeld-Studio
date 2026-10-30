@@ -42,6 +42,7 @@ namespace lfs::io::video {
             }
         }
 
+#if !defined(USE_HIP)
         std::string encoderProbeError(
             const VideoExportOptions& options,
             const std::string& nvenc_error,
@@ -50,6 +51,7 @@ namespace lfs::io::video {
                 "H.264 encoding is unavailable for {}x{}. h264_nvenc: {}; H.264 fallback: {}",
                 options.width, options.height, nvenc_error, fallback_error);
         }
+#endif
 
         std::string codecOpenFailure(
             const AVCodec* codec,
@@ -137,6 +139,17 @@ namespace lfs::io::video {
             y_plane_bytes_ = static_cast<size_t>(width_) * static_cast<size_t>(height_);
             uv_plane_bytes_ = y_plane_bytes_ / 4;
 
+#if defined(USE_HIP)
+            // ROCm has no video encoder, so H.264 is always encoded on the CPU.
+            LOG_INFO("Encoding H.264 on the CPU (FFmpeg software encoder): ROCm has no video encoder");
+            if (const auto result = initX264(path, opts); !result) {
+                const std::string software_error = result.error();
+                cleanup();
+                return std::unexpected(std::format(
+                    "H.264 encoding is unavailable for {}x{}. ROCm has no video encoder; H.264 software encoder: {}",
+                    opts.width, opts.height, software_error));
+            }
+#else
             if (const auto nvenc_error = tryInitNvenc(path, opts); nvenc_error) {
                 cleanup();
                 LOG_INFO("NVENC unavailable, falling back to x264");
@@ -146,6 +159,7 @@ namespace lfs::io::video {
                     return std::unexpected(encoderProbeError(opts, *nvenc_error, fallback_error));
                 }
             }
+#endif
 
             is_open_ = true;
             frame_count_ = 0;
