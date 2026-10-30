@@ -183,6 +183,21 @@ endif()
 
 target_compile_features(lfs_video PUBLIC cxx_std_23)
 
+if(USE_HIP)
+    # Video decodes with rocDecode, the ROCm counterpart of the NVDEC decoders
+    # FFmpeg uses on CUDA. ROCm has no video encoder; encoding stays on FFmpeg.
+    target_sources(lfs_video PRIVATE video/rocdecode_decoder.hpp video/rocdecode_decoder.cpp)
+    find_path(LFS_ROCDECODE_INCLUDE_DIR rocdecode/rocdecode.h HINTS "${ROCM_PATH}/include")
+    find_library(LFS_ROCDECODE_LIBRARY rocdecode HINTS "${ROCM_PATH}/lib")
+    if(NOT LFS_ROCDECODE_INCLUDE_DIR OR NOT LFS_ROCDECODE_LIBRARY)
+        message(FATAL_ERROR "rocDecode not found under ROCM_PATH (${ROCM_PATH}). The ROCm build decodes "
+                            "video with rocDecode: install it with the ROCm SDK, or set "
+                            "LFS_ROCDECODE_INCLUDE_DIR and LFS_ROCDECODE_LIBRARY.")
+    endif()
+    target_include_directories(lfs_video SYSTEM PRIVATE "${LFS_ROCDECODE_INCLUDE_DIR}")
+    target_link_libraries(lfs_video PRIVATE "${LFS_ROCDECODE_LIBRARY}")
+endif()
+
 set_target_properties(lfs_video PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_STANDARD 20

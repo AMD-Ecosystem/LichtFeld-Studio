@@ -72,9 +72,16 @@ namespace lfs::io::video {
 
     } // namespace
 
+#if defined(USE_HIP)
+    // rocDecode frames are complete in device memory when the decoder returns them.
+    CudaFrameHandoff::CudaFrameHandoff(const AVFrame*, const cudaStream_t consumer_stream)
+        : consumer_stream_(consumer_stream),
+          active_(true) {}
+#else
     CudaFrameHandoff::CudaFrameHandoff(const AVFrame* const frame,
                                        const cudaStream_t consumer_stream)
         : CudaFrameHandoff(decoderContextForFrame(frame), consumer_stream) {}
+#endif
 
     CudaFrameHandoff::CudaFrameHandoff(
         const AVCUDADeviceContext& decoder_context,

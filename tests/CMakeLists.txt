@@ -938,7 +938,7 @@ if(NOT BUILD_VISUALIZER_TESTS)
 endif()
 list(APPEND TEST_FILES test_vksplat_input_packer.cpp)
 if(USE_HIP)
-    list(APPEND TEST_FILES test_nvcodec_hip_jpeg.cpp)
+    list(APPEND TEST_FILES test_nvcodec_hip_jpeg.cpp test_rocdecode_video.cpp)
 endif()
 list(APPEND TEST_FILES test_viewer_sh_zerocopy_triad.cpp)
 # Phase 7A: bounded-wait machine + SubmissionState + QW-6 (GPU-free).

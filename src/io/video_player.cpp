@@ -10,6 +10,9 @@
 #include "video/frame_color_range.hpp"
 #include "video/probed_stream_rewind.hpp"
 #include "video/sws_packed_rgb.hpp"
+#if defined(USE_HIP)
+#include "video/rocdecode_decoder.hpp"
+#endif
 #include "video/video_metadata.hpp"
 
 extern "C" {
@@ -211,6 +214,42 @@ namespace lfs::io {
             const char* hw_decoder_name = getHwDecoderName(codec_id);
             const AVCodec* codec = nullptr;
 
+#if defined(USE_HIP)
+            // ROCm decodes on rocDecode. Only streams it does not support on this GPU
+            // decode on the CPU; any other rocDecode failure is an error. Dolby Vision
+            // keeps FFmpeg's decoder for its RPU side data, as on CUDA.
+            if (hw_decoder_name && !has_dolby_vision) {
+                const auto refusal = video::RocDecodeDecoder::unsupportedReason(stream->codecpar);
+                if (!refusal) {
+                    setError("rocDecode capability query failed: " + refusal.error());
+                    close();
+                    return false;
+                }
+                if (refusal->empty()) {
+                    auto decoder = video::RocDecodeDecoder::create(stream->codecpar, stream->time_base);
+                    if (!decoder) {
+                        setError("Failed to open rocDecode hardware decoder: " + decoder.error());
+                        close();
+                        return false;
+                    }
+                    rocdecode_ = std::move(*decoder);
+                    using_hw_decode_ = true;
+                    LOG_INFO("VideoPlayer: rocDecode decoder: {}", avcodec_get_name(codec_id));
+                } else {
+                    LOG_WARN("VideoPlayer: decoding video on the CPU (FFmpeg software decoder): {}", *refusal);
+                }
+            }
+
+            if (rocdecode_) {
+                // rocDecode decodes; the context only carries the stream parameters.
+                codec_ctx_ = avcodec_alloc_context3(nullptr);
+                if (!codec_ctx_ || avcodec_parameters_to_context(codec_ctx_, stream->codecpar) < 0) {
+                    setError("Failed to configure video decoder");
+                    close();
+                    return false;
+                }
+            } else {
+#else
             // NVDEC cuvid does not reliably preserve Dolby Vision RPU side data.
             if (hw_decoder_name && !has_dolby_vision) {
                 codec = avcodec_find_decoder_by_name(hw_decoder_name);
@@ -223,6 +262,7 @@ namespace lfs::io {
                     codec = nullptr;
                 }
             }
+#endif
 
             if (!codec) {
                 codec = avcodec_find_decoder(codec_id);
@@ -292,6 +332,9 @@ namespace lfs::io {
                 close();
                 return false;
             }
+#if defined(USE_HIP)
+            }
+#endif
 
             src_width_ = codec_ctx_->width;
             src_height_ = codec_ctx_->height;
@@ -411,6 +454,9 @@ namespace lfs::io {
                 avcodec_free_context(&codec_ctx_);
                 codec_ctx_ = nullptr;
             }
+#if defined(USE_HIP)
+            rocdecode_.reset();
+#endif
             if (hw_device_ctx_) {
                 av_buffer_unref(&hw_device_ctx_);
                 hw_device_ctx_ = nullptr;
@@ -797,6 +843,11 @@ namespace lfs::io {
                 return;
             }
 
+#if defined(USE_HIP)
+            if (rocdecode_)
+                rocdecode_->flush();
+            else
+#endif
             avcodec_flush_buffers(codec_ctx_);
             resetDecoderPumpState();
             eof_reached_ = false;
@@ -829,7 +880,61 @@ namespace lfs::io {
             skip_video_conversion_ = false;
         }
 
+#if defined(USE_HIP)
+        DecodeResult decodeNextFrameFromRocDecode() {
+            while (true) {
+                av_frame_unref(frame_);
+                const int receive_result = rocdecode_->receiveFrame(frame_);
+                if (receive_result == 0)
+                    return convertFrameToBuffer() ? DecodeResult::Frame : DecodeResult::Error;
+                if (receive_result == AVERROR_EOF)
+                    return DecodeResult::EndOfStream;
+
+                if (packet_pending_) {
+                    const int send_result = rocdecode_->sendPacket(packet_);
+                    av_packet_unref(packet_);
+                    packet_pending_ = false;
+                    if (send_result == 0)
+                        continue;
+                    setError("rocDecode packet submission failed: " + rocdecode_->lastError());
+                    return DecodeResult::Error;
+                }
+
+                if (demux_eof_) {
+                    if (decoder_drain_sent_)
+                        return DecodeResult::EndOfStream;
+                    decoder_drain_sent_ = true;
+                    if (rocdecode_->sendPacket(nullptr) == 0)
+                        continue;
+                    setError("rocDecode drain failed: " + rocdecode_->lastError());
+                    return DecodeResult::Error;
+                }
+
+                while (true) {
+                    const int read_result = av_read_frame(fmt_ctx_, packet_);
+                    if (read_result == AVERROR_EOF) {
+                        demux_eof_ = true;
+                        break;
+                    }
+                    if (read_result < 0) {
+                        setError("Video demux failed: " + ffmpegError(read_result));
+                        return DecodeResult::Error;
+                    }
+                    if (packet_->stream_index == video_stream_idx_) {
+                        packet_pending_ = true;
+                        break;
+                    }
+                    av_packet_unref(packet_);
+                }
+            }
+        }
+
+#endif
         DecodeResult decodeNextFrame() {
+#if defined(USE_HIP)
+            if (rocdecode_)
+                return decodeNextFrameFromRocDecode();
+#endif
             while (true) {
                 av_frame_unref(frame_);
                 const int receive_result = avcodec_receive_frame(codec_ctx_, frame_);
@@ -912,9 +1017,15 @@ namespace lfs::io {
                 return true;
             }
 
+#if defined(USE_HIP)
+            if (rocdecode_) {
+                av_frame_unref(sw_frame_);
+                const int transfer_result = video::RocDecodeDecoder::transferToHost(sw_frame_, frame_);
+#else
             if (using_hw_decode_ && frame_->format == AV_PIX_FMT_CUDA) {
                 av_frame_unref(sw_frame_);
                 const int transfer_result = av_hwframe_transfer_data(sw_frame_, frame_, 0);
+#endif
                 if (transfer_result < 0) {
                     setError("Hardware video frame transfer failed: " + ffmpegError(transfer_result));
                     return false;
@@ -988,6 +1099,9 @@ namespace lfs::io {
         AVFormatContext* fmt_ctx_ = nullptr;
         AVCodecContext* codec_ctx_ = nullptr;
         AVBufferRef* hw_device_ctx_ = nullptr;
+#if defined(USE_HIP)
+        std::unique_ptr<video::RocDecodeDecoder> rocdecode_;
+#endif
         SwsContext* sws_ctx_ = nullptr;
         std::vector<uint8_t> rgb_scratch_;
         AVFrame* frame_ = nullptr;

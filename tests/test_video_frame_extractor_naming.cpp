@@ -1049,7 +1049,11 @@ TEST(VideoFrameExtractorOutputNaming, IntervalUsesSourceFrameNumbers) {
 
     const nlohmann::json metadata = readMetadata(output_dir);
     ASSERT_TRUE(metadata.contains("processing"));
+#if defined(USE_HIP)
+    EXPECT_EQ(metadata["processing"]["decoder"]["backend"], "rocdecode")
+#else
     EXPECT_EQ(metadata["processing"]["decoder"]["backend"], "nvdec")
+#endif
         << "regression must exercise the hardware decode path";
 }
 
@@ -2283,7 +2287,11 @@ TEST(VideoFrameExtractorOutputNaming, Vp9KeepsEverySourceTimestamp) {
     std::string error;
     ASSERT_TRUE(extractor.extract(params, error)) << error;
     const auto metadata = readMetadata(temp.path);
+#if defined(USE_HIP)
+    ASSERT_EQ(metadata["processing"]["decoder"]["backend"], "rocdecode");
+#else
     ASSERT_EQ(metadata["processing"]["decoder"]["backend"], "nvdec");
+#endif
     EXPECT_EQ(countPngFiles(temp.path), reference.size());
     for (int index = 1; index <= 185; ++index) {
         SCOPED_TRACE(index);
