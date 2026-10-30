@@ -207,6 +207,24 @@ TEST(RocDecodeVideo, StreamsTheVideoEngineCannotDecodeAreNamed) {
     avcodec_parameters_free(&parameters);
 }
 
+TEST(RocDecodeVideo, MinimumSizeAppliesToTheCodedSize) {
+    // 60x60 is coded as 64x64 in both codecs, which rocDecode decodes.
+    for (const char* name : {"h264_60x60.mp4", "hevc_60x60.mp4"}) {
+        SCOPED_TRACE(name);
+        Input input(fixture(name));
+        ASSERT_TRUE(input.ok());
+        const auto refusal = RocDecodeDecoder::unsupportedReason(input.stream()->codecpar);
+        ASSERT_TRUE(refusal.has_value()) << refusal.error();
+        EXPECT_EQ(*refusal, "");
+    }
+
+    Input input(fixture("h264_420.mp4"));
+    ASSERT_TRUE(input.ok());
+    const auto refusal = RocDecodeDecoder::unsupportedReason(input.stream()->codecpar);
+    ASSERT_TRUE(refusal.has_value()) << refusal.error();
+    EXPECT_TRUE(refusal->starts_with("64x48 H.264 is outside rocDecode's ")) << *refusal;
+}
+
 class RocDecodeMatchesSoftware : public ::testing::TestWithParam<const char*> {};
 
 TEST_P(RocDecodeMatchesSoftware, FramesAndTimestamps) {
@@ -249,8 +267,8 @@ TEST_P(RocDecodeMatchesSoftware, FramesAndTimestamps) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Fixtures, RocDecodeMatchesSoftware,
-                         ::testing::Values("generated H.264 High", "hevc_full.mp4", "vp9_full.webm",
-                                           "vp9_timestamps.webm"));
+                         ::testing::Values("generated H.264 High", "h264_60x60.mp4", "hevc_full.mp4",
+                                           "hevc_60x60.mp4", "vp9_full.webm", "vp9_timestamps.webm"));
 
 TEST(RocDecodeVideo, FlushRestartsFromTheSeekTarget) {
     Input input(fixture("vp9_timestamps.webm"));

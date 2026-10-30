@@ -36,3 +36,10 @@ ffmpeg -f lavfi -i testsrc=size=64x48:rate=10 -frames:v 5 -c:v libx264 -pix_fmt 
 ```
 
 The 4:4:4 fixtures exercise software fallback when the hardware decoder rejects the chroma format. The 4:2:0 fixture guards the existing hardware decode path. They also run with software decoding on machines without CUDA.
+
+`h264_60x60.mp4` (H.264 High) and `hevc_60x60.mp4` (HEVC Main) are ten 60x60 frames each. Both codecs code them as 64x64, so they guard hardware decoding of streams whose display size is below the decoder's minimum but whose coded size is not. Generated with FFmpeg 6.1, libx264 and libx265:
+
+```sh
+ffmpeg -f lavfi -i testsrc2=size=60x60:rate=10 -frames:v 10 -c:v libx264 -profile:v high -pix_fmt yuv420p h264_60x60.mp4
+ffmpeg -f lavfi -i testsrc2=size=60x60:rate=10 -frames:v 10 -c:v libx265 -pix_fmt yuv420p hevc_60x60.mp4
+```

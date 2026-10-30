@@ -32,12 +32,15 @@ namespace lfs::io::video {
         struct CodecMapping {
             rocDecVideoCodec codec;
             const char* name;
+            // Block size the coded size is a multiple of (H.264 macroblock, smallest HEVC coding block). The
+            // caps minimum applies to the coded size.
+            int coded_alignment = 1;
         };
 
         [[nodiscard]] std::optional<CodecMapping> rocDecodeCodec(const AVCodecID id) {
             switch (id) {
-            case AV_CODEC_ID_H264: return CodecMapping{rocDecVideoCodec_AVC, "H.264"};
-            case AV_CODEC_ID_HEVC: return CodecMapping{rocDecVideoCodec_HEVC, "HEVC"};
+            case AV_CODEC_ID_H264: return CodecMapping{rocDecVideoCodec_AVC, "H.264", 16};
+            case AV_CODEC_ID_HEVC: return CodecMapping{rocDecVideoCodec_HEVC, "HEVC", 8};
             case AV_CODEC_ID_AV1: return CodecMapping{rocDecVideoCodec_AV1, "AV1"};
             case AV_CODEC_ID_VP9: return CodecMapping{rocDecVideoCodec_VP9, "VP9"};
             case AV_CODEC_ID_VP8: return CodecMapping{rocDecVideoCodec_VP8, "VP8"};
@@ -115,9 +118,12 @@ namespace lfs::io::video {
             if (!caps->is_supported)
                 return std::format("rocDecode does not decode {} {} {}-bit on this GPU", codec.name,
                                    chromaName(chroma), bit_depth);
+            const auto coded = [&](const int size) {
+                return (size + codec.coded_alignment - 1) / codec.coded_alignment * codec.coded_alignment;
+            };
             if (width > 0 && height > 0 &&
                 (static_cast<uint32_t>(width) > caps->max_width || static_cast<uint32_t>(height) > caps->max_height ||
-                 width < caps->min_width || height < caps->min_height)) {
+                 coded(width) < caps->min_width || coded(height) < caps->min_height)) {
                 return std::format("{}x{} {} is outside rocDecode's {}x{} to {}x{} on this GPU", width, height,
                                    codec.name, caps->min_width, caps->min_height, caps->max_width,
                                    caps->max_height);
