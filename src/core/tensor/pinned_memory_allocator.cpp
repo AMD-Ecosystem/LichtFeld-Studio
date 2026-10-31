@@ -571,28 +571,6 @@ namespace lfs::core {
             std::erase(info.extra_streams, stream);
         }
         severed_streams_.insert(stream);
-#ifdef USE_HIP
-        // HIP keeps the recording stream in each event and dereferences it in
-        // hipEventQuery/hipEventSynchronize, even after that stream has been
-        // destroyed. Cached blocks must not outlive the stream with events
-        // recorded on it: the sync above completed them, so return every
-        // completed event to the pool while the stream is still alive.
-        for (auto& [size, blocks] : cache_) {
-            for (Block& block : blocks) {
-                std::erase_if(block.ready_events, [](const cudaEvent_t event) {
-                    const cudaError_t query_status = cudaEventQuery(event);
-                    if (query_status != cudaSuccess) {
-                        if (query_status != cudaErrorNotReady) {
-                            cudaGetLastError();
-                        }
-                        return false;
-                    }
-                    CudaEventPool::instance().release(event);
-                    return true;
-                });
-            }
-        }
-#endif
     }
 
     void PinnedMemoryAllocator::empty_cache_impl(const bool publish_stats) {
