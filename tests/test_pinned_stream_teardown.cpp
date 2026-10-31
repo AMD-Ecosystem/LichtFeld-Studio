@@ -98,9 +98,15 @@ TEST_F(PinnedStreamTeardownTest, RecycledStreamHandleIsLiveAgainAfterRecordStrea
 }
 #if defined(USE_HIP)
 
+#include "hip_heap_reuse.hpp"
+
 #include <cstdint>
-#include <cstdlib>
-#include <vector>
+#include <thread>
+
+namespace tensor_hardening {
+    // tensor_hardening_cuda_utils.cu
+    cudaError_t launch_delay_kernel(cudaStream_t stream, uint64_t cycles);
+} // namespace tensor_hardening
 
 // A cached block keeps the use event recorded on a stream that is later
 // released and destroyed. Reusing the block must not depend on the destroyed
@@ -118,21 +124,45 @@ TEST_F(PinnedStreamTeardownTest, CachedBlockReuseAfterStreamDestroyIgnoresFreedS
     alloc.release_stream(stream);
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 
-    std::vector<void*> heap;
-    for (size_t size = 16; size <= 64 * 1024; size += 16) {
-        auto* const words = static_cast<std::uint32_t*>(std::malloc(size));
-        ASSERT_NE(words, nullptr);
-        for (size_t i = 0; i < size / sizeof(std::uint32_t); ++i) {
-            words[i] = 1;
-        }
-        heap.push_back(words);
-    }
-
+    const lfs::test::HeapReuse heap;
     void* reused = alloc.allocate(bytes);
     EXPECT_NE(reused, nullptr);
     alloc.deallocate(reused);
-    for (void* chunk : heap) {
-        std::free(chunk);
+}
+
+// empty_cache() takes the cached blocks under the allocator lock and waits on
+// their use events after dropping it. A stream released and destroyed while
+// it waits on an earlier event must not break the wait on a later one.
+TEST_F(PinnedStreamTeardownTest, EmptyCacheWaitOutlivesConcurrentStreamDestroy) {
+    auto& alloc = PinnedMemoryAllocator::instance();
+    alloc.empty_cache();
+
+    cudaStream_t slow_stream = nullptr;
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&slow_stream, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    // The block's events are waited on in order: first the slow stream's
+    // (about 2 s), then the one on the stream destroyed meanwhile.
+    void* ptr = alloc.allocate(1 << 20);
+    ASSERT_NE(ptr, nullptr);
+    ASSERT_EQ(tensor_hardening::launch_delay_kernel(slow_stream, 2'000'000'000), cudaSuccess);
+    alloc.record_stream(ptr, slow_stream);
+    alloc.deallocate(ptr, stream);
+    ASSERT_GT(alloc.get_stats().cached_bytes, 0u);
+
+    std::thread releaser([&alloc] { alloc.empty_cache(); });
+    while (alloc.get_stats().cached_bytes != 0) {
+        std::this_thread::yield();
     }
+    alloc.release_stream(stream);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    {
+        const lfs::test::HeapReuse heap;
+        releaser.join();
+    }
+
+    alloc.release_stream(slow_stream);
+    EXPECT_EQ(cudaStreamDestroy(slow_stream), cudaSuccess);
 }
 #endif

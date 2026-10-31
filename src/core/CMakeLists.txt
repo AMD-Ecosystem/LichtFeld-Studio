@@ -112,6 +112,9 @@ set(CORE_SOURCES
         persisted_settings.cpp
         legacy_settings_migration.cpp
 )
+if(USE_HIP)
+    list(APPEND CORE_SOURCES cuda/hip_stream_reuse.cpp)
+endif()
 if(USE_HIP AND NOT WIN32)
     list(APPEND CORE_SOURCES cuda/hip_host_timeline.cpp)
 endif()

@@ -203,3 +203,71 @@ TEST_F(StaleStreamTeardownTest, RetiredStreamRegistryReuseCycle) {
     CudaMemoryPool::instance().release_stream(stream_s);
     ASSERT_EQ(cudaStreamDestroy(stream_s), cudaSuccess);
 }
+#if defined(USE_HIP)
+
+#include "hip_heap_reuse.hpp"
+
+// As on CUDA, an event stays valid after the stream it was recorded on is
+// destroyed, also once the heap has handed the stream's memory out again.
+TEST_F(StaleStreamTeardownTest, EventOutlivesDestroyedStreamAfterHeapReuse) {
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    cudaEvent_t event = nullptr;
+    ASSERT_EQ(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), cudaSuccess);
+    ASSERT_EQ(cudaEventRecord(event, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    {
+        const lfs::test::HeapReuse heap;
+        EXPECT_EQ(cudaEventQuery(event), cudaSuccess);
+        EXPECT_EQ(cudaEventSynchronize(event), cudaSuccess);
+    }
+    EXPECT_EQ(cudaEventDestroy(event), cudaSuccess);
+}
+
+// A destroyed stream is handed back out only to a create with the same flags
+// and the default priority, and works as a fresh one.
+TEST_F(StaleStreamTeardownTest, DestroyedStreamIsReusedOnlyWithMatchingFlagsAndPriority) {
+    cudaStream_t blocking = nullptr;
+    cudaStream_t non_blocking = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&blocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&non_blocking, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(blocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(non_blocking), cudaSuccess);
+
+    cudaStream_t reused_non_blocking = nullptr;
+    cudaStream_t reused_blocking = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&reused_non_blocking, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreate(&reused_blocking), cudaSuccess);
+    EXPECT_EQ(reused_non_blocking, non_blocking);
+    EXPECT_EQ(reused_blocking, blocking);
+    unsigned int flags = 0;
+    ASSERT_EQ(hipStreamGetFlags(reused_non_blocking, &flags), hipSuccess);
+    EXPECT_EQ(flags, static_cast<unsigned int>(cudaStreamNonBlocking));
+    ASSERT_EQ(hipStreamGetFlags(reused_blocking, &flags), hipSuccess);
+    EXPECT_EQ(flags, static_cast<unsigned int>(hipStreamDefault));
+
+    void* scratch = nullptr;
+    ASSERT_EQ(cudaMalloc(&scratch, 256), cudaSuccess);
+    EXPECT_EQ(cudaMemsetAsync(scratch, 0, 256, reused_non_blocking), cudaSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(reused_non_blocking), cudaSuccess);
+    EXPECT_EQ(cudaFree(scratch), cudaSuccess);
+
+    int least_priority = 0;
+    int greatest_priority = 0;
+    ASSERT_EQ(hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority), hipSuccess);
+    if (greatest_priority != least_priority) {
+        cudaStream_t prioritized = nullptr;
+        ASSERT_EQ(hipStreamCreateWithPriority(&prioritized, cudaStreamNonBlocking, greatest_priority),
+                  hipSuccess);
+        ASSERT_EQ(cudaStreamDestroy(prioritized), cudaSuccess);
+        cudaStream_t other = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking), cudaSuccess);
+        EXPECT_NE(other, prioritized);
+        EXPECT_EQ(cudaStreamDestroy(other), cudaSuccess);
+    }
+
+    EXPECT_EQ(cudaStreamDestroy(reused_non_blocking), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(reused_blocking), cudaSuccess);
+}
+#endif

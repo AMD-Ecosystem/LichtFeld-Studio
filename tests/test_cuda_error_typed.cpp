@@ -8,6 +8,9 @@
 #include "core/scene.hpp"
 #include "core/tensor.hpp"
 #include "training/trainer.hpp"
+#if defined(USE_HIP)
+#include "hip_heap_reuse.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -245,6 +248,34 @@ namespace {
         });
     }
 
+#if defined(USE_HIP)
+    // The viewer records each model read on its render stream and destroys that
+    // stream when its renderer resets, while the reads may still be pending in
+    // the trainer's ring. The next read past a full ring waits on the oldest
+    // event, which must not depend on the destroyed stream's memory.
+    TEST_F(CudaErrorTypedTest, TrainerModelReadRingOutlivesReaderStream) {
+        lfs::core::Scene scene;
+        const auto cameras = scene.addGroup("Cameras");
+        scene.addCamera("camera.png", cameras, make_camera(0));
+        lfs::training::Trainer trainer(scene);
+
+        cudaStream_t reader_stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&reader_stream, cudaStreamNonBlocking), cudaSuccess);
+        for (int i = 0; i < 4; ++i) { // fills the reader-done ring
+            trainer.beginModelRead(reader_stream);
+            trainer.endModelRead(reader_stream);
+        }
+        ASSERT_EQ(cudaStreamSynchronize(reader_stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(reader_stream), cudaSuccess);
+
+        const lfs::test::HeapReuse heap;
+        EXPECT_NO_THROW({
+            trainer.beginModelRead(nullptr);
+            trainer.endModelRead(nullptr);
+        });
+    }
+
+#endif
     TEST_F(CudaErrorTypedTest, SeveralCamerasConstructAndDestroyCleanly) {
         EXPECT_NO_THROW({
             std::vector<std::shared_ptr<lfs::core::Camera>> cameras;

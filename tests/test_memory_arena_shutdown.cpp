@@ -110,3 +110,30 @@ TEST(MemoryArenaShutdownTest, FullResetToleratesPoisonedCudaContext) {
 
     EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
+#if defined(USE_HIP)
+
+#include "hip_heap_reuse.hpp"
+
+// Trainer shutdown destroys the training stream before it resets the arena, and
+// the viewer keeps asking whether the arena is free in between. The last frame's
+// event was recorded on that stream; querying it must not depend on the
+// destroyed stream's memory.
+TEST(MemoryArenaShutdownTest, FrameEventQueryAfterStreamDestroy) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    lfs::core::RasterizerMemoryArena arena(test_config());
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    const uint64_t frame = arena.begin_frame(stream);
+    arena.end_frame(frame, stream);
+    ASSERT_TRUE(arena.has_last_frame_event_for_testing());
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    {
+        const lfs::test::HeapReuse heap;
+        EXPECT_TRUE(arena.render_frame_ready());
+    }
+    arena.full_reset();
+}
+#endif

@@ -130,9 +130,11 @@
 #define cudaPointerGetAttributes                    hipPointerGetAttributes
 #define cudaRuntimeGetVersion                       hipRuntimeGetVersion
 #define cudaSetDevice                               hipSetDevice
-#define cudaStreamCreate                            hipStreamCreate
-#define cudaStreamCreateWithFlags                   hipStreamCreateWithFlags
-#define cudaStreamDestroy                           hipStreamDestroy
+/* Destroyed streams are parked for reuse, not freed (see hip_stream_reuse.hpp). */
+#include "core/cuda/hip_stream_reuse.hpp"
+#define cudaStreamCreate                            lfs::core::hip_stream_reuse::create
+#define cudaStreamCreateWithFlags                   lfs::core::hip_stream_reuse::create_with_flags
+#define cudaStreamDestroy                           lfs::core::hip_stream_reuse::destroy
 #define cudaStreamNonBlocking                       hipStreamNonBlocking
 #define cudaStreamQuery                             hipStreamQuery
 #define cudaStreamSynchronize                       hipStreamSynchronize
