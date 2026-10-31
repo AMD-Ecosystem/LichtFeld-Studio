@@ -2,12 +2,17 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "rocdecode_decoder.hpp"
+#include "rocdecode_reference_clips.hpp"
 
 #include "core/logger.hpp"
 
 extern "C" {
 #include <libavcodec/bsf.h>
+#include <libavformat/avformat.h>
 #include <libavutil/buffer.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/md5.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -16,10 +21,16 @@ extern "C" {
 #include <rocdecode/rocparser.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <format>
+#include <iterator>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <span>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -170,6 +181,96 @@ namespace lfs::io::video {
             default:
                 return true;
             }
+        }
+
+        // An embedded clip read through FFmpeg's demuxers.
+        struct MemoryInput {
+            std::span<const uint8_t> data;
+            int64_t position = 0;
+        };
+
+        int readMemory(void* const opaque, uint8_t* const buffer, const int size) {
+            auto& input = *static_cast<MemoryInput*>(opaque);
+            const int64_t left = static_cast<int64_t>(input.data.size()) - input.position;
+            if (left <= 0)
+                return AVERROR_EOF;
+            const int count = static_cast<int>(std::min<int64_t>(size, left));
+            std::memcpy(buffer, input.data.data() + input.position, count);
+            input.position += count;
+            return count;
+        }
+
+        int64_t seekMemory(void* const opaque, int64_t offset, const int whence) {
+            auto& input = *static_cast<MemoryInput*>(opaque);
+            const auto size = static_cast<int64_t>(input.data.size());
+            switch (whence & ~AVSEEK_FORCE) {
+            case AVSEEK_SIZE: return size;
+            case SEEK_SET: break;
+            case SEEK_CUR: offset += input.position; break;
+            case SEEK_END: offset += size; break;
+            default: return AVERROR(EINVAL);
+            }
+            if (offset < 0 || offset > size)
+                return AVERROR(EINVAL);
+            input.position = offset;
+            return offset;
+        }
+
+        struct MemoryDemuxer {
+            MemoryInput input;
+            AVFormatContext* format = nullptr;
+            AVIOContext* io = nullptr;
+            AVPacket* packet = nullptr;
+
+            ~MemoryDemuxer() {
+                av_packet_free(&packet);
+                avformat_close_input(&format);
+                if (io)
+                    av_freep(&io->buffer);
+                avio_context_free(&io);
+            }
+        };
+
+        // MD5 of a host frame packed without row padding, as FFmpeg's framemd5 muxer hashes it.
+        [[nodiscard]] std::string frameMd5(const AVFrame* const frame) {
+            const auto format = static_cast<AVPixelFormat>(frame->format);
+            const int size = av_image_get_buffer_size(format, frame->width, frame->height, 1);
+            if (size <= 0)
+                return {};
+            std::vector<uint8_t> packed(static_cast<size_t>(size));
+            if (av_image_copy_to_buffer(packed.data(), size, frame->data, frame->linesize, format, frame->width,
+                                        frame->height, 1) < 0)
+                return {};
+            uint8_t digest[16];
+            av_md5_sum(digest, packed.data(), static_cast<size_t>(size));
+            std::string hex;
+            for (const uint8_t byte : digest)
+                std::format_to(std::back_inserter(hex), "{:02x}", byte);
+            return hex;
+        }
+
+        // The 12-bit AV1 profile shares the 16-bit surfaces of the 10-bit clip.
+        [[nodiscard]] int referenceBitDepth(const int bit_depth) { return bit_depth > 8 ? 10 : 8; }
+
+        [[nodiscard]] const RocDecodeReferenceClip* referenceClip(const AVCodecID codec, const int bit_depth) {
+            for (const RocDecodeReferenceClip& clip : rocDecodeReferenceClips())
+                if (clip.codec == codec && clip.bit_depth == referenceBitDepth(bit_depth))
+                    return &clip;
+            return nullptr;
+        }
+
+        // Results of the reference clip check, by device, codec and reference bit
+        // depth: an empty string when the frames matched, else the CPU reason.
+        struct SelfCheckRegistry {
+            std::mutex mutex;
+            std::map<std::tuple<int, AVCodecID, int>, std::string> results;
+            std::map<std::pair<AVCodecID, int>, std::array<std::string, 2>> overrides;
+            int runs = 0;
+        };
+
+        SelfCheckRegistry& selfCheckRegistry() {
+            static auto* const registry = new SelfCheckRegistry();
+            return *registry;
         }
 
     } // namespace
@@ -451,7 +552,143 @@ namespace lfs::io::video {
         const auto layout = streamLayout(parameters);
         if (!layout)
             return layout.error();
-        return capsRefusal(*codec, layout->chroma, layout->bit_depth, parameters->width, parameters->height);
+        const auto refusal =
+            capsRefusal(*codec, layout->chroma, layout->bit_depth, parameters->width, parameters->height);
+        if (!refusal || !refusal->empty())
+            return refusal;
+        return selfCheckRefusal(parameters->codec_id, layout->bit_depth);
+    }
+
+    // rocDecode reports success for every picture even where a GPU's video
+    // driver returns wrong pixels, so the frames of a short valid clip are
+    // compared with FFmpeg's software decode before the codec is trusted.
+    std::expected<std::string, std::string> RocDecodeDecoder::selfCheckRefusal(const AVCodecID codec_id,
+                                                                               const int bit_depth) {
+        const RocDecodeReferenceClip* const clip = referenceClip(codec_id, bit_depth);
+        if (!clip)
+            return std::string{};
+        int device = 0;
+        if (const hipError_t result = hipGetDevice(&device); result != hipSuccess)
+            return std::unexpected(std::format("hipGetDevice failed: {}", hipGetErrorString(result)));
+
+        SelfCheckRegistry& registry = selfCheckRegistry();
+        const std::lock_guard lock(registry.mutex);
+        const auto key = std::tuple{device, codec_id, clip->bit_depth};
+        if (const auto found = registry.results.find(key); found != registry.results.end())
+            return found->second;
+
+        std::array<std::string, 2> expected{clip->frame_md5[0], clip->frame_md5[1]};
+        if (const auto found = registry.overrides.find({codec_id, clip->bit_depth});
+            found != registry.overrides.end())
+            expected = found->second;
+        const char* const codec_name = rocDecodeCodec(codec_id)->name;
+        const auto start = std::chrono::steady_clock::now();
+        ++registry.runs;
+
+        auto demuxer = std::make_unique<MemoryDemuxer>();
+        demuxer->input.data = clip->data;
+        constexpr int IO_BUFFER_SIZE = 4096;
+        auto* const io_buffer = static_cast<uint8_t*>(av_malloc(IO_BUFFER_SIZE));
+        if (!io_buffer)
+            return std::unexpected("Failed to allocate the reference clip reader");
+        demuxer->io = avio_alloc_context(io_buffer, IO_BUFFER_SIZE, 0, &demuxer->input, readMemory, nullptr,
+                                         seekMemory);
+        if (!demuxer->io) {
+            av_free(io_buffer);
+            return std::unexpected("Failed to allocate the reference clip reader");
+        }
+        demuxer->format = avformat_alloc_context();
+        demuxer->packet = av_packet_alloc();
+        if (!demuxer->format || !demuxer->packet)
+            return std::unexpected("Failed to allocate the reference clip reader");
+        demuxer->format->pb = demuxer->io;
+        demuxer->format->flags |= AVFMT_FLAG_CUSTOM_IO;
+        if (avformat_open_input(&demuxer->format, nullptr, av_find_input_format(clip->demuxer), nullptr) < 0 ||
+            demuxer->format->nb_streams != 1)
+            return std::unexpected(std::format("FFmpeg could not read the {} reference clip", codec_name));
+        const AVStream* const stream = demuxer->format->streams[0];
+
+        auto decoder = open(stream->codecpar, stream->time_base);
+        if (!decoder)
+            return std::unexpected(std::format("rocDecode could not open the {} reference clip: {}", codec_name,
+                                               decoder.error()));
+        std::vector<std::string> frames;
+        AVFrame* frame = av_frame_alloc();
+        AVFrame* host = av_frame_alloc();
+        std::string error = frame && host ? "" : "failed to allocate a video frame";
+        bool drained = false;
+        while (error.empty()) {
+            const int received = (*decoder)->receiveFrame(frame);
+            if (received == 0) {
+                if (RocDecodeDecoder::transferToHost(host, frame) < 0)
+                    error = "copying a frame to host memory failed";
+                else
+                    frames.push_back(frameMd5(host));
+                continue;
+            }
+            if (received == AVERROR_EOF)
+                break;
+            if (received != AVERROR(EAGAIN) || drained) {
+                error = (*decoder)->lastError();
+                break;
+            }
+            int read = av_read_frame(demuxer->format, demuxer->packet);
+            drained = read < 0;
+            read = (*decoder)->sendPacket(drained ? nullptr : demuxer->packet);
+            av_packet_unref(demuxer->packet);
+            if (read < 0)
+                error = (*decoder)->lastError();
+        }
+        av_frame_free(&frame);
+        av_frame_free(&host);
+        if (!error.empty())
+            return std::unexpected(
+                std::format("rocDecode could not decode the {} reference clip: {}", codec_name, error));
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+        hipDeviceProp_t properties{};
+        const bool named = hipGetDeviceProperties(&properties, device) == hipSuccess;
+        const std::string gpu = named ? std::format("{} ({})", properties.name, properties.gcnArchName)
+                                      : std::format("HIP device {}", device);
+        std::size_t matching = 0;
+        while (matching < frames.size() && matching < expected.size() && frames[matching] == expected[matching])
+            ++matching;
+        std::string refusal;
+        if (frames.size() == expected.size() && matching == expected.size()) {
+            LOG_INFO("rocDecode decodes {} {}-bit correctly on {} (reference clip checked in {} ms)", codec_name,
+                     clip->bit_depth, gpu, elapsed);
+        } else {
+            refusal = std::format("rocDecode produced wrong frames for {} {}-bit on this GPU and driver", codec_name,
+                                  clip->bit_depth);
+            LOG_WARN("{}: {} decoded {} frames of a reference clip, and frame {} differs from FFmpeg's software "
+                     "decode of the same clip (checked in {} ms)",
+                     refusal, gpu, frames.size(), matching + 1, elapsed);
+        }
+        registry.results.emplace(key, refusal);
+        return refusal;
+    }
+
+    void RocDecodeDecoder::overrideSelfCheckDigestsForTesting(const AVCodecID codec, const int bit_depth,
+                                                              const std::array<std::string, 2>& frame_md5) {
+        SelfCheckRegistry& registry = selfCheckRegistry();
+        const std::lock_guard lock(registry.mutex);
+        registry.overrides[{codec, referenceBitDepth(bit_depth)}] = frame_md5;
+    }
+
+    void RocDecodeDecoder::resetSelfCheckForTesting() {
+        SelfCheckRegistry& registry = selfCheckRegistry();
+        const std::lock_guard lock(registry.mutex);
+        registry.results.clear();
+        registry.overrides.clear();
+        registry.runs = 0;
+    }
+
+    int RocDecodeDecoder::selfCheckRunsForTesting() {
+        SelfCheckRegistry& registry = selfCheckRegistry();
+        const std::lock_guard lock(registry.mutex);
+        return registry.runs;
     }
 
     std::expected<std::unique_ptr<RocDecodeDecoder>, std::string> RocDecodeDecoder::create(
@@ -461,7 +698,19 @@ namespace lfs::io::video {
             return std::unexpected(refusal.error());
         if (!refusal->empty())
             return std::unexpected(*refusal);
+        return open(parameters, time_base);
+    }
 
+    std::expected<std::unique_ptr<RocDecodeDecoder>, std::string> RocDecodeDecoder::createWithoutSelfCheckForTesting(
+        const AVCodecParameters* const parameters, const AVRational time_base) {
+        const auto codec = rocDecodeCodec(parameters->codec_id);
+        if (!codec)
+            return std::unexpected(std::format("rocDecode has no {} decoder", avcodec_get_name(parameters->codec_id)));
+        return open(parameters, time_base);
+    }
+
+    std::expected<std::unique_ptr<RocDecodeDecoder>, std::string> RocDecodeDecoder::open(
+        const AVCodecParameters* const parameters, const AVRational time_base) {
         std::unique_ptr<RocDecodeDecoder> decoder(new RocDecodeDecoder());
         decoder->state_ = std::make_unique<State>();
         State& state = *decoder->state_;

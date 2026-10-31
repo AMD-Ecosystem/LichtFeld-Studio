@@ -9,6 +9,9 @@
 #include "io/video/video_encoder.hpp"
 #include "io/video_frame_extractor.hpp"
 #include "io/video_player.hpp"
+#if defined(USE_HIP) && LFS_HAVE_ROCDECODE
+#include "io/video/rocdecode_decoder.hpp"
+#endif
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Elements/ElementFormControlInput.h>
@@ -114,6 +117,33 @@ namespace {
         return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
     }
 
+#if defined(USE_HIP)
+    // The decoder backend the extractor records on ROCm: rocDecode, unless this
+    // ROCm SDK has none or rocDecode refuses the stream on this GPU and driver
+    // (for example when its reference clip check found wrong frames).
+    std::string hipDecoderBackend(const std::filesystem::path& video_path) {
+#if LFS_HAVE_ROCDECODE
+        AVFormatContext* format = nullptr;
+        if (avformat_open_input(&format, video_path.string().c_str(), nullptr, nullptr) < 0)
+            return "unreadable";
+        std::string backend = "no video stream";
+        if (avformat_find_stream_info(format, nullptr) >= 0) {
+            const int index = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            if (index >= 0) {
+                const auto refusal =
+                    lfs::io::video::RocDecodeDecoder::unsupportedReason(format->streams[index]->codecpar);
+                backend = refusal && refusal->empty() ? "rocdecode" : "ffmpeg_software";
+            }
+        }
+        avformat_close_input(&format);
+        return backend;
+#else
+        (void)video_path;
+        return "ffmpeg_software";
+#endif
+    }
+
+#endif
     bool writeEncodedVideo(const std::filesystem::path& video_path,
                            const int frame_count,
                            const int framerate,
@@ -994,15 +1024,16 @@ TEST(VideoEncoderTimingTest, EncodedFramesHaveRequestedDurationAndRate) {
 TEST(VideoFrameExtractorOutputNaming, SparseFpsSeeksOnlyAcrossWholeKeyframeIntervals) {
     if (!cudaAvailable())
         GTEST_SKIP() << "Requires NVDEC";
-#if defined(USE_HIP) && !LFS_HAVE_ROCDECODE
-    GTEST_SKIP() << "Requires rocDecode, which this ROCm SDK does not have";
-#endif
 
     TempDir temp("sparse_seek");
     const std::filesystem::path video_path = temp.path / "source.mp4";
     std::string error;
     // The encoder writes one keyframe per second.
     ASSERT_TRUE(writeEncodedVideo(video_path, 90, 30, error, 160, 90)) << error;
+#if defined(USE_HIP)
+    if (hipDecoderBackend(video_path) != "rocdecode")
+        GTEST_SKIP() << "Requires rocDecode, which does not decode this clip with this ROCm SDK, GPU and driver";
+#endif
 
     for (const auto [fps, seeks, frames] : {std::tuple{2.0, 1, 6u}, std::tuple{0.5, 2, 2u}}) {
         SCOPED_TRACE(::testing::Message() << "fps=" << fps);
@@ -1053,7 +1084,7 @@ TEST(VideoFrameExtractorOutputNaming, IntervalUsesSourceFrameNumbers) {
     const nlohmann::json metadata = readMetadata(output_dir);
     ASSERT_TRUE(metadata.contains("processing"));
 #if defined(USE_HIP)
-    EXPECT_EQ(metadata["processing"]["decoder"]["backend"], LFS_HAVE_ROCDECODE ? "rocdecode" : "ffmpeg_software")
+    EXPECT_EQ(metadata["processing"]["decoder"]["backend"], hipDecoderBackend(video_path))
 #else
     EXPECT_EQ(metadata["processing"]["decoder"]["backend"], "nvdec")
 #endif
@@ -2291,7 +2322,7 @@ TEST(VideoFrameExtractorOutputNaming, Vp9KeepsEverySourceTimestamp) {
     ASSERT_TRUE(extractor.extract(params, error)) << error;
     const auto metadata = readMetadata(temp.path);
 #if defined(USE_HIP)
-    ASSERT_EQ(metadata["processing"]["decoder"]["backend"], LFS_HAVE_ROCDECODE ? "rocdecode" : "ffmpeg_software");
+    ASSERT_EQ(metadata["processing"]["decoder"]["backend"], hipDecoderBackend(source));
 #else
     ASSERT_EQ(metadata["processing"]["decoder"]["backend"], "nvdec");
 #endif

@@ -5,25 +5,35 @@
 // streams the GPU cannot decode are refused with a reason.
 
 #include "io/video/rocdecode_decoder.hpp"
+#include "io/video/rocdecode_reference_clips.hpp"
 
 #include <gtest/gtest.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/md5.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 }
 
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <filesystem>
+#include <format>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 using lfs::io::video::RocDecodeDecoder;
+using lfs::io::video::RocDecodeReferenceClip;
 
 namespace {
 
@@ -173,15 +183,89 @@ namespace {
         return ok;
     }
 
-    std::unique_ptr<RocDecodeDecoder> openOrSkip(const AVStream* stream) {
+    std::unique_ptr<RocDecodeDecoder> openOrSkip(const AVStream* stream, std::string* reason = nullptr) {
         const auto refusal = RocDecodeDecoder::unsupportedReason(stream->codecpar);
         EXPECT_TRUE(refusal.has_value()) << refusal.error();
+        if (reason)
+            *reason = refusal ? *refusal : refusal.error();
         if (!refusal || !refusal->empty())
             return nullptr;
         auto decoder = RocDecodeDecoder::create(stream->codecpar, stream->time_base);
         EXPECT_TRUE(decoder.has_value()) << decoder.error();
         return decoder ? std::move(*decoder) : nullptr;
     }
+
+    // Differing luma and chroma samples between rocDecode's NV12 frames and the
+    // software decoder's planar frames, or -1 when the frame count, format or size differ.
+    long long sampleDifferences(const std::vector<FramePtr>& gpu, const std::vector<FramePtr>& cpu) {
+        if (gpu.size() != cpu.size() || cpu.empty())
+            return -1;
+        long long differences = 0;
+        for (std::size_t i = 0; i < gpu.size(); ++i) {
+            const AVFrame& g = *gpu[i];
+            const AVFrame& c = *cpu[i];
+            if (g.format != AV_PIX_FMT_NV12 || (c.format != AV_PIX_FMT_YUV420P && c.format != AV_PIX_FMT_YUVJ420P) ||
+                g.width != c.width || g.height != c.height)
+                return -1;
+            for (int y = 0; y < g.height; ++y)
+                for (int x = 0; x < g.width; ++x)
+                    differences += g.data[0][y * g.linesize[0] + x] != c.data[0][y * c.linesize[0] + x];
+            for (int y = 0; y < (g.height + 1) / 2; ++y)
+                for (int x = 0; x < (g.width + 1) / 2; ++x) {
+                    differences += g.data[1][y * g.linesize[1] + 2 * x] != c.data[1][y * c.linesize[1] + x];
+                    differences += g.data[1][y * g.linesize[1] + 2 * x + 1] != c.data[2][y * c.linesize[2] + x];
+                }
+        }
+        return differences;
+    }
+
+    // MD5 of a planar 4:2:0 software frame repacked as NV12 or P010, the layout the reference digests describe.
+    std::string semiPlanarMd5(const AVFrame& frame) {
+        const AVPixFmtDescriptor* const descriptor = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame.format));
+        const int depth = descriptor->comp[0].depth;
+        std::vector<uint8_t> packed;
+        const auto put = [&](const uint8_t* plane, const int linesize, const int x, const int y) {
+            if (depth == 8) {
+                packed.push_back(plane[y * linesize + x]);
+                return;
+            }
+            uint16_t value = 0;
+            std::memcpy(&value, plane + y * linesize + 2 * x, sizeof(value));
+            value = static_cast<uint16_t>(value << (16 - depth));
+            packed.push_back(static_cast<uint8_t>(value & 0xff));
+            packed.push_back(static_cast<uint8_t>(value >> 8));
+        };
+        for (int y = 0; y < frame.height; ++y)
+            for (int x = 0; x < frame.width; ++x)
+                put(frame.data[0], frame.linesize[0], x, y);
+        for (int y = 0; y < (frame.height + 1) / 2; ++y)
+            for (int x = 0; x < (frame.width + 1) / 2; ++x) {
+                put(frame.data[1], frame.linesize[1], x, y);
+                put(frame.data[2], frame.linesize[2], x, y);
+            }
+        uint8_t digest[16];
+        av_md5_sum(digest, packed.data(), packed.size());
+        std::string hex;
+        for (const uint8_t byte : digest)
+            std::format_to(std::back_inserter(hex), "{:02x}", byte);
+        return hex;
+    }
+
+    std::filesystem::path writeClip(const RocDecodeReferenceClip& clip) {
+        const auto path = std::filesystem::temp_directory_path() /
+                          std::format("lfs_rocdecode_reference_{}_{}.{}", avcodec_get_name(clip.codec),
+                                      clip.bit_depth, std::string_view(clip.demuxer) == "mp4" ? "mp4" : "webm");
+        std::ofstream(path, std::ios::binary)
+            .write(reinterpret_cast<const char*>(clip.data.data()), static_cast<std::streamsize>(clip.data.size()));
+        return path;
+    }
+
+    // Each test starts and ends with no remembered reference clip results.
+    class RocDecodeSelfCheck : public ::testing::Test {
+    protected:
+        void SetUp() override { RocDecodeDecoder::resetSelfCheckForTesting(); }
+        void TearDown() override { RocDecodeDecoder::resetSelfCheckForTesting(); }
+    };
 
 } // namespace
 
@@ -208,14 +292,15 @@ TEST(RocDecodeVideo, StreamsTheVideoEngineCannotDecodeAreNamed) {
 }
 
 TEST(RocDecodeVideo, MinimumSizeAppliesToTheCodedSize) {
-    // 60x60 is coded as 64x64 in both codecs, which rocDecode decodes.
+    // 60x60 is coded as 64x64 in both codecs, which rocDecode decodes. A GPU
+    // and driver whose reference clip decodes wrongly refuse the codec instead.
     for (const char* name : {"h264_60x60.mp4", "hevc_60x60.mp4"}) {
         SCOPED_TRACE(name);
         Input input(fixture(name));
         ASSERT_TRUE(input.ok());
         const auto refusal = RocDecodeDecoder::unsupportedReason(input.stream()->codecpar);
         ASSERT_TRUE(refusal.has_value()) << refusal.error();
-        EXPECT_EQ(*refusal, "");
+        EXPECT_TRUE(refusal->empty() || refusal->starts_with("rocDecode produced wrong frames")) << *refusal;
     }
 
     Input input(fixture("h264_420.mp4"));
@@ -236,9 +321,10 @@ TEST_P(RocDecodeMatchesSoftware, FramesAndTimestamps) {
     }
     Input input(path);
     ASSERT_TRUE(input.ok());
-    const auto decoder = openOrSkip(input.stream());
+    std::string reason;
+    const auto decoder = openOrSkip(input.stream(), &reason);
     if (!decoder)
-        GTEST_SKIP() << "This GPU does not decode " << GetParam() << " on rocDecode";
+        GTEST_SKIP() << "This GPU does not decode " << GetParam() << " on rocDecode: " << reason;
     const auto gpu = decodeOnGpu(*decoder, input);
     const auto cpu = decodeOnCpu(path);
     ASSERT_FALSE(cpu.empty());
@@ -273,9 +359,10 @@ INSTANTIATE_TEST_SUITE_P(Fixtures, RocDecodeMatchesSoftware,
 TEST(RocDecodeVideo, FlushRestartsFromTheSeekTarget) {
     Input input(fixture("vp9_timestamps.webm"));
     ASSERT_TRUE(input.ok());
-    const auto decoder = openOrSkip(input.stream());
+    std::string reason;
+    const auto decoder = openOrSkip(input.stream(), &reason);
     if (!decoder)
-        GTEST_SKIP() << "This GPU does not decode VP9 on rocDecode";
+        GTEST_SKIP() << "This GPU does not decode VP9 on rocDecode: " << reason;
     const auto first = decodeOnGpu(*decoder, input, 12);
     ASSERT_EQ(first.size(), 12u);
     input.rewind();
@@ -309,5 +396,115 @@ TEST(RocDecodeVideo, ColourRangeFollowsTheStream) {
             EXPECT_EQ(frame->color_range, range);
             EXPECT_EQ(frame->colorspace, AVCOL_SPC_BT470BG);
         }
+    }
+}
+
+// The embedded digests are what FFmpeg's software decoders produce for the embedded clips.
+TEST_F(RocDecodeSelfCheck, ReferenceDigestsMatchTheSoftwareDecode) {
+    ASSERT_EQ(lfs::io::video::rocDecodeReferenceClips().size(), 7u);
+    for (const RocDecodeReferenceClip& clip : lfs::io::video::rocDecodeReferenceClips()) {
+        SCOPED_TRACE(std::format("{} {}-bit", avcodec_get_name(clip.codec), clip.bit_depth));
+        const auto path = writeClip(clip);
+        const auto frames = decodeOnCpu(path);
+        std::filesystem::remove(path);
+        if (frames.empty() && clip.codec == AV_CODEC_ID_AV1) {
+            // FFmpeg's own AV1 decoder needs a hardware accelerator; only libdav1d decodes AV1 in software.
+            ASSERT_EQ(avcodec_find_decoder_by_name("libdav1d"), nullptr);
+            continue;
+        }
+        ASSERT_EQ(frames.size(), clip.frame_md5.size());
+        for (std::size_t i = 0; i < frames.size(); ++i) {
+            EXPECT_EQ(frames[i]->width, 64);
+            EXPECT_EQ(semiPlanarMd5(*frames[i]), clip.frame_md5[i]) << "frame " << i;
+        }
+    }
+}
+
+// A digest mismatch refuses the codec with a named reason, and the result is
+// remembered: the reference clip is decoded once per process and codec.
+TEST_F(RocDecodeSelfCheck, WrongFramesDecodeOnTheCpu) {
+    Input input(fixture("h264_60x60.mp4"));
+    ASSERT_TRUE(input.ok());
+    const AVCodecParameters* const parameters = input.stream()->codecpar;
+    RocDecodeDecoder::overrideSelfCheckDigestsForTesting(AV_CODEC_ID_H264, 8, {std::string(32, '0'), std::string(32, '0')});
+    const auto refusal = RocDecodeDecoder::unsupportedReason(parameters);
+    ASSERT_TRUE(refusal.has_value()) << refusal.error();
+    if (RocDecodeDecoder::selfCheckRunsForTesting() == 0)
+        GTEST_SKIP() << "This GPU does not decode H.264 on rocDecode: " << *refusal;
+    EXPECT_EQ(*refusal, "rocDecode produced wrong frames for H.264 8-bit on this GPU and driver");
+    EXPECT_EQ(RocDecodeDecoder::selfCheckRunsForTesting(), 1);
+
+    const auto again = RocDecodeDecoder::unsupportedReason(parameters);
+    ASSERT_TRUE(again.has_value()) << again.error();
+    EXPECT_EQ(*again, *refusal);
+    const auto decoder = RocDecodeDecoder::create(parameters, input.stream()->time_base);
+    ASSERT_FALSE(decoder.has_value());
+    EXPECT_EQ(decoder.error(), *refusal);
+    EXPECT_EQ(RocDecodeDecoder::selfCheckRunsForTesting(), 1);
+
+    // Another codec keeps its own result.
+    Input hevc(fixture("hevc_60x60.mp4"));
+    ASSERT_TRUE(hevc.ok());
+    const auto hevc_refusal = RocDecodeDecoder::unsupportedReason(hevc.stream()->codecpar);
+    ASSERT_TRUE(hevc_refusal.has_value()) << hevc_refusal.error();
+    EXPECT_NE(*hevc_refusal, *refusal);
+}
+
+TEST_F(RocDecodeSelfCheck, ConcurrentFirstUseDecodesTheClipOnce) {
+    Input input(fixture("h264_60x60.mp4"));
+    ASSERT_TRUE(input.ok());
+    const AVCodecParameters* const parameters = input.stream()->codecpar;
+    std::array<std::expected<std::string, std::string>, 8> results;
+    {
+        std::vector<std::jthread> threads;
+        for (auto& result : results)
+            threads.emplace_back([&result, parameters] { result = RocDecodeDecoder::unsupportedReason(parameters); });
+    }
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value()) << result.error();
+        EXPECT_EQ(*result, *results[0]);
+    }
+    EXPECT_LE(RocDecodeDecoder::selfCheckRunsForTesting(), 1);
+}
+
+// The check's verdict on this GPU and driver predicts a full decode: a codec it
+// accepts decodes the fixtures bit-exactly, and a codec it refuses does not.
+TEST_F(RocDecodeSelfCheck, VerdictAgreesWithAFullDecode) {
+    for (const char* name : {"h264_60x60.mp4", "hevc_60x60.mp4", "hevc_full.mp4", "vp9_full.webm"}) {
+        SCOPED_TRACE(name);
+        Input input(fixture(name));
+        ASSERT_TRUE(input.ok());
+        const auto refusal = RocDecodeDecoder::unsupportedReason(input.stream()->codecpar);
+        ASSERT_TRUE(refusal.has_value()) << refusal.error();
+        const bool wrong_frames = refusal->starts_with("rocDecode produced wrong frames");
+        if (!refusal->empty() && !wrong_frames)
+            continue;
+        auto decoder = RocDecodeDecoder::createWithoutSelfCheckForTesting(input.stream()->codecpar,
+                                                                          input.stream()->time_base);
+        ASSERT_TRUE(decoder.has_value()) << decoder.error();
+        const auto gpu = decodeOnGpu(**decoder, input);
+        const long long differences = sampleDifferences(gpu, decodeOnCpu(fixture(name)));
+        ASSERT_GE(differences, 0) << "frame count or layout differs from the software decode";
+        if (wrong_frames)
+            EXPECT_GT(differences, 0) << *refusal;
+        else
+            EXPECT_EQ(differences, 0);
+    }
+}
+
+// Each reference clip either decodes correctly on this GPU, or its codec and
+// bit depth are refused by name: caps, or wrong frames from the check.
+TEST_F(RocDecodeSelfCheck, EveryReferenceClipIsAcceptedOrRefusedByName) {
+    for (const RocDecodeReferenceClip& clip : lfs::io::video::rocDecodeReferenceClips()) {
+        SCOPED_TRACE(std::format("{} {}-bit", avcodec_get_name(clip.codec), clip.bit_depth));
+        const auto path = writeClip(clip);
+        Input input(path);
+        ASSERT_TRUE(input.ok());
+        const auto refusal = RocDecodeDecoder::unsupportedReason(input.stream()->codecpar);
+        std::filesystem::remove(path);
+        ASSERT_TRUE(refusal.has_value()) << refusal.error();
+        EXPECT_TRUE(refusal->empty() || refusal->starts_with("rocDecode produced wrong frames") ||
+                    refusal->starts_with("rocDecode does not decode"))
+            << *refusal;
     }
 }

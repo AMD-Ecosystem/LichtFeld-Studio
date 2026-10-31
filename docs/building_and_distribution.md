@@ -251,7 +251,7 @@ What differs from the CUDA build:
 
 - JPEG images decode on the GPU with rocJPEG. ROCm has no JPEG encoder or JPEG 2000 codec, so JPEG encoding, the lossless JPEG 2000 image caches, and JPEGs the hardware decoder does not accept (smaller than 64x64, progressive) are handled on the CPU with libjpeg and OpenJPH.
 - On Linux, HIP cannot import Vulkan semaphores, so the viewer orders HIP and Vulkan work on the host around each shared image instead of on the GPU.
-- Video decodes on the GPU with rocDecode (H.264, HEVC, VP9 and AV1, as far as the GPU supports them). Streams it cannot decode on the GPU, such as 4:4:4 chroma or MPEG-4 Part 2, decode with FFmpeg's software decoders, and the log names the reason (on a Windows build without rocDecode, "rocDecode not available in this ROCm SDK on Windows"). ROCm has no video encoder, so video export encodes H.264 with FFmpeg's software encoder.
+- Video decodes on the GPU with rocDecode (H.264, HEVC, VP9 and AV1, as far as the GPU supports them). Streams it cannot decode on the GPU, such as 4:4:4 chroma or MPEG-4 Part 2, decode with FFmpeg's software decoders, and the log names the reason (on a Windows build without rocDecode, "rocDecode not available in this ROCm SDK on Windows"). The first time a process decodes a codec on a GPU, rocDecode decodes a two-frame reference clip and the frames are compared with FFmpeg's software decode, which takes 10 to 50 ms; some GPU and video driver combinations decode without an error but return wrong pixels, and on those the codec decodes on the CPU with "rocDecode produced wrong frames for <codec> on this GPU and driver" in the log. ROCm has no video encoder, so video export encodes H.264 with FFmpeg's software encoder.
 
 ### Compute-only build
 
