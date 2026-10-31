@@ -118,6 +118,11 @@ if(NOT _LFS_HIP_COMPUTE_ONLY)
     lfs_validate_vcpkg_profile()
 endif()
 
+if(USE_HIP AND NOT _LFS_HIP_COMPUTE_ONLY)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HipVcpkgManifest.cmake")
+    lfs_hip_vcpkg_manifest()
+endif()
+
 if(USE_HIP)
     # Enable HIP at project() time so the compiler is detected before any
     # reconfigure could drop -DUSE_HIP.

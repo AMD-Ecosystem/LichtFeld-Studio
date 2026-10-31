@@ -407,11 +407,6 @@ TEST_F(RocDecodeSelfCheck, ReferenceDigestsMatchTheSoftwareDecode) {
         const auto path = writeClip(clip);
         const auto frames = decodeOnCpu(path);
         std::filesystem::remove(path);
-        if (frames.empty() && clip.codec == AV_CODEC_ID_AV1) {
-            // FFmpeg's own AV1 decoder needs a hardware accelerator; only libdav1d decodes AV1 in software.
-            ASSERT_EQ(avcodec_find_decoder_by_name("libdav1d"), nullptr);
-            continue;
-        }
         ASSERT_EQ(frames.size(), clip.frame_md5.size());
         for (std::size_t i = 0; i < frames.size(); ++i) {
             EXPECT_EQ(frames[i]->width, 64);
