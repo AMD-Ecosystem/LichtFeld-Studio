@@ -84,6 +84,17 @@
     "zstd"
   ],
   "features": {
+    "rocm": {
+      "description": "Dependencies of the ROCm build: libdav1d for decoding AV1 on the CPU",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "features": [
+            "dav1d"
+          ]
+        }
+      ]
+    },
     "tests": {
       "description": "Dependencies used only by the C++ test targets",
       "dependencies": [
