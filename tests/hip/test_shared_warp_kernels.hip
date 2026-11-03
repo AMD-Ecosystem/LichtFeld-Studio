@@ -11,6 +11,7 @@
 #include "core/tensor/backend/cuda/kernels/warp_segment_reduce.cuh"
 #include "device_kernel_checks.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -99,6 +100,30 @@ namespace {
             expect_near(static_cast<double>(result[b * 4 + 1]), max, 0.0, where + " max");
             expect_near(static_cast<double>(result[b * 4 + 2]), min, 0.0, where + " min");
             expect_near(static_cast<double>(result[b * 4 + 3]), prod, 1e-6, where + " prod");
+        }
+    }
+
+    // Integer max of negative values and min of positive values: unused
+    // partials must not contribute 0.
+    void check_one_signed_integer_reductions(const int block) {
+        for (const int sign : {-1, 1}) {
+            std::vector<int> host(block);
+            for (int i = 0; i < block; ++i)
+                host[i] = sign * (1000 + i * 13 % 500);
+            DeviceBuffer<int> input(host.size());
+            DeviceBuffer<int> output(4);
+            input.upload(host);
+            block_reductions<int><<<1, block>>>(input.data, output.data);
+            require(hipGetLastError(), "block_reductions");
+            const auto result = output.download(4);
+            int max = host[0], min = host[0];
+            for (const int v : host) {
+                max = std::max(max, v);
+                min = std::min(min, v);
+            }
+            const std::string where = (sign < 0 ? "negative" : "positive") + std::string(" int block ") + std::to_string(block);
+            expect(result[1] == max, where + " max: got " + std::to_string(result[1]) + ", want " + std::to_string(max));
+            expect(result[2] == min, where + " min: got " + std::to_string(result[2]) + ", want " + std::to_string(min));
         }
     }
 
@@ -229,6 +254,7 @@ int main(int argc, char** argv) {
         check_block_reductions<float>(block);
         check_block_reductions<double>(block);
         check_block_reductions<int>(block);
+        check_one_signed_integer_reductions(block);
     }
     check_warp_reductions<float>();
     check_warp_reductions<double>();

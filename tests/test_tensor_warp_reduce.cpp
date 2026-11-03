@@ -127,6 +127,20 @@ TEST_F(TensorWarpReduceTest, BlockReductionsMatchHostForEveryWarpMultiple) {
     }
 }
 
+TEST_F(TensorWarpReduceTest, IntegerBlockExtremaIgnoreUnusedPartials) {
+    for (int block_size = 32; block_size <= 1024; block_size += 32) {
+        SCOPED_TRACE(block_size);
+        for (const int sign : {-1, 1}) {
+            std::vector<int> input(block_size);
+            for (int i = 0; i < block_size; ++i)
+                input[i] = sign * (1000 + i * 13 % 500);
+            const auto results = run_reduction(input, 4, 1, block_size);
+            EXPECT_EQ(results[1], *std::max_element(input.begin(), input.end())) << "sign " << sign;
+            EXPECT_EQ(results[2], *std::min_element(input.begin(), input.end())) << "sign " << sign;
+        }
+    }
+}
+
 TEST_F(TensorWarpReduceTest, WarpReductionsCombineThirtyTwoLaneGroups) {
     expect_warp_reductions<float>();
     expect_warp_reductions<double>();

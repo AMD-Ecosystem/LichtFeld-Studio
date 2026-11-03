@@ -9,6 +9,7 @@
 
 #include "core/device/portability.cuh"
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 namespace lfs::core {
@@ -81,6 +82,23 @@ namespace lfs::core {
             return val;
         }
 
+        // Max/min identities: infinity for floating-point types, the range limits otherwise.
+        template <typename T>
+        __device__ constexpr T max_identity() {
+            if constexpr (std::numeric_limits<T>::has_infinity)
+                return -std::numeric_limits<T>::infinity();
+            else
+                return std::numeric_limits<T>::lowest();
+        }
+
+        template <typename T>
+        __device__ constexpr T min_identity() {
+            if constexpr (std::numeric_limits<T>::has_infinity)
+                return std::numeric_limits<T>::infinity();
+            else
+                return std::numeric_limits<T>::max();
+        }
+
         // ============= BLOCK-LEVEL REDUCTIONS (USES WARP REDUCTION) =============
 
         /**
@@ -139,7 +157,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : -std::numeric_limits<T>::infinity();
+                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : max_identity<T>();
                 val = warp_reduce_max(val);
             }
 
@@ -166,7 +184,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : std::numeric_limits<T>::infinity();
+                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : min_identity<T>();
                 val = warp_reduce_min(val);
             }
 
@@ -356,7 +374,7 @@ namespace lfs::core {
             size_t vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
             size_t idx = vec_idx * 4;
 
-            T val = -std::numeric_limits<T>::infinity();
+            T val = max_identity<T>();
             if constexpr (std::is_same_v<T, float>) {
                 bool is_aligned = (reinterpret_cast<uintptr_t>(input) % 16) == 0;
 
@@ -387,7 +405,7 @@ namespace lfs::core {
             size_t vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
             size_t idx = vec_idx * 4;
 
-            T val = std::numeric_limits<T>::infinity();
+            T val = min_identity<T>();
             if constexpr (std::is_same_v<T, float>) {
                 bool is_aligned = (reinterpret_cast<uintptr_t>(input) % 16) == 0;
 
@@ -494,7 +512,7 @@ namespace lfs::core {
             size_t vec_idx = threadIdx.x;
             size_t idx = vec_idx * 4;
 
-            T val = -std::numeric_limits<T>::infinity();
+            T val = max_identity<T>();
             if constexpr (std::is_same_v<T, float>) {
                 bool is_aligned = (reinterpret_cast<uintptr_t>(segment_start) % 16) == 0;
 
@@ -525,7 +543,7 @@ namespace lfs::core {
             size_t vec_idx = threadIdx.x;
             size_t idx = vec_idx * 4;
 
-            T val = std::numeric_limits<T>::infinity();
+            T val = min_identity<T>();
             if constexpr (std::is_same_v<T, float>) {
                 bool is_aligned = (reinterpret_cast<uintptr_t>(segment_start) % 16) == 0;
 
