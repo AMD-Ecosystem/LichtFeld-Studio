@@ -8,6 +8,7 @@
 #include "core/tensor.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -24,6 +25,7 @@
 #include <vector>
 
 namespace lfs::core::export_cuda {
+    namespace cg = cooperative_groups;
 
     using lfs::core::DataType;
     using lfs::core::Device;
@@ -401,15 +403,13 @@ namespace lfs::core::export_cuda {
                 __syncthreads();
             }
 
-            const unsigned group_mask = 0xffffffffu;
+            const auto centroid_group = cg::tiled_partition<ASSIGN_CENTROID_GROUPS>(cg::this_thread_block());
             const int group_lane = tid % ASSIGN_CENTROID_GROUPS;
 #pragma unroll
             for (int p = 0; p < ASSIGN_POINTS_PER_THREAD; ++p) {
                 for (int offset = ASSIGN_CENTROID_GROUPS / 2; offset > 0; offset >>= 1) {
-                    const float other_dist = __shfl_down_sync(
-                        group_mask, best_dist[p], offset, ASSIGN_CENTROID_GROUPS);
-                    const int other_idx = __shfl_down_sync(
-                        group_mask, best_idx[p], offset, ASSIGN_CENTROID_GROUPS);
+                    const float other_dist = centroid_group.shfl_down(best_dist[p], offset);
+                    const int other_idx = centroid_group.shfl_down(best_idx[p], offset);
                     if (other_dist < best_dist[p] ||
                         (other_dist == best_dist[p] && other_idx < best_idx[p])) {
                         best_dist[p] = other_dist;
@@ -542,9 +542,10 @@ namespace lfs::core::export_cuda {
                     }
 #endif
                 }
+                const auto quad = cg::tiled_partition<4>(cg::this_thread_block());
                 for (int delta = 2; delta > 0; delta /= 2) {
-                    const float other = __shfl_xor_sync(0xffffffffu, best, delta, 4);
-                    const int id = __shfl_xor_sync(0xffffffffu, best_id, delta, 4);
+                    const float other = quad.shfl_xor(best, delta);
+                    const int id = quad.shfl_xor(best_id, delta);
                     if (other < best || (other == best && id < best_id)) {
                         best = other;
                         best_id = id;
@@ -656,15 +657,13 @@ namespace lfs::core::export_cuda {
                 __syncthreads();
             }
 
-            const unsigned group_mask = 0xffffffffu;
+            const auto centroid_group = cg::tiled_partition<ASSIGN_CENTROID_GROUPS>(cg::this_thread_block());
             const int group_lane = tid % ASSIGN_CENTROID_GROUPS;
 #pragma unroll
             for (int p = 0; p < POINTS_PER_THREAD; ++p) {
                 for (int offset = ASSIGN_CENTROID_GROUPS / 2; offset > 0; offset >>= 1) {
-                    const float other_dist = __shfl_down_sync(
-                        group_mask, best_dist[p], offset, ASSIGN_CENTROID_GROUPS);
-                    const int other_idx = __shfl_down_sync(
-                        group_mask, best_idx[p], offset, ASSIGN_CENTROID_GROUPS);
+                    const float other_dist = centroid_group.shfl_down(best_dist[p], offset);
+                    const int other_idx = centroid_group.shfl_down(best_idx[p], offset);
                     if (other_dist < best_dist[p] ||
                         (other_dist == best_dist[p] && other_idx < best_idx[p])) {
                         best_dist[p] = other_dist;
@@ -1096,15 +1095,13 @@ namespace lfs::core::export_cuda {
                 __syncthreads();
             }
 
-            const unsigned group_mask = 0xffffffffu;
+            const auto centroid_group = cg::tiled_partition<ASSIGN_CENTROID_GROUPS>(cg::this_thread_block());
             const int group_lane = tid % ASSIGN_CENTROID_GROUPS;
 #pragma unroll
             for (int p = 0; p < POINTS_PER_THREAD; ++p) {
                 for (int offset = ASSIGN_CENTROID_GROUPS / 2; offset > 0; offset >>= 1) {
-                    const float other_dist = __shfl_down_sync(
-                        group_mask, best_dist[p], offset, ASSIGN_CENTROID_GROUPS);
-                    const int other_idx = __shfl_down_sync(
-                        group_mask, best_idx[p], offset, ASSIGN_CENTROID_GROUPS);
+                    const float other_dist = centroid_group.shfl_down(best_dist[p], offset);
+                    const int other_idx = centroid_group.shfl_down(best_idx[p], offset);
                     if (other_dist < best_dist[p] ||
                         (other_dist == best_dist[p] && other_idx < best_idx[p])) {
                         best_dist[p] = other_dist;

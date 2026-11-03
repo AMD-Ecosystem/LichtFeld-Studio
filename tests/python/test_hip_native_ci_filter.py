@@ -62,7 +62,8 @@ class HipCiFilter(unittest.TestCase):
                      "src/core/tensor/backend/vulkan/shaders/inference.slang",
                      "src/core/cuda/undistort/distortion_model.cuh",
                      "src/core/tensor/backend/metal/expression_msl.cpp",
-                     "src/io/cuda/image_format_kernels.cu"):
+                     "src/io/cuda/image_format_kernels.cu",
+                     "src/training/kernels/warp_reduce.cuh"):
             with self.subTest(path=path):
                 self.write(path)
                 head = self.commit()

@@ -55,3 +55,35 @@ if(LFS_HIP_NATIVE_GPU_TESTS)
     set_tests_properties(HipNative.TensorWorkspaceRecovery PROPERTIES LABELS "hip;gpu" TIMEOUT 120)
 
 endif()
+
+# Shared CUDA/HIP warp-group kernels: always compiled, run only with the GPU tests.
+if(WIN32 OR CMAKE_HOST_WIN32)
+    set(_device_test_compiler "${LFS_HIP_ROOT}/lib/llvm/bin/clang++.exe")
+    set(_device_test_link_flags)
+else()
+    set(_device_test_compiler "${LFS_HIP_ROOT}/lib/llvm/bin/clang++")
+    set(_device_test_link_flags "-Wl,-rpath,${LFS_HIP_ROOT}/lib" "-Wl,-rpath,${LFS_HIP_ROOT}/lib64")
+endif()
+foreach(_device_test IN ITEMS SharedWarpKernels:shared_warp_kernels
+                              SharedTrainingWarpReduce:shared_training_warp_reduce)
+    string(REPLACE ":" ";" _device_test "${_device_test}")
+    list(GET _device_test 0 _test_name)
+    list(GET _device_test 1 _test_source)
+    set(_test_executable "${CMAKE_BINARY_DIR}/hip_${_test_source}_tests${CMAKE_EXECUTABLE_SUFFIX}")
+    add_custom_command(OUTPUT "${_test_executable}"
+        COMMAND "${_device_test_compiler}" -x hip -std=c++20 -O3 ${LFS_HIP_OFFLOAD_FLAGS}
+            "--hip-path=${LFS_HIP_ROOT}" -DLFS_TENSOR_PRIVATE_ACCESS
+            "-I${_root}/src" "-I${_root}/src/core/include"
+            -MD -MF "${_test_executable}.d"
+            "${_root}/tests/hip/test_${_test_source}.hip" --hip-link ${_device_test_link_flags}
+            -o "${_test_executable}"
+        DEPENDS "${_root}/tests/hip/test_${_test_source}.hip" "${_device_test_compiler}"
+        DEPFILE "${_test_executable}.d"
+        VERBATIM)
+    add_custom_target(${_test_source}_hip_tests ALL DEPENDS "${_test_executable}")
+    if(LFS_HIP_NATIVE_GPU_TESTS)
+        add_test(NAME HipNative.${_test_name}
+            COMMAND "${_test_executable}" --device "${LFS_HIP_NATIVE_TEST_DEVICE}")
+        set_tests_properties(HipNative.${_test_name} PROPERTIES LABELS "hip;gpu" TIMEOUT 120)
+    endif()
+endforeach()

@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cooperative_groups.h>
 #include <nvtx3/nvToolsExt.h>
 
 namespace lfs::training::kernels::blob_seeding {
+    namespace cg = cooperative_groups;
     namespace {
         using lfs::core::DataType;
         using lfs::core::Device;
@@ -167,9 +169,10 @@ namespace lfs::training::kernels::blob_seeding {
             }
             constexpr uint32_t BRIGHT_BITS = 0x55555555u;
             unsigned int bright = __popc(bits & BRIGHT_BITS), dark = __popc(bits & (BRIGHT_BITS << 1));
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
             for (int offset = 16; offset > 0; offset /= 2) {
-                bright += __shfl_down_sync(0xffffffffu, bright, offset);
-                dark += __shfl_down_sync(0xffffffffu, dark, offset);
+                bright += warp32.shfl_down(bright, offset);
+                dark += warp32.shfl_down(dark, offset);
             }
             if ((threadIdx.x & 31) == 0) {
                 atomicAdd(&set_bits[0], bright);

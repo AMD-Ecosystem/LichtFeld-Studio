@@ -7,12 +7,13 @@
 
 #pragma once
 
+#include "core/device/portability.cuh"
 #include <cstdint>
-#include <cuda_runtime.h>
 #include <type_traits>
 
 namespace lfs::core {
     namespace warp_ops {
+        namespace cg = cooperative_groups;
 
         // ============= WARP-LEVEL REDUCTIONS (NO SHARED MEMORY!) =============
 
@@ -31,9 +32,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_sum(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val += __shfl_xor_sync(0xffffffff, val, offset);
+                val += warp32.shfl_xor(val, offset);
             }
             return val;
         }
@@ -43,9 +45,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_max(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = warp32.shfl_xor(val, offset);
                 val = (val > other) ? val : other;
             }
             return val;
@@ -56,9 +59,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_min(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = warp32.shfl_xor(val, offset);
                 val = (val < other) ? val : other;
             }
             return val;
@@ -69,9 +73,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_prod(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val *= __shfl_xor_sync(0xffffffff, val, offset);
+                val *= warp32.shfl_xor(val, offset);
             }
             return val;
         }
@@ -179,13 +184,14 @@ namespace lfs::core {
          * result valid in warp 0 (thread 0 reads for bounds write).
          */
         __device__ inline float4 block_reduce_min4(float4 val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 const float4 o = make_float4(
-                    __shfl_xor_sync(0xffffffff, val.x, offset),
-                    __shfl_xor_sync(0xffffffff, val.y, offset),
-                    __shfl_xor_sync(0xffffffff, val.z, offset),
-                    __shfl_xor_sync(0xffffffff, val.w, offset));
+                    warp32.shfl_xor(val.x, offset),
+                    warp32.shfl_xor(val.y, offset),
+                    warp32.shfl_xor(val.z, offset),
+                    warp32.shfl_xor(val.w, offset));
                 val.x = fminf(val.x, o.x);
                 val.y = fminf(val.y, o.y);
                 val.z = fminf(val.z, o.z);
@@ -211,10 +217,10 @@ namespace lfs::core {
 #pragma unroll
                 for (int offset = 16; offset > 0; offset /= 2) {
                     const float4 o = make_float4(
-                        __shfl_xor_sync(0xffffffff, val.x, offset),
-                        __shfl_xor_sync(0xffffffff, val.y, offset),
-                        __shfl_xor_sync(0xffffffff, val.z, offset),
-                        __shfl_xor_sync(0xffffffff, val.w, offset));
+                        warp32.shfl_xor(val.x, offset),
+                        warp32.shfl_xor(val.y, offset),
+                        warp32.shfl_xor(val.z, offset),
+                        warp32.shfl_xor(val.w, offset));
                     val.x = fminf(val.x, o.x);
                     val.y = fminf(val.y, o.y);
                     val.z = fminf(val.z, o.z);
@@ -232,11 +238,12 @@ namespace lfs::core {
          * Result valid in warp 0.
          */
         __device__ inline float2 block_reduce_min2(float2 val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 const float2 o = make_float2(
-                    __shfl_xor_sync(0xffffffff, val.x, offset),
-                    __shfl_xor_sync(0xffffffff, val.y, offset));
+                    warp32.shfl_xor(val.x, offset),
+                    warp32.shfl_xor(val.y, offset));
                 val.x = fminf(val.x, o.x);
                 val.y = fminf(val.y, o.y);
             }
@@ -257,8 +264,8 @@ namespace lfs::core {
 #pragma unroll
                 for (int offset = 16; offset > 0; offset /= 2) {
                     const float2 o = make_float2(
-                        __shfl_xor_sync(0xffffffff, val.x, offset),
-                        __shfl_xor_sync(0xffffffff, val.y, offset));
+                        warp32.shfl_xor(val.x, offset),
+                        warp32.shfl_xor(val.y, offset));
                     val.x = fminf(val.x, o.x);
                     val.y = fminf(val.y, o.y);
                 }

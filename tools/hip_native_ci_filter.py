@@ -37,7 +37,7 @@ FILES = {
     "src/core/tensor/backend/cuda/kernels/tensor_spatial.cu",
     "src/core/tensor/backend/metal/expression_msl.cpp",
     "src/core/cuda/kernels/splat_transform.cu", "src/core/cuda/kernels/mask_normalization.cu",
-    "src/io/cuda/image_format_kernels.cu",
+    "src/io/cuda/image_format_kernels.cu", "src/training/kernels/warp_reduce.cuh",
 }
 
 

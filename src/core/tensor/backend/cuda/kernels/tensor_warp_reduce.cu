@@ -17,6 +17,7 @@
 #include "core/tensor/backend/cuda/kernels/packed128.cuh"
 #include "core/tensor/backend/cuda/kernels/tensor_ops.hpp"
 #include "core/tensor/backend/cuda/kernels/warp_reduce.cuh"
+#include "core/tensor/backend/cuda/kernels/warp_segment_reduce.cuh"
 #include "cub_workspace.hpp"
 #include "internal/gpu_config.hpp"
 #include "internal/tensor_functors.hpp"
@@ -31,6 +32,7 @@
 #include <thrust/transform.h>
 
 namespace lfs::core::tensor_ops {
+    namespace cg = cooperative_groups;
 
     namespace {
         __device__ uint64_t extreme_key(float value, uint32_t position, bool maximum) {
@@ -49,8 +51,9 @@ namespace lfs::core::tensor_ops {
         }
 
         __device__ uint64_t warp_extreme(uint64_t key) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
             for (int offset = 16; offset > 0; offset /= 2) {
-                const uint64_t other = __shfl_down_sync(0xffffffffu, key, offset);
+                const uint64_t other = warp32.shfl_down(key, offset);
                 key = key > other ? key : other;
             }
             return key;
@@ -386,222 +389,6 @@ namespace lfs::core::tensor_ops {
     }
 
     // ============= SEGMENTED REDUCTION KERNELS (CONTIGUOUS) =============
-
-    /**
-     * @brief FAST kernel for MEDIUM segments (32-2048 elements)
-     *
-     * Each WARP processes one segment entirely using warp shuffle reductions.
-     * NO block synchronization needed!
-     *
-     * OPTIMIZATION: COALESCED float4 loads - all lanes read consecutive memory.
-     * For segment_size=1024: 32 lanes * 4 floats = 128 floats per iteration, 8 iterations.
-     */
-    __global__ void warp_medium_segment_reduce_sum_kernel(
-        const float* __restrict__ input,
-        float* __restrict__ output,
-        size_t num_segments,
-        size_t segment_size) {
-        const int warp_id = threadIdx.x / 32;
-        const int lane = threadIdx.x % 32;
-        const int warps_per_block = blockDim.x / 32;
-
-        const bool can_vectorize = (segment_size % 4) == 0;
-
-        for (size_t seg_idx = blockIdx.x * warps_per_block + warp_id;
-             seg_idx < num_segments;
-             seg_idx += gridDim.x * warps_per_block) {
-            const float* segment_start = input + seg_idx * segment_size;
-
-            float sum = 0.0f;
-
-            if (can_vectorize) {
-                const size_t num_float4s = segment_size / 4;
-                for (size_t base = 0; base < num_float4s; base += 32) {
-                    size_t idx = base + lane;
-                    if (idx < num_float4s) {
-                        float4 v = reinterpret_cast<const float4*>(segment_start)[idx];
-                        sum += v.x + v.y + v.z + v.w;
-                    }
-                }
-            } else {
-                for (size_t i = lane; i < segment_size; i += 32) {
-                    sum += segment_start[i];
-                }
-            }
-
-            sum = warp_ops::warp_reduce_sum(sum);
-
-            if (lane == 0) {
-                output[seg_idx] = sum;
-            }
-        }
-    }
-
-    /**
-     * @brief FAST kernel for MEDIUM segments - MEAN variant with coalesced loads
-     */
-    __global__ void warp_medium_segment_reduce_mean_kernel(
-        const float* __restrict__ input,
-        float* __restrict__ output,
-        size_t num_segments,
-        size_t segment_size) {
-        const int warp_id = threadIdx.x / 32;
-        const int lane = threadIdx.x % 32;
-        const int warps_per_block = blockDim.x / 32;
-        const float inv_size = 1.0f / static_cast<float>(segment_size);
-        const bool can_vectorize = (segment_size % 4) == 0;
-
-        for (size_t seg_idx = blockIdx.x * warps_per_block + warp_id;
-             seg_idx < num_segments;
-             seg_idx += gridDim.x * warps_per_block) {
-            const float* segment_start = input + seg_idx * segment_size;
-
-            float sum = 0.0f;
-            if (can_vectorize) {
-                const size_t num_float4s = segment_size / 4;
-                for (size_t base = 0; base < num_float4s; base += 32) {
-                    size_t idx = base + lane;
-                    if (idx < num_float4s) {
-                        float4 v = reinterpret_cast<const float4*>(segment_start)[idx];
-                        sum += v.x + v.y + v.z + v.w;
-                    }
-                }
-            } else {
-                for (size_t i = lane; i < segment_size; i += 32) {
-                    sum += segment_start[i];
-                }
-            }
-
-            sum = warp_ops::warp_reduce_sum(sum);
-
-            if (lane == 0) {
-                output[seg_idx] = sum * inv_size;
-            }
-        }
-    }
-
-    /**
-     * @brief FAST kernel for MEDIUM segments - MAX variant with coalesced loads
-     */
-    __global__ void warp_medium_segment_reduce_max_kernel(
-        const float* __restrict__ input,
-        float* __restrict__ output,
-        size_t num_segments,
-        size_t segment_size) {
-        const int warp_id = threadIdx.x / 32;
-        const int lane = threadIdx.x % 32;
-        const int warps_per_block = blockDim.x / 32;
-        const bool can_vectorize = (segment_size % 4) == 0;
-
-        for (size_t seg_idx = blockIdx.x * warps_per_block + warp_id;
-             seg_idx < num_segments;
-             seg_idx += gridDim.x * warps_per_block) {
-            const float* segment_start = input + seg_idx * segment_size;
-
-            float val = -CUDA_INFINITY;
-            if (can_vectorize) {
-                const size_t num_float4s = segment_size / 4;
-                for (size_t base = 0; base < num_float4s; base += 32) {
-                    size_t idx = base + lane;
-                    if (idx < num_float4s) {
-                        float4 v = reinterpret_cast<const float4*>(segment_start)[idx];
-                        val = ops::max_reduce_op{}(val, ops::max_reduce_op{}(ops::max_reduce_op{}(v.x, v.y), ops::max_reduce_op{}(v.z, v.w)));
-                    }
-                }
-            } else {
-                for (size_t i = lane; i < segment_size; i += 32) {
-                    val = ops::max_reduce_op{}(val, segment_start[i]);
-                }
-            }
-
-            val = warp_ops::warp_reduce_max(val);
-
-            if (lane == 0) {
-                output[seg_idx] = val;
-            }
-        }
-    }
-
-    /**
-     * @brief FAST kernel for MEDIUM segments - MIN variant with coalesced loads
-     */
-    __global__ void warp_medium_segment_reduce_min_kernel(
-        const float* __restrict__ input,
-        float* __restrict__ output,
-        size_t num_segments,
-        size_t segment_size) {
-        const int warp_id = threadIdx.x / 32;
-        const int lane = threadIdx.x % 32;
-        const int warps_per_block = blockDim.x / 32;
-        const bool can_vectorize = (segment_size % 4) == 0;
-
-        for (size_t seg_idx = blockIdx.x * warps_per_block + warp_id;
-             seg_idx < num_segments;
-             seg_idx += gridDim.x * warps_per_block) {
-            const float* segment_start = input + seg_idx * segment_size;
-
-            float val = CUDA_INFINITY;
-            if (can_vectorize) {
-                const size_t num_float4s = segment_size / 4;
-                for (size_t base = 0; base < num_float4s; base += 32) {
-                    size_t idx = base + lane;
-                    if (idx < num_float4s) {
-                        float4 v = reinterpret_cast<const float4*>(segment_start)[idx];
-                        val = ops::min_reduce_op{}(val, ops::min_reduce_op{}(ops::min_reduce_op{}(v.x, v.y), ops::min_reduce_op{}(v.z, v.w)));
-                    }
-                }
-            } else {
-                for (size_t i = lane; i < segment_size; i += 32) {
-                    val = ops::min_reduce_op{}(val, segment_start[i]);
-                }
-            }
-
-            val = warp_ops::warp_reduce_min(val);
-
-            if (lane == 0) {
-                output[seg_idx] = val;
-            }
-        }
-    }
-
-    __global__ void warp_medium_segment_reduce_prod_kernel(
-        const float* __restrict__ input,
-        float* __restrict__ output,
-        size_t num_segments,
-        size_t segment_size) {
-        const int warp_id = threadIdx.x / 32;
-        const int lane = threadIdx.x % 32;
-        const int warps_per_block = blockDim.x / 32;
-        const bool can_vectorize = (segment_size % 4) == 0;
-
-        for (size_t seg_idx = blockIdx.x * warps_per_block + warp_id;
-             seg_idx < num_segments;
-             seg_idx += gridDim.x * warps_per_block) {
-            const float* segment_start = input + seg_idx * segment_size;
-
-            float val = 1.0f;
-            if (can_vectorize) {
-                const size_t num_float4s = segment_size / 4;
-                for (size_t base = 0; base < num_float4s; base += 32) {
-                    size_t idx = base + lane;
-                    if (idx < num_float4s) {
-                        float4 v = reinterpret_cast<const float4*>(segment_start)[idx];
-                        val *= v.x * v.y * v.z * v.w;
-                    }
-                }
-            } else {
-                for (size_t i = lane; i < segment_size; i += 32) {
-                    val *= segment_start[i];
-                }
-            }
-
-            val = warp_ops::warp_reduce_prod(val);
-
-            if (lane == 0) {
-                output[seg_idx] = val;
-            }
-        }
-    }
 
     __global__ void warp_tiny_segment_reduce_sum_kernel(
         const float* __restrict__ input,

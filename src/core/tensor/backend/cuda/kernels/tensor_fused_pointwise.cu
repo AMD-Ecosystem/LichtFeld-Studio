@@ -20,6 +20,7 @@ static_assert(static_cast<uint8_t>(lfs::core::internal::LazyPointwiseOpKind::Abs
 static_assert(static_cast<uint8_t>(lfs::core::internal::LazyPointwiseOpKind::Round) == 24);
 
 namespace lfs::core::tensor_ops {
+    namespace cg = cooperative_groups;
 
     namespace {
 
@@ -215,10 +216,11 @@ namespace lfs::core::tensor_ops {
         }
 
         __device__ __forceinline__ float warp_reduce_extrema(float val, int reduce_op_int) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 val = reduce_combine(
-                    val, __shfl_xor_sync(0xffffffff, val, offset), reduce_op_int);
+                    val, warp32.shfl_xor(val, offset), reduce_op_int);
             }
             return val;
         }

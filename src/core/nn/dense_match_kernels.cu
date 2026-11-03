@@ -7,6 +7,7 @@
 #include "nn_kernels.hpp"
 #include "nn_nvtx.hpp"
 
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -16,13 +17,15 @@
 
 namespace lfs::core::nn::kernels {
     namespace {
+        namespace cg = cooperative_groups;
 
         constexpr float kPi = 3.14159265358979323846f;
 
         __device__ __forceinline__ float warp_reduce(float v) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                v += __shfl_down_sync(0xffffffffu, v, offset);
+                v += warp32.shfl_down(v, offset);
             }
             return v;
         }
@@ -440,10 +443,11 @@ namespace lfs::core::nn::kernels {
                 acc += v * v;
             }
             __shared__ float red[32];
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
             float w = acc;
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                w += __shfl_xor_sync(0xffffffffu, w, offset);
+                w += warp32.shfl_xor(w, offset);
             }
             if ((threadIdx.x & 31) == 0) {
                 red[threadIdx.x / 32] = w;
@@ -454,7 +458,7 @@ namespace lfs::core::nn::kernels {
                 float v = threadIdx.x < warps ? red[threadIdx.x] : 0.0f;
 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1) {
-                    v += __shfl_xor_sync(0xffffffffu, v, offset);
+                    v += warp32.shfl_xor(v, offset);
                 }
                 if (threadIdx.x == 0) {
                     red[0] = v;
@@ -480,9 +484,10 @@ namespace lfs::core::nn::kernels {
                 acc += a[idx] * b[idx];
             }
             __shared__ float red[32];
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+                acc += warp32.shfl_xor(acc, offset);
             }
             if ((threadIdx.x & 31) == 0) {
                 red[threadIdx.x / 32] = acc;
@@ -558,10 +563,11 @@ namespace lfs::core::nn::kernels {
             __shared__ float red_val[32];
             __shared__ int red_idx[32];
             const int lane = threadIdx.x & 31;
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                const float other = __shfl_xor_sync(0xffffffffu, best, offset);
-                const int other_idx = __shfl_xor_sync(0xffffffffu, mode, offset);
+                const float other = warp32.shfl_xor(best, offset);
+                const int other_idx = warp32.shfl_xor(mode, offset);
                 if (other > best || (other == best && other_idx < mode)) {
                     best = other;
                     mode = other_idx;
@@ -595,7 +601,7 @@ namespace lfs::core::nn::kernels {
             }
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+                acc += warp32.shfl_xor(acc, offset);
             }
             if (lane == 0) {
                 red_val[threadIdx.x / 32] = acc;

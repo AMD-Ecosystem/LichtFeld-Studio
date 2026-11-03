@@ -41,6 +41,11 @@ cmake --build build-hip-native
 ctest --test-dir build-hip-native --output-on-failure
 ```
 
+The build also compiles `tests/hip/test_shared_*.hip`, which launch CUDA kernel
+sources shared with HIP (warp reductions, segmented reductions, the coalesced channel
+broadcast and the 64-thread block ballot). They run with the GPU tests, as
+`HipNative.SharedWarpKernels` and `HipNative.SharedTrainingWarpReduce`.
+
 GPU checks use ordinal 0 by default. Set `LFS_HIP_NATIVE_TEST_DEVICE` to a different
 nonnegative ordinal when testing a specific compatible GPU; no automatic fallback
 to another device occurs.

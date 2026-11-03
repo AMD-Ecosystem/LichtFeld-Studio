@@ -7,6 +7,7 @@
 #include "nn_nvtx.hpp"
 
 #include <algorithm>
+#include <cooperative_groups.h>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -15,6 +16,7 @@
 
 namespace lfs::core::nn::kernels {
     namespace {
+        namespace cg = cooperative_groups;
 
         __global__ void resample_pil_axis_kernel(const float* input, float* output, const int* bounds,
                                                  const int* coefficients, int taps, int count,
@@ -125,9 +127,10 @@ namespace lfs::core::nn::kernels {
         }
 
         __device__ __forceinline__ float warp_sum(float v) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                v += __shfl_xor_sync(0xffffffffu, v, offset);
+                v += warp32.shfl_xor(v, offset);
             }
             return v;
         }

@@ -17,6 +17,7 @@
 #include <cuda_fp16.h>
 
 namespace fast_lfs::rasterization::kernels {
+    namespace cg = cooperative_groups;
 
     // SH swizzle index: swizzled layout is [ceil(N/R), K_F4, R] of float4 where
     // R = config::sh_reorder_size and K_F4 = config::sh_rest_float4_per_primitive,
@@ -1415,10 +1416,11 @@ namespace fast_lfs::rasterization::kernels {
     }
 
     __device__ __forceinline__ uint warp_exclusive_scan_uint(uint val) {
+        const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
         uint inclusive = val;
 #pragma unroll
         for (int offset = 1; offset < 32; offset <<= 1) {
-            const uint n = __shfl_up_sync(0xffffffffu, inclusive, offset);
+            const uint n = warp32.shfl_up(inclusive, offset);
             if ((threadIdx.x & 31) >= static_cast<unsigned>(offset))
                 inclusive += n;
         }

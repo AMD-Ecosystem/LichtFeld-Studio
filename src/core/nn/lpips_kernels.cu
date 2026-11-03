@@ -6,12 +6,14 @@
 #include "nn_kernels.hpp"
 
 #include <algorithm>
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
 namespace lfs::core::nn::kernels {
     namespace {
+        namespace cg = cooperative_groups;
 
         constexpr int kRgbTileH = 8;
         constexpr int kRgbTileW = 16;
@@ -225,6 +227,7 @@ namespace lfs::core::nn::kernels {
             const int tid = static_cast<int>(threadIdx.x);
             const int lane = tid & 31;
             const int warp = tid >> 5;
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
             const int ni = static_cast<int>(blockIdx.z);
             const int r = static_cast<int>(blockIdx.y);
             const int col = static_cast<int>(blockIdx.x) * 32 + lane;
@@ -258,8 +261,8 @@ namespace lfs::core::nn::kernels {
                 if constexpr (kPool) {
                     float mx = fmaxf(x0, x1);
                     float my = fmaxf(y0, y1);
-                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
-                    my = fmaxf(my, __shfl_xor_sync(0xffffffffu, my, 1));
+                    mx = fmaxf(mx, warp32.shfl_xor(mx, 1));
+                    my = fmaxf(my, warp32.shfl_xor(my, 1));
                     if (pool_ok) {
                         const long long o = (static_cast<long long>(ni) * channels + c) * out_h * out_w +
                                             static_cast<long long>(r) * out_w + (col >> 1);
@@ -314,7 +317,7 @@ namespace lfs::core::nn::kernels {
             }
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                score += __shfl_xor_sync(0xffffffffu, score, offset);
+                score += warp32.shfl_xor(score, offset);
             }
             if (lane == 0) {
                 block_score[warp] = score;

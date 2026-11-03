@@ -6,6 +6,7 @@
 #include "nn_kernels.hpp"
 #include "nn_nvtx.hpp"
 
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <float.h>
@@ -15,22 +16,25 @@
 
 namespace lfs::core::nn::kernels {
     namespace {
+        namespace cg = cooperative_groups;
 
         constexpr int kMaxD = 128;
         constexpr int kBr = 64;
 
         __device__ __forceinline__ float warp_sum(float v) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                v += __shfl_xor_sync(0xffffffffu, v, offset);
+                v += warp32.shfl_xor(v, offset);
             }
             return v;
         }
 
         __device__ __forceinline__ float warp_max(float v) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                const float other = __shfl_xor_sync(0xffffffffu, v, offset);
+                const float other = warp32.shfl_xor(v, offset);
                 v = fmaxf(v, other);
             }
             return v;
@@ -794,6 +798,7 @@ namespace lfs::core::nn::kernels {
             using namespace nvcuda::wmma;
             const int warp = tid / 32;
             const int lane = tid % 32;
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
             const int warp_row = warp * 16;
             const int base_row = lane / 4;
             const int base_col = (lane % 4) * 2;
@@ -864,8 +869,8 @@ namespace lfs::core::nn::kernels {
                     }
 #pragma unroll
                     for (int r = 0; r < 2; ++r) {
-                        row_max[r] = fmaxf(row_max[r], __shfl_xor_sync(0xffffffffu, row_max[r], 1));
-                        row_max[r] = fmaxf(row_max[r], __shfl_xor_sync(0xffffffffu, row_max[r], 2));
+                        row_max[r] = fmaxf(row_max[r], warp32.shfl_xor(row_max[r], 1));
+                        row_max[r] = fmaxf(row_max[r], warp32.shfl_xor(row_max[r], 2));
                     }
 
                     float alpha[2];
@@ -902,8 +907,8 @@ namespace lfs::core::nn::kernels {
                     }
 #pragma unroll
                     for (int r = 0; r < 2; ++r) {
-                        l_add[r] += __shfl_xor_sync(0xffffffffu, l_add[r], 1);
-                        l_add[r] += __shfl_xor_sync(0xffffffffu, l_add[r], 2);
+                        l_add[r] += warp32.shfl_xor(l_add[r], 1);
+                        l_add[r] += warp32.shfl_xor(l_add[r], 2);
                         l_i[tile][r] = l_i[tile][r] * alpha[r] + l_add[r];
                         m_i[tile][r] = m_new[r];
                     }

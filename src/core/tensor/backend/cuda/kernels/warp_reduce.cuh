@@ -10,12 +10,13 @@
 
 #include "core/tensor/internal/tensor_functors.hpp"
 
+#include "core/device/portability.cuh"
 #include <cstdint>
-#include <cuda_runtime.h>
 #include <type_traits>
 
 namespace lfs::core {
     namespace warp_ops {
+        namespace cg = cooperative_groups;
 
         // ============= WARP-LEVEL REDUCTIONS (NO SHARED MEMORY!) =============
 
@@ -34,9 +35,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_sum(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val += __shfl_xor_sync(0xffffffff, val, offset);
+                val += warp32.shfl_xor(val, offset);
             }
             return val;
         }
@@ -46,9 +48,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_max(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = warp32.shfl_xor(val, offset);
                 val = ops::max_reduce_op{}(val, other);
             }
             return val;
@@ -59,9 +62,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_min(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = warp32.shfl_xor(val, offset);
                 val = ops::min_reduce_op{}(val, other);
             }
             return val;
@@ -72,9 +76,10 @@ namespace lfs::core {
          */
         template <typename T>
         __device__ inline T warp_reduce_prod(T val) {
+            const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val *= __shfl_xor_sync(0xffffffff, val, offset);
+                val *= warp32.shfl_xor(val, offset);
             }
             return val;
         }

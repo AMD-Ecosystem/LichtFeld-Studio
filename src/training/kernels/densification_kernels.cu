@@ -8,12 +8,14 @@
 #include "lfs/training/screen_share.cuh"
 #include "training/kernels/cuda_scratch.hpp"
 #include <algorithm>
+#include <cooperative_groups.h>
 #include <cub/cub.cuh>
 #include <limits>
 
 #include "kernel_stream.hpp"
 
 namespace lfs::training::kernels {
+    namespace cg = cooperative_groups;
 
     // ============================================================================
     // Helper functions
@@ -446,8 +448,9 @@ namespace lfs::training::kernels {
                 atomicAdd(&shared_hist[(key >> shift) & digit_mask], 1u);
             }
             if constexpr (kPass == 0 && kPositiveOnly) {
+                const auto warp32 = cg::tiled_partition<32>(cg::this_thread_block());
                 for (int offset = 16; offset > 0; offset >>= 1) {
-                    counted += __shfl_down_sync(0xffffffffu, counted, offset);
+                    counted += warp32.shfl_down(counted, offset);
                 }
                 if ((threadIdx.x & 31) == 0 && counted != 0u) {
                     atomicAdd(&state->total, counted);

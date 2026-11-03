@@ -30,8 +30,49 @@ namespace {
         }
     }
 
+    template <typename T>
+    __global__ void block_reductions_kernel(const T* input, T* output) {
+        const T x = input[blockIdx.x * blockDim.x + threadIdx.x];
+        const T sum = lfs::core::warp_ops::block_reduce_sum(x);
+        const T max = lfs::core::warp_ops::block_reduce_max(x);
+        const T min = lfs::core::warp_ops::block_reduce_min(x);
+        const T prod = lfs::core::warp_ops::block_reduce_prod(static_cast<T>(threadIdx.x % 37 == 0 ? 2 : 1));
+        if (threadIdx.x == 0) {
+            output[blockIdx.x * 4 + 0] = sum;
+            output[blockIdx.x * 4 + 1] = max;
+            output[blockIdx.x * 4 + 2] = min;
+            output[blockIdx.x * 4 + 3] = prod;
+        }
+    }
+
+    template <typename T>
+    __global__ void warp_reductions_kernel(const T* input, T* output) {
+        const T x = input[threadIdx.x];
+        output[threadIdx.x * 4 + 0] = lfs::core::warp_ops::warp_reduce_sum(x);
+        output[threadIdx.x * 4 + 1] = lfs::core::warp_ops::warp_reduce_max(x);
+        output[threadIdx.x * 4 + 2] = lfs::core::warp_ops::warp_reduce_min(x);
+        output[threadIdx.x * 4 + 3] = lfs::core::warp_ops::warp_reduce_prod(static_cast<T>(threadIdx.x % 7 == 0 ? 2 : 1));
+    }
+
 } // namespace
 
 void launch_consecutive_tensor_warp_reductions(float* output, int blocks) {
     consecutive_reductions_kernel<<<blocks, 256>>>(output);
 }
+
+template <typename T>
+void launch_tensor_block_reductions(const T* input, T* output, int blocks, int block_size) {
+    block_reductions_kernel<T><<<blocks, block_size>>>(input, output);
+}
+
+template <typename T>
+void launch_tensor_warp_reductions(const T* input, T* output, int threads) {
+    warp_reductions_kernel<T><<<1, threads>>>(input, output);
+}
+
+template void launch_tensor_block_reductions<float>(const float*, float*, int, int);
+template void launch_tensor_block_reductions<double>(const double*, double*, int, int);
+template void launch_tensor_block_reductions<int>(const int*, int*, int, int);
+template void launch_tensor_warp_reductions<float>(const float*, float*, int);
+template void launch_tensor_warp_reductions<double>(const double*, double*, int);
+template void launch_tensor_warp_reductions<int>(const int*, int*, int);

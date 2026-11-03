@@ -11,6 +11,7 @@
 #define LFS_HOST_DEVICE     __host__ __device__
 #define LFS_NO_CONTRACT     _Pragma("clang fp contract(off)")
 #elif defined(__CUDACC__)
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #define LFS_DEVICE_COMPILER 1
 #define LFS_HOST_DEVICE     __host__ __device__

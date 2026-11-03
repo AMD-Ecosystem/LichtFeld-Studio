@@ -123,7 +123,7 @@ namespace fast_lfs::rasterization::kernels::forward {
             active = false;
 
         // early exit if whole warp is inactive
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (!cg::tiled_partition<32>(cg::this_thread_block()).any(active))
             return;
 
         // load opacity
@@ -154,7 +154,7 @@ namespace fast_lfs::rasterization::kernels::forward {
         const float q_norm_sq = qrr_raw + qxx_raw + qyy_raw + qzz_raw;
         if (q_norm_sq < 1e-8f)
             active = false;
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (!cg::tiled_partition<32>(cg::this_thread_block()).any(active))
             return;
         const float q_norm_sq_safe = fmaxf(q_norm_sq, 1e-8f);
         const float inv_q_norm_sq = 2.0f / q_norm_sq_safe;
@@ -238,7 +238,7 @@ namespace fast_lfs::rasterization::kernels::forward {
             active = false;
 
         // early exit if whole warp is inactive
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (!cg::tiled_partition<32>(cg::this_thread_block()).any(active))
             return;
 
         // compute exact number of tiles the primitive overlaps
@@ -457,7 +457,7 @@ namespace fast_lfs::rasterization::kernels::forward {
         const uint n_touched_tiles = active ? static_cast<uint>(primitive_n_touched_tiles[work_idx]) : 0;
         active = active && n_touched_tiles > 0;
 
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (!cg::tiled_partition<32>(cg::this_thread_block()).any(active))
             return;
 
         const ushort4 screen_bounds = active ? primitive_screen_bounds[work_idx] : make_ushort4(0, 0, 0, 0);

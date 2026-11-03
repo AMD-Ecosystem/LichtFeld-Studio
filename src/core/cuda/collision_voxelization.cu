@@ -3,6 +3,7 @@
 #include "collision_voxelization_kernels.hpp"
 #include "core/cuda/morton.cuh"
 #include "core/cuda_allocation.hpp"
+#include "core/device/block_ballot.cuh"
 #include "core/tensor_cuda_interop.hpp"
 #include <cfloat>
 #include <cub/device/device_merge_sort.cuh>
@@ -167,16 +168,12 @@ namespace lfs::core::cuda {
                 }
             }
         }
-        const uint32_t mask = __ballot_sync(0xffffffffu, density > 0 && double(density) >= grid.cutoff);
-        __shared__ uint32_t masks[2];
-        if ((lane & 31) == 0)
-            masks[lane >> 5] = mask;
-        __syncthreads();
-        if (lane == 0 && (masks[0] | masks[1])) {
+        const uint64_t mask = lfs::core::device::block_ballot64(density > 0 && double(density) >= grid.cutoff);
+        if (lane == 0 && mask) {
             const auto row = atomicAdd(count, 1u);
-            if (masks[0] != UINT32_MAX || masks[1] != UINT32_MAX)
+            if (mask != ~uint64_t(0))
                 atomicAdd(count + 1, 1u);
-            output[row] = {morton_encode(tile.x >> 2, tile.y >> 2, tile.z >> 2), uint64_t(masks[0]) | (uint64_t(masks[1]) << 32)};
+            output[row] = {morton_encode(tile.x >> 2, tile.y >> 2, tile.z >> 2), mask};
         }
     }
     __global__ void prepare(const float* means, const float* scales, const float* rotations, const float* opacity,
