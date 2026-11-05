@@ -878,11 +878,11 @@ struct OpenCVFisheyeCameraModel
         dforward_poly_even = {1, 3 * k1, 5 * k2, 7 * k3, 9 * k4};
 
         auto const max_diag_x =
-            max(parameters.resolution[0] - parameters.principal_point[0],
-                parameters.principal_point[0]);
+            fmaxf(parameters.resolution[0] - parameters.principal_point[0],
+                  parameters.principal_point[0]);
         auto const max_diag_y =
-            max(parameters.resolution[1] - parameters.principal_point[1],
-                parameters.principal_point[1]);
+            fmaxf(parameters.resolution[1] - parameters.principal_point[1],
+                  parameters.principal_point[1]);
         auto const max_radius_pixels =
             std::sqrt(max_diag_x * max_diag_x + max_diag_y * max_diag_y);
 
@@ -907,9 +907,9 @@ struct OpenCVFisheyeCameraModel
         }
 
         max_angle =
-            min(min(max_angle, static_cast<float>(PI)),
-                max(max_radius_pixels / parameters.focal_length[0],
-                    max_radius_pixels / parameters.focal_length[1]));
+            fminf(fminf(max_angle, static_cast<float>(PI)),
+                  fmaxf(max_radius_pixels / parameters.focal_length[0],
+                        max_radius_pixels / parameters.focal_length[1]));
 
         // approximate backward poly (mapping normalized distances to angles)
         // *very crudely* by the line through the origin and the radius the
@@ -1101,11 +1101,11 @@ struct ThinPrismFisheyeCameraModel
         dforward_poly_even = {1, 3 * k1, 5 * k2, 7 * k3, 9 * k4};
 
         auto const max_diag_x =
-            max(parameters.resolution[0] - parameters.principal_point[0],
-                parameters.principal_point[0]);
+            fmaxf(parameters.resolution[0] - parameters.principal_point[0],
+                  parameters.principal_point[0]);
         auto const max_diag_y =
-            max(parameters.resolution[1] - parameters.principal_point[1],
-                parameters.principal_point[1]);
+            fmaxf(parameters.resolution[1] - parameters.principal_point[1],
+                  parameters.principal_point[1]);
         auto const max_radius_pixels =
             std::sqrt(max_diag_x * max_diag_x + max_diag_y * max_diag_y);
 
@@ -1126,9 +1126,9 @@ struct ThinPrismFisheyeCameraModel
             }
         }
 
-        max_angle = min(min(max_angle, static_cast<float>(PI)),
-                        max(max_radius_pixels / parameters.focal_length[0],
-                            max_radius_pixels / parameters.focal_length[1]));
+        max_angle = fminf(fminf(max_angle, static_cast<float>(PI)),
+                          fmaxf(max_radius_pixels / parameters.focal_length[0],
+                                max_radius_pixels / parameters.focal_length[1]));
 
         auto const max_normalized_dist = std::max(
             parameters.resolution[0] / 2.f / parameters.focal_length[0],

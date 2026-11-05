@@ -643,21 +643,14 @@ TEST(UndistortInverse, FisheyeRoundTrip) {
     expect_inverse_round_trip(CameraModelType::FISHEYE);
 }
 
-// Catches GUT rendering thin prism fisheye cameras with another model than COLMAP and the undistortion
-// (tangential and prism terms on the radially distorted point instead of the theta-scaled one), and an
-// unprojection that does not invert the projection.
-TEST(GutThinPrismFisheye, ProjectsLikeColmapAndInvertsItself) {
-    const gut_camera_model_test::ThinPrismCamera camera{
-        .focal = {600.0f, 610.0f},
-        .principal = {512.0f, 384.0f},
-        .resolution = {1024, 768},
-        .radial = {0.25f, -0.05f, 0.01f, -0.002f},
-        .thin_prism = {0.01f, -0.008f, 0.012f, -0.009f}};
+namespace {
+void expect_thin_prism_projects_like_colmap_and_inverts(const gut_camera_model_test::ThinPrismCamera& camera,
+                                                        std::initializer_list<float> thetas) {
     const std::array<double, 8> extra{camera.radial[0], camera.radial[1], camera.thin_prism[0], camera.thin_prism[1],
                                       camera.radial[2], camera.radial[3], camera.thin_prism[2], camera.thin_prism[3]};
     std::vector<float> rays;
     std::vector<float> expected;
-    for (const float theta : {0.15f, 0.35f, 0.55f}) {
+    for (const float theta : thetas) {
         for (const float azimuth : {0.3f, 1.9f, 3.6f, 5.1f}) {
             const float u = std::tan(theta) * std::cos(azimuth);
             const float v = std::tan(theta) * std::sin(azimuth);
@@ -679,6 +672,29 @@ TEST(GutThinPrismFisheye, ProjectsLikeColmapAndInvertsItself) {
         for (int c = 0; c < 3; ++c)
             EXPECT_NEAR(rays_back[4 * i + c], rays[3 * i + c] / norm, 2e-5f) << i << " " << c;
     }
+}
+} // namespace
+
+// Catches GUT rendering thin prism fisheye cameras with another model than COLMAP and the undistortion
+// (tangential and prism terms on the radially distorted point instead of the theta-scaled one), and an
+// unprojection that does not invert the projection.
+TEST(GutThinPrismFisheye, ProjectsLikeColmapAndInvertsItself) {
+    expect_thin_prism_projects_like_colmap_and_inverts({.focal = {600.0f, 610.0f},
+                                                        .principal = {512.0f, 384.0f},
+                                                        .resolution = {1024, 768},
+                                                        .radial = {0.25f, -0.05f, 0.01f, -0.002f},
+                                                        .thin_prism = {0.01f, -0.008f, 0.012f, -0.009f}},
+                                                       {0.15f, 0.35f, 0.55f});
+}
+
+// Catches an angle limit that drops the rays past one radian, which this lens images inside its frame.
+TEST(GutThinPrismFisheye, ProjectsAndInvertsPastOneRadian) {
+    expect_thin_prism_projects_like_colmap_and_inverts({.focal = {1454.0f, 1454.0f},
+                                                        .principal = {1920.0f, 1920.0f},
+                                                        .resolution = {3840, 3840},
+                                                        .radial = {0.159f, 0.134f, -0.087f, -0.0013f},
+                                                        .thin_prism = {0.001f, -0.0008f, 0.0012f, -0.0009f}},
+                                                       {0.5f, 1.03f, 1.06f});
 }
 
 // Catches a fisheye inverse whose Newton start assumes the lens reaches its widest angle at half the image width.
